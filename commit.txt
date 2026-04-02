@@ -1,3 +1,11 @@
+[NSP] Recognize destination subview materialization pattern
+
+Add helper to recognize and materialize tensor results directly
+into destination subviews via bufferization.materialize_in_destination.
+
+Enables proper handling of the NSP Localize → Materialize contract
+and avoids unnecessary tensor.empty in recognized cases.
+
 [NSP] Model materialize_tile as a memory-effecting anchor op
 
 Make nsp.materialize_tile implement MemoryEffectOpInterface and model it
