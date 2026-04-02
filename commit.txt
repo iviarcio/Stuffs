@@ -1,0 +1,8 @@
+    [NSP] Add memref pattern's path in materialization for localized elementwise ops
+
+    Rewrite simple localized tensor linalg.generic ops to write directly into the
+    destination memref subview during NSP materialization.
+
+    Keep bufferization.materialize_in_destination as a fallback for unsupported
+    cases, while eliminating the final tensor staging buffer in elementwise kernels.
+
