@@ -1,16 +1,16 @@
-[NSP] Recognize destination subview materialization pattern
+[NSP] Add initial rank-2 support via tile_shape in MaterializeTile
 
-Add helper to recognize and materialize tensor results directly
-into destination subviews via bufferization.materialize_in_destination.
+Replace tile_size with tile_shape in nsp.materialize_tile to enable
+multi-dimensional tiles (initially rank-2).
 
-Enables proper handling of the NSP Localize → Materialize contract
-and avoids unnecessary tensor.empty in recognized cases.
+Update verification to ensure:
 
-[NSP] Model materialize_tile as a memory-effecting anchor op
+rank consistency between source, destination, and tile_shape
+positive tile dimensions
+compatibility with source shape
+tile bounds fit within destination (when static)
 
-Make nsp.materialize_tile implement MemoryEffectOpInterface and model it
-conservatively as reading the source tensor and reading/writing the
-destination memref.
+This enables correct materialization of 2D elementwise workloads (e.g.
+vector_add_2d) under the existing 1D sharding model (split on dim0).
 
-This preserves the local compute/materialization contract across
-canonicalization before NSPMaterializePass runs.
+Follow-ups will generalize fast-path lowering and N-D support further.
