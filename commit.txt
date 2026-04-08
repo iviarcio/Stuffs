@@ -13,4 +13,7 @@ tile bounds fit within destination (when static)
 This enables correct materialization of 2D elementwise workloads (e.g.
 vector_add_2d) under the existing 1D sharding model (split on dim0).
 
-Follow-ups will generalize fast-path lowering and N-D support further.
+[shard-to-llvm] Lower rank-2 shard.all_slice via tensor.extract_slice
+
+Extend LowerAllSlice in ShardToLLVMPass to support ranked tensors
+sliced along dimension 0, instead of handling only rank-1 tensors.
