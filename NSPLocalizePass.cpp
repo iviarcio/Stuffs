@@ -14,7 +14,8 @@
 // materialize those local tiles into destination memrefs.
 //
 // The current implementation targets the simplest sharded elementwise patterns
-// (e.g. vadd expressed as linalg.generic) and rewrites them into:
+// (e.g. vadd expressed as linalg.generic) for ranked tensors of rank 1 or 2
+// and rewrites them into:
 //   - per-core local slices using shard.all_slice
 //   - local compute (linalg.generic) on the sliced tensors
 //   - optional reconstitution using shard.all_gather when collectives are
@@ -67,8 +68,8 @@
 #include "mlir/Dialect/Shard/IR/ShardOps.h"
 
 // NSP dialect ops/types.
-#include "hexagon/NSP/IR/NSPDialect.h"
-#include "hexagon/NSP/IR/NSPOps.h"
+#include "hexagon/Dialect/NSP/IR/NSPDialect.h"
+#include "hexagon/Dialect/NSP/IR/NSPOps.h"
 
 namespace mlir {
 namespace hexagon {
@@ -531,8 +532,10 @@ struct NSPLocalizePass
     //
     // We intentionally keep this scoped:
     //   - Only elementwise linalg.generic with identity indexing maps.
+    //   - Only rank-1 / rank-2 ranked tensors.
+    //   - Only all-parallel iterator spaces.
     //   - Only sharding split along axis 0.
-    //   - Only ranked tensors with static sizes.
+    //   - Only ranked tensors with static dim0 divisible by the grid size.
     const SmallVector<mlir::shard::GridAxis> gridAxes = {
         static_cast<mlir::shard::GridAxis>(0)};
     // Some Shard ops (e.g. all_gather) expect grid_axes as i16.
@@ -576,6 +579,42 @@ struct NSPLocalizePass
       auto aShape = getLocalShape(a);
       auto bShape = getLocalShape(b);
       return aShape && bShape && (*aShape == *bShape);
+    };
+
+    auto isSupportedElementwiseGenericShape =
+        [&](mlir::linalg::GenericOp g,
+            RankedTensorType outResTy,
+            ArrayRef<RankedTensorType> inputTys) -> bool {
+      if (!outResTy)
+        return false;
+
+      const int64_t rank = outResTy.getRank();
+      if (rank != 1 && rank != 2)
+        return false;
+
+      if (g.getNumLoops() != rank)
+        return false;
+
+      auto iters = g.getIteratorTypesArray();
+      if ((int64_t)iters.size() != rank)
+        return false;
+      if (!llvm::all_of(iters, [](mlir::utils::IteratorType it) {
+            return it == mlir::utils::IteratorType::parallel;
+          }))
+        return false;
+
+      auto maps = g.getIndexingMapsArray();
+      if ((int64_t)maps.size() != g.getNumDpsInputs() + g.getNumDpsInits())
+        return false;
+      if (!llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }))
+        return false;
+
+      for (RankedTensorType t : inputTys) {
+        if (!t || t.getRank() != rank)
+          return false;
+      }
+
+      return true;
     };
 
     module.walk([&](mlir::func::FuncOp func) {
@@ -660,56 +699,115 @@ struct NSPLocalizePass
       auto isCompatibleElementwiseGeneric =
           [&](mlir::linalg::GenericOp prod,
               RankedTensorType expectedLocalTy) -> bool {
-        auto expectedShape = getLocalShape(expectedLocalTy);
-        if (!expectedShape) {
-          // expectedLocalTy is already supposed to be shard-local.
-          // If we cannot reason about its shape, do not clone recursively.
+        if (!expectedLocalTy)
           return false;
-        }
+
+        const int64_t expectedRank = expectedLocalTy.getRank();
+        if (expectedRank != 1 && expectedRank != 2)
+          return false;
 
         const int64_t nIn = prod.getNumDpsInputs();
         if ((nIn != 1 && nIn != 2) || prod.getNumDpsInits() != 1)
           return false;
-        if (prod.getNumLoops() != 1)
+
+        if (prod.getNumLoops() != expectedRank)
           return false;
 
         auto iters = prod.getIteratorTypesArray();
-        if (iters.size() != 1 ||
-            iters.front() != mlir::utils::IteratorType::parallel)
+        if ((int64_t)iters.size() != expectedRank)
+          return false;
+        if (!llvm::all_of(iters, [](mlir::utils::IteratorType it) {
+              return it == mlir::utils::IteratorType::parallel;
+            }))
           return false;
 
         auto maps = prod.getIndexingMapsArray();
-        if (static_cast<int64_t>(maps.size()) != nIn + 1)
+        if ((int64_t)maps.size() != nIn + 1)
           return false;
         for (AffineMap m : maps)
           if (!m.isIdentity())
             return false;
 
         auto resTy = dyn_cast<RankedTensorType>(prod.getResult(0).getType());
-        if (!resTy || resTy.getRank() != 1)
+        if (!resTy || resTy.getRank() != expectedRank)
           return false;
 
         auto prodLocalTy = getLocalType(resTy);
         if (!prodLocalTy)
           return false;
-        // expectedLocalTy is already local. Do NOT pass it to
-        // haveSameLocalShape(), which expects global types
+
         if (prodLocalTy.getShape() != expectedLocalTy.getShape())
           return false;
 
         for (int64_t i = 0; i < nIn; ++i) {
-          auto inTy = dyn_cast<RankedTensorType>(
-              prod.getDpsInputOperand(i)->get().getType());
-          if (!inTy || inTy.getRank() != 1)
+          auto inTy =
+              dyn_cast<RankedTensorType>(prod.getDpsInputOperand(i)->get().getType());
+          if (!inTy || inTy.getRank() != expectedRank)
             return false;
+
           auto inLocalTy = getLocalType(inTy);
           if (!inLocalTy)
             return false;
+
           if (inLocalTy.getShape() != expectedLocalTy.getShape())
             return false;
         }
+
         return true;
       };
+      // auto isCompatibleElementwiseGeneric =
+      //     [&](mlir::linalg::GenericOp prod,
+      //         RankedTensorType expectedLocalTy) -> bool {
+      //   auto expectedShape = getLocalShape(expectedLocalTy);
+      //   if (!expectedShape) {
+      //     // expectedLocalTy is already supposed to be shard-local.
+      //     // If we cannot reason about its shape, do not clone recursively.
+      //     return false;
+      //   }
+      //
+      //   const int64_t nIn = prod.getNumDpsInputs();
+      //   if ((nIn != 1 && nIn != 2) || prod.getNumDpsInits() != 1)
+      //     return false;
+      //   if (prod.getNumLoops() != 1)
+      //     return false;
+      //
+      //   auto iters = prod.getIteratorTypesArray();
+      //   if (iters.size() != 1 ||
+      //       iters.front() != mlir::utils::IteratorType::parallel)
+      //     return false;
+      //
+      //   auto maps = prod.getIndexingMapsArray();
+      //   if (static_cast<int64_t>(maps.size()) != nIn + 1)
+      //     return false;
+      //   for (AffineMap m : maps)
+      //     if (!m.isIdentity())
+      //       return false;
+      //
+      //   auto resTy = dyn_cast<RankedTensorType>(prod.getResult(0).getType());
+      //   if (!resTy || resTy.getRank() != 1)
+      //     return false;
+      //
+      //   auto prodLocalTy = getLocalType(resTy);
+      //   if (!prodLocalTy)
+      //     return false;
+      //   // expectedLocalTy is already local. Do NOT pass it to
+      //   // haveSameLocalShape(), which expects global types
+      //   if (prodLocalTy.getShape() != expectedLocalTy.getShape())
+      //     return false;
+      //
+      //   for (int64_t i = 0; i < nIn; ++i) {
+      //     auto inTy = dyn_cast<RankedTensorType>(
+      //         prod.getDpsInputOperand(i)->get().getType());
+      //     if (!inTy || inTy.getRank() != 1)
+      //       return false;
+      //     auto inLocalTy = getLocalType(inTy);
+      //     if (!inLocalTy)
+      //       return false;
+      //     if (inLocalTy.getShape() != expectedLocalTy.getShape())
+      //       return false;
+      //   }
+      //   return true;
+      // };
 
       // Build a local-tile version of a global value by cloning a chain of
       // compatible elementwise producers. This avoids materializing full global
@@ -807,27 +905,33 @@ struct NSPLocalizePass
 
       for (mlir::linalg::GenericOp g : worklist) {
 
-        // Pattern: elementwise 1D generic with identity maps.
+        // Pattern: elementwise rank-1 / rank-2 generic with identity maps.
         const int64_t numInputs = g.getNumDpsInputs();
         if ((numInputs != 1 && numInputs != 2) || g.getNumDpsInits() != 1)
           continue;
-        if (g.getNumLoops() != 1)
-          continue;
-        auto iters = g.getIteratorTypesArray();
-        if (iters.size() != 1 ||
-            iters.front() != mlir::utils::IteratorType::parallel)
-          continue;
 
-        auto maps = g.getIndexingMapsArray();
-        // For a unary elementwise op: 1 input + 1 output => 2 maps.
-        // For a binary elementwise op: 2 inputs + 1 output => 3 maps.
-        if (static_cast<int64_t>(maps.size()) != numInputs + 1)
-          continue;
-        bool allIdentity = true;
-        for (AffineMap m : maps)
-          allIdentity &= m.isIdentity();
-        if (!allIdentity)
-          continue;
+        // Pattern: elementwise 1D/2D generic with identity maps.
+        // const int64_t numInputs = g.getNumDpsInputs();
+        // if ((numInputs != 1 && numInputs != 2) || g.getNumDpsInits() != 1)
+        //   continue;
+        //
+        // if (g.getNumLoops() != 1)
+        //   continue;
+        // auto iters = g.getIteratorTypesArray();
+        // if (iters.size() != 1 ||
+        //     iters.front() != mlir::utils::IteratorType::parallel)
+        //   continue;
+        //
+        // auto maps = g.getIndexingMapsArray();
+        // // For a unary elementwise op: 1 input + 1 output => 2 maps.
+        // // For a binary elementwise op: 2 inputs + 1 output => 3 maps.
+        // if (static_cast<int64_t>(maps.size()) != numInputs + 1)
+        //   continue;
+        // bool allIdentity = true;
+        // for (AffineMap m : maps)
+        //   allIdentity &= m.isIdentity();
+        // if (!allIdentity)
+        //   continue;
 
         SmallVector<Value> inputs;
         inputs.reserve(numInputs);
@@ -842,9 +946,9 @@ struct NSPLocalizePass
         auto outResTy = dyn_cast<RankedTensorType>(g.getResult(0).getType());
         if (!outResTy)
           continue;
-        for (RankedTensorType t : inputTys)
-          if (!t)
-            continue;
+        // for (RankedTensorType t : inputTys)
+        //   if (!t)
+        //     continue;
 
         bool allRanked = true;
         for (RankedTensorType t : inputTys)
@@ -853,11 +957,13 @@ struct NSPLocalizePass
           continue;
 
         // Restrict to rank-1 or rank-2 tensors for now.
-        if (outResTy.getRank() != 1 && outResTy.getRank() != 2)
+        // if (outResTy.getRank() != 1 && outResTy.getRank() != 2)
+        //   continue;
+        // for (RankedTensorType t : inputTys)
+        //   if (t.getRank() != outResTy.getRank())
+        //     continue;
+        if (!isSupportedElementwiseGenericShape(g, outResTy, inputTys))
           continue;
-        for (RankedTensorType t : inputTys)
-          if (t.getRank() != outResTy.getRank())
-            continue;
 
         auto localTy = getLocalType(outResTy);
         if (!localTy) {
@@ -987,18 +1093,25 @@ struct NSPLocalizePass
           return;
         }
 
-        auto tileShapeAttr =
+        auto tileShapeDenseAttr =
             localizedGeneric->getAttrOfType<DenseI64ArrayAttr>("nsp.materialize_tile_shape");
         auto splitAxisAttr =
             localizedGeneric->getAttrOfType<IntegerAttr>("nsp.materialize_split_axis");
 
-        if (!tileShapeAttr || !splitAxisAttr) {
+        if (!tileShapeDenseAttr || !splitAxisAttr) {
           localizedGeneric.emitError()
               << "NSPLocalize: localized generic is missing tile materialization "
                  "attributes";
           signalPassFailure();
           return;
         }
+
+        SmallVector<Attribute> tileShapeElems;
+        tileShapeElems.reserve(tileShapeDenseAttr.size());
+        for (int64_t dim : tileShapeDenseAttr.asArrayRef())
+          tileShapeElems.push_back(b.getI64IntegerAttr(dim));
+
+        auto tileShapeArrayAttr = b.getArrayAttr(tileShapeElems);
 
         // Emit the explicit hand-off op for NSPMaterializePass.
         b.setInsertionPoint(mat);
@@ -1008,7 +1121,7 @@ struct NSPLocalizePass
             /*dest=*/dest,
             /*grid=*/SymbolRefAttr::get(ctx, grid.getSymName()),
             /*splitAxis=*/splitAxisAttr,
-            /*tileShape=*/tileShapeAttr);
+            /*tileShape=*/tileShapeArrayAttr);
 
         // The old sink chain is now replaced by the explicit NSP materialization
         // anchor, so the old sink/wrappers/global generic can go away now.

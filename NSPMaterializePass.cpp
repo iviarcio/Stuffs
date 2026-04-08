@@ -22,8 +22,12 @@
 //   5. erases the temporary NSP hand-off op.
 //
 // Bring-up constraints:
-//   - only handles rank-1 direct store-by-tile materialization,
-//   - expects static tile size,
+//   - the generic tile hand-off supports rank-1 / rank-2 destination
+//     materialization through tile_shape,
+//   - split_axis is currently restricted to 0,
+//   - the direct memref fast-paths remain rank-1 only,
+//   - rank-2 currently falls back to bufferization.materialize_in_destination
+//     unless a dedicated fast-path is added,
 //   - expects a valid shard.grid symbol referenced by the NSP op.
 //
 //===----------------------------------------------------------------------===//
@@ -79,11 +83,18 @@ getStaticTileShape(mlir::hexagon::nsp::MaterializeTileOp tileOp) {
 
   SmallVector<int64_t> shape;
   shape.reserve(tileShapeAttr.size());
-  for (int64_t dim : tileShapeAttr.asArrayRef()) {
+  for (Attribute attr : tileShapeAttr) {
+    auto intAttr = dyn_cast<IntegerAttr>(attr);
+    if (!intAttr)
+      return failure();
+
+    int64_t dim = intAttr.getInt();
     if (dim <= 0)
       return failure();
+
     shape.push_back(dim);
   }
+
   return shape;
 }
 
@@ -97,6 +108,10 @@ getStaticTileShape(mlir::hexagon::nsp::MaterializeTileOp tileOp) {
 ///   - rank-1 elementwise shape
 ///   - one parallel iterator
 ///   - identity indexing maps
+///
+/// Note: the generic tile materialization path itself already accepts rank-2
+/// tile_shape/destSubview, but this direct memref rewrite helper is still
+/// intentionally rank-1 only.
 static bool isSimpleLocalizedElementwiseGeneric(linalg::GenericOp g) {
   if (!g || !g->hasAttr("nsp.localized"))
     return false;
@@ -640,7 +655,7 @@ static LogicalResult tryRewriteScfForTileToMemref(OpBuilder &b, Location loc,
 
       auto newRead = nb.create<vector::TransferReadOp>(
           tr.getLoc(), tr.getVectorType(), newChunkMemrefs[idx], indices,
-          tr.getPermutationMapAttr(). tr.getPadding(), tr.getMask(),
+          tr.getPermutationMapAttr(), tr.getPadding(), tr.getMask(),
           tr.getInBoundsAttr());
       map.map(tr.getResult(), newRead.getResult());
       continue;
