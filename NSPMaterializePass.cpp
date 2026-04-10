@@ -169,29 +169,9 @@ static FailureOr<Value> buildRank2Subview(OpBuilder &b, Location loc,
   if (offsets.size() != 2 || sizes.size() != 2 || strides.size() != 2)
     return failure();
 
-  int64_t staticSize0 = ShapedType::kDynamic;
-  int64_t staticSize1 = ShapedType::kDynamic;
-
-  if (auto a0 = dyn_cast<Attribute>(sizes[0]))
-    if (auto i0 = dyn_cast<IntegerAttr>(a0))
-      staticSize0 = i0.getInt();
-  if (auto a1 = dyn_cast<Attribute>(sizes[1]))
-    if (auto i1 = dyn_cast<IntegerAttr>(a1))
-      staticSize1 = i1.getInt();
-
-  auto subLayout = StridedLayoutAttr::get(
-      baseTy.getContext(),
-      /*offset=*/ShapedType::kDynamic,
-      /*strides=*/ArrayRef<int64_t>{ShapedType::kDynamic, 1});
-
-  auto subviewTy =
-      MemRefType::get({staticSize0, staticSize1}, baseTy.getElementType(),
-                      subLayout, baseTy.getMemorySpace());
-
-  return b
-      .create<memref::SubViewOp>(loc, subviewTy, baseMemref, offsets, sizes,
-                                 strides)
-      .getResult();
+  auto subview =
+      b.create<memref::SubViewOp>(loc, baseMemref, offsets, sizes, strides);
+  return subview.getResult();
 }
 
 /// Build a rank-1 memref view for a [1 x C] slice taken from a rank-2 base
