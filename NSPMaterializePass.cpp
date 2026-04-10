@@ -14,20 +14,22 @@
 //   1. computes the participant-local tile offset using
 //      shard.process_linear_index,
 //   2. creates a memref.subview into the final destination buffer,
-//   3. tries a path that rewrites a localized tensor linalg.generic
-//      into a memref-semantics linalg.generic writing directly into memref
-//      inputs/outputs,
-//   4. falls back to bufferization.materialize_in_destination when this
-//      path is not applicable,
+//   3. tries fast-path rewrites that replace tensor tile materialization with
+//      direct writes into memref subviews,
+//   4. falls back to bufferization.materialize_in_destination when no
+//      supported fast-path matches,
 //   5. erases the temporary NSP hand-off op.
 //
 // Bring-up constraints:
 //   - the generic tile hand-off supports rank-1 / rank-2 destination
 //     materialization through tile_shape,
 //   - split_axis is currently restricted to 0,
-//   - the direct memref fast-paths remain rank-1 only,
-//   - rank-2 currently falls back to bufferization.materialize_in_destination
-//     unless a dedicated fast-path is added,
+//   - the direct memref rewrite for localized linalg.generic remains rank-1,
+//   - a dedicated fast-path exists for the elemenwise 2d-style pattern:
+//       * rank-2 outer tile / accumulator
+//       * rank-1 inner vectorized chunks
+//   - other rank-2 patterns still fall back to
+//     bufferization.materialize_in_destination,
 //   - expects a valid shard.grid symbol referenced by the NSP op.
 //
 //===----------------------------------------------------------------------===//
@@ -192,6 +194,56 @@ static FailureOr<Value> buildRank2Subview(OpBuilder &b, Location loc,
       .getResult();
 }
 
+/// Build a rank-1 memref view for a [1 x C] slice taken from a rank-2 base
+/// memref at offsets [rowOff, colOff].
+///
+/// This helper is used by the current 2-D elementwise vectorized fast-path,
+/// where:
+///   - the outer tile / accumulator is rank-2, but
+///   - the vector.transfer_{read,write} ops operate on rank-1 chunks.
+///
+/// In the source tensor IR this corresponds to patterns such as:
+///   %chunk = tensor.extract_slice %tile[%i, %j] [1, C] [1, 1]
+///            : tensor<T0xT1xf32> to tensor<Cxf32>
+///
+/// The memref form is built in two steps:
+///   1. create a rank-2 memref.subview of shape [1 x C]
+///   2. collapse it to rank-1 so it matches vector.transfer_read/write [%c0]
+static FailureOr<Value> buildRank1SubviewFromRank2(OpBuilder &b, Location loc,
+                                                   Value baseMemref,
+                                                   OpFoldResult rowOff,
+                                                   OpFoldResult colOff,
+                                                   OpFoldResult chunkSize) {
+  auto baseTy = dyn_cast<MemRefType>(baseMemref.getType());
+  if (!baseTy || baseTy.getRank() != 2)
+    return failure();
+
+  int64_t staticSize = ShapedType::kDynamic;
+  if (auto attr = dyn_cast<Attribute>(chunkSize))
+    if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+      staticSize = intAttr.getInt();
+
+  auto subLayout = StridedLayoutAttr::get(baseTy.getContext(),
+                                          /*offset=*/ShapedType::kDynamic,
+                                          /*strides=*/ArrayRef<int64_t>{1});
+
+  auto subviewTy =
+      MemRefType::get(ArrayRef<int64_t>{staticSize}, baseTy.getElementType(),
+                      subLayout, baseTy.getMemorySpace());
+
+  SmallVector<OpFoldResult> offsets = {rowOff, colOff};
+  SmallVector<OpFoldResult> sizes = {b.getIndexAttr(1), chunkSize};
+  SmallVector<OpFoldResult> strides = {b.getIndexAttr(1), b.getIndexAttr(1)};
+
+  auto full2D =
+      b.create<memref::SubViewOp>(loc, baseMemref, offsets, sizes, strides);
+
+  return b
+      .create<memref::CollapseShapeOp>(loc, subviewTy, full2D.getResult(),
+                                       ReassociationIndices{{0, 1}})
+      .getResult();
+}
+
 /// Match a rank-2 tensor.extract_slice with:
 ///   %slice = tensor.extract_slice %source[%o0, %o1][%s0, %s1][%t0, %t1]
 static LogicalResult
@@ -199,8 +251,11 @@ matchRank2TensorExtractSlice(Value v, Value &source,
                              SmallVectorImpl<OpFoldResult> &offsets,
                              SmallVectorImpl<OpFoldResult> &sizes,
                              SmallVectorImpl<OpFoldResult> &strides) {
-  auto extract =
-      stripTensorCastWrappers(v).getDefiningOp<tensor::ExtractSliceOp>();
+  auto strippedOr = stripTensorCasts(v);
+  if (failed(strippedOr))
+    return failure();
+
+  auto extract = (*strippedOr).getDefiningOp<tensor::ExtractSliceOp>();
   if (!extract)
     return failure();
 
@@ -849,43 +904,31 @@ static LogicalResult tryRewriteScfForTileToMemref(OpBuilder &b, Location loc,
   return success();
 }
 
-/// Try to rewrite the rank-2 tiled tensor pattern produced by vectorization
-/// into nested memref-writing scf.for loops.
+/// Try to rewrite the current 2d-elementwise-style pattern:
+///   - outer tile / accumulator is rank-2
+///   - inner vectorized chunks are rank-1
 ///
-/// Expected shape (current fast-path):
-///   %init = tensor.empty : tensor<T0xT1xf32>
-///   %outer = scf.for %i = ... iter_args(%acc0 = %init) -> tensor<T0xT1xf32> {
-///     %inner = scf.for %j = ... iter_args(%acc1 = %acc0) -> tensor<T0xT1xf32>
-///     {
-///       %a = tensor.extract_slice %in0[%i, %j] [1, C] [1, 1]
-///       %b = tensor.extract_slice %in1[%i, %j] [1, C] [1, 1]   (optional)
-///       %o = tensor.extract_slice %acc1[%i, %j] [1, C] [1, 1]
-///       %ra = vector.transfer_read %a[%c0, %c0], ...
-///       %rb = vector.transfer_read %b[%c0, %c0], ...
-///       ...
-///       %tw = vector.transfer_write %vec, %o[%c0, %c0], ...
-///       %next = tensor.insert_slice %tw into %acc1[%i, %j] [1, C] [1, 1]
-///       scf.yield %next
-///     }
-///     scf.yield %inner
-///   }
+/// Expected inner shape:
+///   %a = tensor.extract_slice %in0[%i, %j] [1, C] [1, 1]
+///         : tensor<T0xT1xf32> to tensor<Cxf32>
+///   %b = tensor.extract_slice %in1[%i, %j] [1, C] [1, 1]
+///         : tensor<T0xT1xf32> to tensor<Cxf32>
+///   %o = tensor.extract_slice %acc[%i, %j] [1, C] [1, 1]
+///         : tensor<T0xT1xf32> to tensor<Cxf32>
+///   %ra = vector.transfer_read %a[%c0], ...
+///   %rb = vector.transfer_read %b[%c0], ...
+///   %tw = vector.transfer_write %vec, %o[%c0], ...
+///   %next = tensor.insert_slice %tw into %acc[%i, %j] [1, C] [1, 1]
 ///
 /// Rewritten form:
-///   %in0Tile = memref.subview ...
-///   %in1Tile = memref.subview ...
-///   scf.for %i = ... {
-///     scf.for %j = ... {
-///       %a = memref.subview %in0Tile[%i, %j] [1, C] [1, 1]
-///       %b = memref.subview %in1Tile[%i, %j] [1, C] [1, 1]
-///       %o = memref.subview %destSubview[%i, %j] [1, C] [1, 1]
-///       ...
-///       vector.transfer_write %vec, %o[%c0, %c0], ...
-///     }
-///   }
-static LogicalResult tryRewriteRank2ScfForTileToMemref(OpBuilder &b,
-                                                       Location loc,
-                                                       scf::ForOp outerFor,
-                                                       Value destSubview) {
+///   - materialize each input tile as a rank-2 memref subview
+///   - inside the nested loops, build rank-1 chunk views from those rank-2
+///   tiles
+///   - write directly into a rank-1 chunk view over the destination subview
+static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
+                                                           Location loc,
+                                                           scf::ForOp outerFor,
+                                                           Value destSubview) {
   if (outerFor.getNumResults() != 1 || outerFor.getNumRegionIterArgs() != 1)
     return failure();
 
@@ -938,23 +981,40 @@ static LogicalResult tryRewriteRank2ScfForTileToMemref(OpBuilder &b,
   if (insertSlice.getDest() != innerBody->getArgument(1))
     return failure();
 
-  SmallVector<OpFoldResult> insertOffsets, insertSizes, insertStrides;
-  insertOffsets.assign(insertSlice.getMixedOffsets().begin(),
-                       insertSlice.getMixedOffsets().end());
-  insertSizes.assign(insertSlice.getMixedSizes().begin(),
-                     insertSlice.getMixedSizes().end());
-  insertStrides.assign(insertSlice.getMixedStrides().begin(),
-                       insertSlice.getMixedStrides().end());
+  auto insertedChunkTy =
+      dyn_cast<RankedTensorType>(insertSlice.getSource().getType());
+  if (!insertedChunkTy || insertedChunkTy.getRank() != 1)
+    return failure();
 
+  auto insertOffsets = insertSlice.getMixedOffsets();
+  auto insertSizes = insertSlice.getMixedSizes();
+  auto insertStrides = insertSlice.getMixedStrides();
   if (insertOffsets.size() != 2 || insertSizes.size() != 2 ||
       insertStrides.size() != 2)
     return failure();
 
-  auto rowOff = dyn_cast<Value>(insertOffsets[0]);
-  auto colOff = dyn_cast<Value>(insertOffsets[1]);
-  if (!rowOff || !colOff)
+  auto insRowOff = dyn_cast<Value>(insertOffsets[0]);
+  auto insColOff = dyn_cast<Value>(insertOffsets[1]);
+  if (!insRowOff || !insColOff)
     return failure();
-  if (!isLoopIV(rowOff, outerFor) || !isLoopIV(colOff, innerFor))
+  if (!isLoopIV(insRowOff, outerFor) || !isLoopIV(insColOff, innerFor))
+    return failure();
+
+  // Expect insert_slice [1, C] [1, 1].
+  auto size0Attr = dyn_cast<Attribute>(insertSizes[0]);
+  auto stride0Attr = dyn_cast<Attribute>(insertStrides[0]);
+  auto stride1Attr = dyn_cast<Attribute>(insertStrides[1]);
+  if (!size0Attr || !stride0Attr || !stride1Attr)
+    return failure();
+
+  auto size0Int = dyn_cast<IntegerAttr>(size0Attr);
+  auto stride0Int = dyn_cast<IntegerAttr>(stride0Attr);
+  auto stride1Int = dyn_cast<IntegerAttr>(stride1Attr);
+  if (!size0Int || !stride0Int || !stride1Int)
+    return failure();
+
+  if (size0Int.getInt() != 1 || stride0Int.getInt() != 1 ||
+      stride1Int.getInt() != 1)
     return failure();
 
   auto transferWrite =
@@ -962,21 +1022,20 @@ static LogicalResult tryRewriteRank2ScfForTileToMemref(OpBuilder &b,
   if (!transferWrite)
     return failure();
 
+  // transfer_write base must be a rank-1 chunk extracted from the loop-carried
+  // accumulator, with chunk offset driven by the inner loop IV.
   Value accChunkSource;
-  SmallVector<OpFoldResult> accChunkOffsets, accChunkSizes, accChunkStrides;
-  if (failed(matchRank2TensorExtractSlice(transferWrite.getBase(),
-                                          accChunkSource, accChunkOffsets,
-                                          accChunkSizes, accChunkStrides)))
+  OpFoldResult accChunkOffset, accChunkSize, accChunkStride;
+  if (failed(matchRank1TensorExtractSlice(transferWrite.getBase(),
+                                          accChunkSource, accChunkOffset,
+                                          accChunkSize, accChunkStride)))
     return failure();
 
   if (accChunkSource != innerBody->getArgument(1))
     return failure();
 
-  auto accRowOff = dyn_cast<Value>(accChunkOffsets[0]);
-  auto accColOff = dyn_cast<Value>(accChunkOffsets[1]);
-  if (!accRowOff || !accColOff)
-    return failure();
-  if (!isLoopIV(accRowOff, outerFor) || !isLoopIV(accColOff, innerFor))
+  auto accChunkOffVal = dyn_cast<Value>(accChunkOffset);
+  if (!accChunkOffVal || !isLoopIV(accChunkOffVal, innerFor))
     return failure();
 
   SmallVector<vector::TransferReadOp> transferReads;
@@ -987,30 +1046,61 @@ static LogicalResult tryRewriteRank2ScfForTileToMemref(OpBuilder &b,
   if (transferReads.empty() || transferReads.size() > 2)
     return failure();
 
+  // For each transfer_read:
+  //   rank-1 chunk  <- extracted from
+  //   rank-2 row/tile <- extracted from
+  //   global input tile
   SmallVector<Value> inputBaseTensors;
-  SmallVector<SmallVector<OpFoldResult>> inputOffsets, inputSizes, inputStrides;
+  SmallVector<OpFoldResult> chunkOffsets;
+  SmallVector<OpFoldResult> chunkSizes;
   inputBaseTensors.reserve(transferReads.size());
 
   for (vector::TransferReadOp tr : transferReads) {
-    Value srcTensor;
-    SmallVector<OpFoldResult> offs, szs, strs;
-    if (failed(matchRank2TensorExtractSlice(tr.getBase(), srcTensor, offs, szs,
-                                            strs)))
+    Value srcChunkTensor;
+    OpFoldResult off, size, stride;
+    if (failed(matchRank1TensorExtractSlice(tr.getBase(), srcChunkTensor, off,
+                                            size, stride)))
       return failure();
 
-    auto inRowOff = dyn_cast<Value>(offs[0]);
-    auto inColOff = dyn_cast<Value>(offs[1]);
-    if (!inRowOff || !inColOff)
-      return failure();
-    if (!isLoopIV(inRowOff, outerFor) || !isLoopIV(inColOff, innerFor))
+    auto offVal = dyn_cast<Value>(off);
+    if (!offVal || !isLoopIV(offVal, innerFor))
       return failure();
 
-    inputBaseTensors.push_back(srcTensor);
-    inputOffsets.push_back(std::move(offs));
-    inputSizes.push_back(std::move(szs));
-    inputStrides.push_back(std::move(strs));
+    // The source of the rank-1 chunk must itself be a rank-2 slice whose row
+    // is selected by the outer loop IV.
+    Value srcTileTensor;
+    SmallVector<OpFoldResult> rowOffsets, rowSizes, rowStrides;
+    if (failed(matchRank2TensorExtractSlice(srcChunkTensor, srcTileTensor,
+                                            rowOffsets, rowSizes, rowStrides)))
+      return failure();
+
+    auto rowOff = dyn_cast<Value>(rowOffsets[0]);
+    if (!rowOff || !isLoopIV(rowOff, outerFor))
+      return failure();
+
+    // Expect the intermediate rank-2 slice to keep a single row.
+    auto rowSize0Attr = dyn_cast<Attribute>(rowSizes[0]);
+    auto rowStride0Attr = dyn_cast<Attribute>(rowStrides[0]);
+    auto rowStride1Attr = dyn_cast<Attribute>(rowStrides[1]);
+    if (!rowSize0Attr || !rowStride0Attr || !rowStride1Attr)
+      return failure();
+
+    auto rowSize0Int = dyn_cast<IntegerAttr>(rowSize0Attr);
+    auto rowStride0Int = dyn_cast<IntegerAttr>(rowStride0Attr);
+    auto rowStride1Int = dyn_cast<IntegerAttr>(rowStride1Attr);
+    if (!rowSize0Int || !rowStride0Int || !rowStride1Int)
+      return failure();
+
+    if (rowSize0Int.getInt() != 1 || rowStride0Int.getInt() != 1 ||
+        rowStride1Int.getInt() != 1)
+      return failure();
+
+    inputBaseTensors.push_back(srcTileTensor);
+    chunkOffsets.push_back(off);
+    chunkSizes.push_back(size);
   }
 
+  // Build rank-2 memref tiles for the inputs.
   SmallVector<Value> inputTileMemrefs;
   inputTileMemrefs.reserve(inputBaseTensors.size());
   for (Value tensorLike : inputBaseTensors) {
@@ -1041,23 +1131,26 @@ static LogicalResult tryRewriteRank2ScfForTileToMemref(OpBuilder &b,
 
   OpBuilder ib = OpBuilder::atBlockEnd(newInnerBody);
 
+  // Build rank-1 chunk memrefs from the rank-2 input tiles.
   SmallVector<Value> newChunkMemrefs;
   newChunkMemrefs.reserve(inputTileMemrefs.size());
   for (size_t i = 0; i < inputTileMemrefs.size(); ++i) {
-    SmallVector<OpFoldResult> offs = {
-        map.lookupOrDefault(dyn_cast_if_present<Value>(inputOffsets[i][0])),
-        map.lookupOrDefault(dyn_cast_if_present<Value>(inputOffsets[i][1]))};
-    auto chunkOr = buildRank2Subview(ib, loc, inputTileMemrefs[i], offs,
-                                     inputSizes[i], inputStrides[i]);
+    auto chunkOr = buildRank1SubviewFromRank2(
+        ib, loc, inputTileMemrefs[i],
+        /*rowOff=*/newOuter.getInductionVar(),
+        /*colOff=*/
+        map.lookupOrDefault(dyn_cast_if_present<Value>(chunkOffsets[i])),
+        /*chunkSize=*/chunkSizes[i]);
     if (failed(chunkOr))
       return failure();
     newChunkMemrefs.push_back(*chunkOr);
   }
 
-  SmallVector<OpFoldResult> outOffsets = {newOuter.getInductionVar(),
-                                          newInner.getInductionVar()};
-  auto outChunkOr = buildRank2Subview(ib, loc, destSubview, outOffsets,
-                                      accChunkSizes, accChunkStrides);
+  auto outChunkOr =
+      buildRank1SubviewFromRank2(ib, loc, destSubview,
+                                 /*rowOff=*/newOuter.getInductionVar(),
+                                 /*colOff=*/newInner.getInductionVar(),
+                                 /*chunkSize=*/accChunkSize);
   if (failed(outChunkOr))
     return failure();
   Value outChunkMemref = *outChunkOr;
@@ -1221,8 +1314,8 @@ materializeTileToDestination(OpBuilder &b,
 
     auto sourceTy = dyn_cast<RankedTensorType>(source.getType());
     if (sourceTy && sourceTy.getRank() == 2) {
-      if (succeeded(tryRewriteRank2ScfForTileToMemref(b, loc, tileLoop,
-                                                      destSubview))) {
+      if (succeeded(tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop,
+                                                          destSubview))) {
         tileOp.erase();
 
         if (oldLoopOp->use_empty())
