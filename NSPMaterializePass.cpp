@@ -422,15 +422,19 @@ materializeInputAsSubviewRank2(OpBuilder &b, Location loc, Value inputTensor) {
                  b.getIndexAttr(resultTy.getShape()[1])};
         strides = {b.getIndexAttr(1), b.getIndexAttr(1)};
       } else {
-        if (auto old0 = dyn_cast<Value>(offsets[0]))
-          offsets[0] = b.create<arith::AddIOp>(loc, off0, old0);
-        else if (auto old0Attr = dyn_cast<Attribute>(offsets[0]))
-          offsets[0] =
-              b.create<arith::AddIOp>(loc, off0,
-                                      b.create<arith::ConstantIndexOp>(
-                                          loc, cast<IntegerAttr>(old0Attr).getInt()));
-        else
+        if (auto old0 = dyn_cast<Value>(offsets[0])) {
+          Value newOff0 = b.create<arith::AddIOp>(loc, off0, old0).getResult();
+          offsets[0] = newOff0;
+        } else if (auto old0Attr = dyn_cast<Attribute>(offsets[0])) {
+          Value old0Val =
+              b.create<arith::ConstantIndexOp>(
+                   loc, cast<IntegerAttr>(old0Attr).getInt())
+                  .getResult();
+          Value newOff0 = b.create<arith::AddIOp>(loc, off0, old0Val).getResult();
+          offsets[0] = newOff0;
+        } else {
           return failure();
+        }
       }
 
       baseTensor = allSliceOp.getOperand(0);
