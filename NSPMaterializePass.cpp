@@ -63,6 +63,38 @@ namespace hexagon {
 
 namespace {
 
+//===----------------------------------------------------------------------===//
+// Grid / ABI helpers
+//===----------------------------------------------------------------------===//
+
+static Value castToIndexIfNeeded(Value v, OpBuilder &b, Location loc) {
+  if (v.getType().isIndex())
+    return v;
+  if (isa<IntegerType>(v.getType()))
+    return b.create<arith::IndexCastOp>(loc, b.getIndexType(), v);
+  return Value();
+}
+
+/// Compute the participant linear index from the Hexagon entry-point ABI:
+///   linearIdx = coreId * numThreadsPerCore + threadId
+static FailureOr<Value> computeLinearIdxFromFuncArgs(func::FuncOp func,
+                                                     OpBuilder &b,
+                                                     Location loc) {
+  auto args = func.getArguments();
+  int64_t n = static_cast<int64_t>(args.size());
+  if (n < 6)
+    return failure();
+
+  Value cid = castToIndexIfNeeded(args[n - 2], b, loc);
+  Value tid = castToIndexIfNeeded(args[n - 3], b, loc);
+  Value ntpc = castToIndexIfNeeded(args[n - 6], b, loc);
+  if (!cid || !tid || !ntpc)
+    return failure();
+
+  Value mul = b.create<arith::MulIOp>(loc, cid, ntpc);
+  return b.create<arith::AddIOp>(loc, mul, tid).getResult();
+}
+
 static FailureOr<mlir::shard::GridOp> lookupGrid(Operation *op,
                                                  FlatSymbolRefAttr gridAttr) {
   if (!gridAttr)
@@ -98,6 +130,18 @@ getStaticTileShape(mlir::hexagon::nsp::MaterializeTileOp tileOp) {
   }
 
   return shape;
+}
+
+//===----------------------------------------------------------------------===//
+// Generic pattern classification helpers
+//===----------------------------------------------------------------------===//
+
+/// Return the source value after stripping trivial tensor.cast wrappers.
+static Value stripTensorCastWrappers(Value v) {
+  Value cur = v;
+  while (auto castOp = cur.getDefiningOp<tensor::CastOp>())
+    cur = castOp.getSource();
+  return cur;
 }
 
 /// Return true iff `g` is a localized elementwise generic that can be
@@ -150,12 +194,9 @@ static bool isSimpleLocalizedElementwiseGeneric(linalg::GenericOp g) {
   return true;
 }
 
-static FailureOr<Value> stripTensorCasts(Value v) {
-  Value cur = v;
-  while (auto castOp = cur.getDefiningOp<tensor::CastOp>())
-    cur = castOp.getSource();
-  return cur;
-}
+//===----------------------------------------------------------------------===//
+// Memref view builders
+//===----------------------------------------------------------------------===//
 
 /// Build a rank-2 memref.subview at the current insertion point.
 static FailureOr<Value> buildRank2Subview(OpBuilder &b, Location loc,
@@ -258,16 +299,17 @@ matchRank2TensorExtractSlice(Value v, Value &source,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// Tensor -> memref materialization helpers
+//===----------------------------------------------------------------------===//
+
 /// Materialize a rank-2 memref view from a tensor slice-like value.
 /// Supported sources:
 ///   - shard.all_slice over bufferization.to_tensor(memref)
 ///   - tensor.extract_slice over bufferization.to_tensor(memref)
 static FailureOr<Value>
-materializeInputAsSubviewRank2(OpBuilder &b, Location loc, Value inputTensor) {
-  auto strippedOr = stripTensorCasts(inputTensor);
-  if (failed(strippedOr))
-    return failure();
-  Value base = *strippedOr;
+materializeRank2InputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
+  Value base = stripTensorCastWrappers(inputTensor);
 
   Value sourceTensor;
   SmallVector<OpFoldResult> offsets, sizes, strides;
@@ -283,35 +325,7 @@ materializeInputAsSubviewRank2(OpBuilder &b, Location loc, Value inputTensor) {
     if (!func)
       return failure();
 
-    auto linearIdxOrFail = [&]() -> FailureOr<Value> {
-      auto args = func.getArguments();
-      int64_t n = static_cast<int64_t>(args.size());
-      if (n < 6)
-        return failure();
-
-      Value cid = args[n - 2];
-      Value tid = args[n - 3];
-      Value ntpc = args[n - 6];
-
-      auto castToIndexIfNeeded = [&](Value v) -> Value {
-        if (v.getType().isIndex())
-          return v;
-        if (isa<IntegerType>(v.getType()))
-          return b.create<arith::IndexCastOp>(loc, b.getIndexType(), v);
-        return Value();
-      };
-
-      cid = castToIndexIfNeeded(cid);
-      tid = castToIndexIfNeeded(tid);
-      ntpc = castToIndexIfNeeded(ntpc);
-      if (!cid || !tid || !ntpc)
-        return failure();
-
-      Value mul = b.create<arith::MulIOp>(loc, cid, ntpc);
-      Value add = b.create<arith::AddIOp>(loc, mul, tid);
-      return add;
-    }();
-
+    auto linearIdxOrFail = computeLinearIdxFromFuncArgs(func, b, loc);
     if (failed(linearIdxOrFail))
       return failure();
 
@@ -360,34 +374,7 @@ materializeInputAsSubviewRank2(OpBuilder &b, Location loc, Value inputTensor) {
       if (!func)
         return failure();
 
-      auto linearIdxOrFail = [&]() -> FailureOr<Value> {
-        auto args = func.getArguments();
-        int64_t n = static_cast<int64_t>(args.size());
-        if (n < 6)
-          return failure();
-
-        Value cid = args[n - 2];
-        Value tid = args[n - 3];
-        Value ntpc = args[n - 6];
-
-        auto castToIndexIfNeeded = [&](Value v) -> Value {
-          if (v.getType().isIndex())
-            return v;
-          if (isa<IntegerType>(v.getType()))
-            return b.create<arith::IndexCastOp>(loc, b.getIndexType(), v);
-          return Value();
-        };
-
-        cid = castToIndexIfNeeded(cid);
-        tid = castToIndexIfNeeded(tid);
-        ntpc = castToIndexIfNeeded(ntpc);
-        if (!cid || !tid || !ntpc)
-          return failure();
-
-        Value mul = b.create<arith::MulIOp>(loc, cid, ntpc);
-        Value add = b.create<arith::AddIOp>(loc, mul, tid);
-        return add;
-      }();
+      auto linearIdxOrFail = computeLinearIdxFromFuncArgs(func, b, loc);
       if (failed(linearIdxOrFail))
         return failure();
 
@@ -447,12 +434,10 @@ materializeInputAsSubviewRank2(OpBuilder &b, Location loc, Value inputTensor) {
 /// This helper creates any required arithmetic/subview IR at the builder's
 /// current insertion point. Callers must ensure that point dominates the
 /// future use sites.
-static FailureOr<Value> materializeInputAsSubview(OpBuilder &b, Location loc,
-                                                  Value inputTensor) {
-  auto strippedOr = stripTensorCasts(inputTensor);
-  if (failed(strippedOr))
-    return failure();
-  Value base = *strippedOr;
+static FailureOr<Value> materializeRank1InputAsSubview(OpBuilder &b,
+                                                       Location loc,
+                                                       Value inputTensor) {
+  Value base = stripTensorCastWrappers(inputTensor);
 
   Value sourceTensor;
   OpFoldResult offset;
@@ -474,35 +459,7 @@ static FailureOr<Value> materializeInputAsSubview(OpBuilder &b, Location loc,
     if (!func)
       return failure();
 
-    auto linearIdxOrFail = [&]() -> FailureOr<Value> {
-      // Same ABI convention used in ShardToLLVMPass, kept local here.
-      auto args = func.getArguments();
-      int64_t n = static_cast<int64_t>(args.size());
-      if (n < 6)
-        return failure();
-
-      Value cid = args[n - 2];
-      Value tid = args[n - 3];
-      Value ntpc = args[n - 6];
-
-      auto castToIndexIfNeeded = [&](Value v) -> Value {
-        if (v.getType().isIndex())
-          return v;
-        if (isa<IntegerType>(v.getType()))
-          return b.create<arith::IndexCastOp>(loc, b.getIndexType(), v);
-        return Value();
-      };
-
-      cid = castToIndexIfNeeded(cid);
-      tid = castToIndexIfNeeded(tid);
-      ntpc = castToIndexIfNeeded(ntpc);
-      if (!cid || !tid || !ntpc)
-        return failure();
-
-      Value mul = b.create<arith::MulIOp>(loc, cid, ntpc);
-      Value add = b.create<arith::AddIOp>(loc, mul, tid);
-      return add;
-    }();
+    auto linearIdxOrFail = computeLinearIdxFromFuncArgs(func, b, loc);
 
     if (failed(linearIdxOrFail))
       return failure();
@@ -566,6 +523,16 @@ static FailureOr<Value> materializeInputAsSubview(OpBuilder &b, Location loc,
                                  strides)
       .getResult();
 }
+
+static FailureOr<Value> materializeTensorSliceLikeAsSubview(OpBuilder &b,
+                                                            Location loc,
+                                                            Value v) {
+  return materializeRank1InputAsSubview(b, loc, v);
+}
+
+//===----------------------------------------------------------------------===//
+// Localized generic rewrite helpers
+//===----------------------------------------------------------------------===//
 
 /// Create a memref-semantics replacement for `localizedGeneric` at the
 /// builder's current insertion point.
@@ -642,29 +609,34 @@ static void removeNSPLocalizedAttrs(linalg::GenericOp generic) {
   generic->removeAttr("nsp.group_id");
 }
 
-/// Return the source value after stripping trivial tensor.cast wrappers.
-static Value stripTensorCastWrappers(Value v) {
-  Value cur = v;
-  while (auto castOp = cur.getDefiningOp<tensor::CastOp>())
-    cur = castOp.getSource();
-  return cur;
+static LogicalResult finalizeSuccessfulTensorToMemrefRewrite(
+    mlir::hexagon::nsp::MaterializeTileOp tileOp, Operation *oldOp,
+    Value initArg) {
+  tileOp.erase();
+
+  if (oldOp && oldOp->use_empty())
+    oldOp->erase();
+
+  if (auto emptyOp = initArg.getDefiningOp<tensor::EmptyOp>())
+    eraseIfDead(emptyOp);
+
+  return success();
 }
+
+//===----------------------------------------------------------------------===//
+// Tensor slice matchers
+//===----------------------------------------------------------------------===//
 
 /// Return true iff `v` is the induction variable of `forOp`.
 static bool isLoopIV(Value v, scf::ForOp forOp) {
   return v == forOp.getInductionVar();
 }
 
-/// Match a rank-1 tensor.extract_slice with:
-///   %slice = tensor.extract_slice %source[%offset][%size][%stride]
-///
-/// On success, return the source and the single offset/size/stride triplet.
 static LogicalResult matchRank1TensorExtractSlice(Value v, Value &source,
                                                   OpFoldResult &offset,
                                                   OpFoldResult &size,
                                                   OpFoldResult &stride) {
-  auto extract =
-      stripTensorCastWrappers(v).getDefiningOp<tensor::ExtractSliceOp>();
+  auto extract = stripTensorCastWrappers(v).getDefiningOp<tensor::ExtractSliceOp>();
   if (!extract)
     return failure();
 
@@ -719,14 +691,9 @@ static FailureOr<Value> buildRank1Subview(OpBuilder &b, Location loc,
       .getResult();
 }
 
-/// Materialize a rank-1 memref view from a tensor slice-like value.
-/// Supported sources:
-///   - shard.all_slice over bufferization.to_tensor(memref)
-///   - tensor.extract_slice over bufferization.to_tensor(memref)
-static FailureOr<Value>
-materializeTensorSliceLikeAsSubview(OpBuilder &b, Location loc, Value v) {
-  return materializeInputAsSubview(b, loc, v);
-}
+//===----------------------------------------------------------------------===//
+// Rank-1 loop fast-path
+//===----------------------------------------------------------------------===//
 
 /// Try to rewrite a tiled tensor scf.for into a memref-writing scf.for.
 ///
@@ -963,6 +930,10 @@ static LogicalResult tryRewriteScfForTileToMemref(OpBuilder &b, Location loc,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// Rank-2 loop fast-path
+//===----------------------------------------------------------------------===//
+
 /// Try to rewrite the current elemenwise_2d-style pattern:
 ///   - outer tile / accumulator is rank-2
 ///   - inner vectorized chunks are rank-2 slices of shape [1 x C]
@@ -1181,7 +1152,7 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
   SmallVector<Value> inputTileMemrefs;
   inputTileMemrefs.reserve(inputBaseTensors.size());
   for (Value tensorLike : inputBaseTensors) {
-    auto memrefOr = materializeInputAsSubviewRank2(b, loc, tensorLike);
+    auto memrefOr = materializeRank2InputAsSubview(b, loc, tensorLike);
     if (failed(memrefOr))
       return failure();
     inputTileMemrefs.push_back(*memrefOr);
@@ -1293,6 +1264,10 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// Tile materialization driver
+//===----------------------------------------------------------------------===//
+
 static LogicalResult
 materializeTileToDestination(OpBuilder &b,
                              mlir::hexagon::nsp::MaterializeTileOp tileOp,
@@ -1363,7 +1338,7 @@ materializeTileToDestination(OpBuilder &b,
 
       bool canRewriteAllInputs = true;
       for (OpOperand *in : localizedGeneric.getDpsInputOperands()) {
-        auto subviewOr = materializeInputAsSubview(b, loc, in->get());
+        auto subviewOr = materializeRank1InputAsSubview(b, loc, in->get());
         if (failed(subviewOr)) {
           canRewriteAllInputs = false;
           break;
@@ -1376,18 +1351,8 @@ materializeTileToDestination(OpBuilder &b,
             b, localizedGeneric, memrefInputs, destSubview);
         if (succeeded(newGenericOr)) {
           removeNSPLocalizedAttrs(localizedGeneric);
-
-          // Erase the hand-off op first, since it is the last user of the
-          // old tensor result.
-          tileOp.erase();
-
-          if (oldGenericOp->use_empty())
-            oldGenericOp->erase();
-
-          if (auto emptyOp = oldInit.getDefiningOp<tensor::EmptyOp>())
-            eraseIfDead(emptyOp);
-
-          return success();
+          return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldGenericOp,
+                                                         oldInit);
         }
       }
     }
@@ -1400,52 +1365,20 @@ materializeTileToDestination(OpBuilder &b,
 
     auto sourceTy = dyn_cast<RankedTensorType>(source.getType());
 
-    // if (sourceTy && sourceTy.getRank() == 2) {
-    //   if (succeeded(tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop,
-    //                                                       destSubview))) {
-    //     tileOp.erase();
-    //
-    //     if (oldLoopOp->use_empty())
-    //       oldLoopOp->erase();
-    //
-    //     if (auto emptyOp = initArg.getDefiningOp<tensor::EmptyOp>())
-    //       eraseIfDead(emptyOp);
-    //
-    //     return success();
-    //   }
-    // }
-
     if (sourceTy && sourceTy.getRank() == 2) {
-      if (succeeded(
-              tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop, destSubview))) {
-        tileOp.emitRemark() << "rank2/rank1 fast-path matched";
-        tileOp.erase();
-
-        if (oldLoopOp->use_empty())
-          oldLoopOp->erase();
-
-        if (auto emptyOp = initArg.getDefiningOp<tensor::EmptyOp>())
-          eraseIfDead(emptyOp);
-
-        return success();
+      if (succeeded(tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop,
+                                                          destSubview))) {
+        return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldLoopOp,
+                                                       initArg);
       }
-
-      tileOp.emitRemark() << "rank2/rank1 fast-path did not match; trying fallback paths";
     }
 
     // Keep the existing rank-1 fast-path unchanged.
     // If rank-2 matching fails, we still fall back to the old logic below.
     if (succeeded(
             tryRewriteScfForTileToMemref(b, loc, tileLoop, destSubview))) {
-      tileOp.erase();
-
-      if (oldLoopOp->use_empty())
-        oldLoopOp->erase();
-
-      if (auto emptyOp = initArg.getDefiningOp<tensor::EmptyOp>())
-        eraseIfDead(emptyOp);
-
-      return success();
+      return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldLoopOp,
+                                                     initArg);
     }
   }
 
@@ -1461,6 +1394,10 @@ materializeTileToDestination(OpBuilder &b,
   tileOp.erase();
   return success();
 }
+
+//===----------------------------------------------------------------------===//
+// Pass driver
+//===----------------------------------------------------------------------===//
 
 struct NSPMaterializePass
     : public PassWrapper<NSPMaterializePass, OperationPass<ModuleOp>> {
