@@ -364,6 +364,81 @@ materializeInputAsSubviewRank2(OpBuilder &b, Location loc, Value inputTensor) {
     return failure();
   }
 
+  Value baseTensor = sourceTensor;
+  while (true) {
+    if (auto castOp = baseTensor.getDefiningOp<tensor::CastOp>()) {
+      baseTensor = castOp.getSource();
+      continue;
+    }
+    if (auto allSliceOp = baseTensor.getDefiningOp<mlir::shard::AllSliceOp>()) {
+      auto resultTy =
+          dyn_cast<RankedTensorType>(allSliceOp.getResult().getType());
+      if (!resultTy || resultTy.getRank() != 2)
+        return failure();
+
+      auto func = allSliceOp->getParentOfType<func::FuncOp>();
+      if (!func)
+        return failure();
+
+      auto linearIdxOrFail = [&]() -> FailureOr<Value> {
+        auto args = func.getArguments();
+        int64_t n = static_cast<int64_t>(args.size());
+        if (n < 6)
+          return failure();
+
+        Value cid = args[n - 2];
+        Value tid = args[n - 3];
+        Value ntpc = args[n - 6];
+
+        auto castToIndexIfNeeded = [&](Value v) -> Value {
+          if (v.getType().isIndex())
+            return v;
+          if (isa<IntegerType>(v.getType()))
+            return b.create<arith::IndexCastOp>(loc, b.getIndexType(), v);
+          return Value();
+        };
+
+        cid = castToIndexIfNeeded(cid);
+        tid = castToIndexIfNeeded(tid);
+        ntpc = castToIndexIfNeeded(ntpc);
+        if (!cid || !tid || !ntpc)
+          return failure();
+
+        Value mul = b.create<arith::MulIOp>(loc, cid, ntpc);
+        Value add = b.create<arith::AddIOp>(loc, mul, tid);
+        return add;
+      }();
+      if (failed(linearIdxOrFail))
+        return failure();
+
+      Value tileRows =
+          b.create<arith::ConstantIndexOp>(loc, resultTy.getShape()[0]);
+      Value off0 = b.create<arith::MulIOp>(loc, *linearIdxOrFail, tileRows);
+
+      // Compose the existing offsets with the all_slice outer tile offset.
+      if (offsets.empty()) {
+        offsets = {off0, b.getIndexAttr(0)};
+        sizes = {b.getIndexAttr(resultTy.getShape()[0]),
+                 b.getIndexAttr(resultTy.getShape()[1])};
+        strides = {b.getIndexAttr(1), b.getIndexAttr(1)};
+      } else {
+        if (auto old0 = dyn_cast<Value>(offsets[0]))
+          offsets[0] = b.create<arith::AddIOp>(loc, off0, old0);
+        else if (auto old0Attr = dyn_cast<Attribute>(offsets[0]))
+          offsets[0] =
+              b.create<arith::AddIOp>(loc, off0,
+                                      b.create<arith::ConstantIndexOp>(
+                                          loc, cast<IntegerAttr>(old0Attr).getInt()));
+        else
+          return failure();
+      }
+
+      baseTensor = allSliceOp.getOperand(0);
+      continue;
+    }
+    break;
+  }
+
   auto toTensor = sourceTensor.getDefiningOp<bufferization::ToTensorOp>();
   if (!toTensor)
     return failure();
@@ -929,8 +1004,13 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
                                                            Location loc,
                                                            scf::ForOp outerFor,
                                                            Value destSubview) {
-  if (outerFor.getNumResults() != 1 || outerFor.getNumRegionIterArgs() != 1)
+
+  outerFor.emitRemark() << "trying rank2/rank1 tile materialization fast-path";
+
+  if (outerFor.getNumResults() != 1 || outerFor.getNumRegionIterArgs() != 1) {
+    outerFor.emitRemark() << "fast-path: outer loop must have exactly one tensor iter_arg/result";
     return failure();
+  }
 
   auto outerResultTy =
       dyn_cast<RankedTensorType>(outerFor.getResult(0).getType());
@@ -950,21 +1030,26 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
     return failure();
 
   auto innerFor = outerYield.getOperand(0).getDefiningOp<scf::ForOp>();
-  if (!innerFor)
+  if (!innerFor) {
+    outerFor.emitRemark() << "fast-path: outer yield is not defined by an inner scf.for";
     return failure();
+  }
   if (innerFor->getBlock() != outerBody)
     return failure();
 
   if (innerFor.getNumResults() != 1 || innerFor.getNumRegionIterArgs() != 1)
     return failure();
 
+
   auto innerResultTy =
       dyn_cast<RankedTensorType>(innerFor.getResult(0).getType());
   if (!innerResultTy || innerResultTy != outerResultTy)
     return failure();
 
-  if (innerFor.getInitArgs()[0] != outerBody->getArgument(1))
+  if (innerFor.getInitArgs()[0] != outerBody->getArgument(1)) {
+    outerFor.emitRemark() << "fast-path: inner loop init_arg is not the outer loop-carried accumulator";
     return failure();
+  }
 
   Block *innerBody = innerFor.getBody();
   if (!innerBody)
@@ -976,15 +1061,19 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
 
   auto insertSlice =
       innerYield.getOperand(0).getDefiningOp<tensor::InsertSliceOp>();
-  if (!insertSlice)
+  if (!insertSlice) {
+    innerFor.emitRemark() << "fast-path: inner yield is not a tensor.insert_slice";
     return failure();
+  }
   if (insertSlice.getDest() != innerBody->getArgument(1))
     return failure();
 
   auto insertedChunkTy =
       dyn_cast<RankedTensorType>(insertSlice.getSource().getType());
-  if (!insertedChunkTy || insertedChunkTy.getRank() != 1)
+  if (!insertedChunkTy || insertedChunkTy.getRank() != 1) {
+    innerFor.emitRemark() << "fast-path: inserted chunk is not rank-1";
     return failure();
+  }
 
   auto insertOffsets = insertSlice.getMixedOffsets();
   auto insertSizes = insertSlice.getMixedSizes();
@@ -1014,13 +1103,17 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
     return failure();
 
   if (size0Int.getInt() != 1 || stride0Int.getInt() != 1 ||
-      stride1Int.getInt() != 1)
+      stride1Int.getInt() != 1) {
+    innerFor.emitRemark() << "fast-path: expected insert_slice shape/strides [1, C] [1, 1]";
     return failure();
+  }
 
   auto transferWrite =
       insertSlice.getSource().getDefiningOp<vector::TransferWriteOp>();
-  if (!transferWrite)
+  if (!transferWrite) {
+    innerFor.emitRemark() << "fast-path: insert_slice source is not vector.transfer_write";
     return failure();
+  }
 
   // transfer_write base must be a rank-1 chunk extracted from the loop-carried
   // accumulator, with chunk offset driven by the inner loop IV.
@@ -1028,11 +1121,15 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
   OpFoldResult accChunkOffset, accChunkSize, accChunkStride;
   if (failed(matchRank1TensorExtractSlice(transferWrite.getBase(),
                                           accChunkSource, accChunkOffset,
-                                          accChunkSize, accChunkStride)))
+                                          accChunkSize, accChunkStride))) {
+    innerFor.emitRemark() << "fast-path: transfer_write base is not a rank-1 tensor.extract_slice";
     return failure();
+  }
 
-  if (accChunkSource != innerBody->getArgument(1))
+  if (accChunkSource != innerBody->getArgument(1)) {
+    innerFor.emitRemark() << "fast-path: transfer_write base does not slice the loop-carried accumulator directly";
     return failure();
+  }
 
   auto accChunkOffVal = dyn_cast<Value>(accChunkOffset);
   if (!accChunkOffVal || !isLoopIV(accChunkOffVal, innerFor))
@@ -1043,8 +1140,10 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
     if (auto tr = dyn_cast<vector::TransferReadOp>(op))
       transferReads.push_back(tr);
   }
-  if (transferReads.empty() || transferReads.size() > 2)
+  if (transferReads.empty() || transferReads.size() > 2) {
+    innerFor.emitRemark() << "fast-path: expected 1 or 2 vector.transfer_read ops in the inner loop";
     return failure();
+  }
 
   // For each transfer_read:
   //   rank-1 chunk  <- extracted from
@@ -1059,8 +1158,10 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
     Value srcChunkTensor;
     OpFoldResult off, size, stride;
     if (failed(matchRank1TensorExtractSlice(tr.getBase(), srcChunkTensor, off,
-                                            size, stride)))
+                                            size, stride))) {
+      tr.emitRemark() << "fast-path: transfer_read base is not a rank-1 tensor.extract_slice";
       return failure();
+    }
 
     auto offVal = dyn_cast<Value>(off);
     if (!offVal || !isLoopIV(offVal, innerFor))
@@ -1071,12 +1172,16 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
     Value srcTileTensor;
     SmallVector<OpFoldResult> rowOffsets, rowSizes, rowStrides;
     if (failed(matchRank2TensorExtractSlice(srcChunkTensor, srcTileTensor,
-                                            rowOffsets, rowSizes, rowStrides)))
+                                            rowOffsets, rowSizes, rowStrides))) {
+      tr.emitRemark() << "fast-path: rank-1 chunk source is not a rank-2 tensor.extract_slice";
       return failure();
+    }
 
     auto rowOff = dyn_cast<Value>(rowOffsets[0]);
-    if (!rowOff || !isLoopIV(rowOff, outerFor))
+    if (!rowOff || !isLoopIV(rowOff, outerFor)) {
+      tr.emitRemark() << "fast-path: outer row slice is not indexed by the outer loop IV";
       return failure();
+    }
 
     // Expect the intermediate rank-2 slice to keep a single row.
     auto rowSize0Attr = dyn_cast<Attribute>(rowSizes[0]);
@@ -1105,8 +1210,10 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b,
   inputTileMemrefs.reserve(inputBaseTensors.size());
   for (Value tensorLike : inputBaseTensors) {
     auto memrefOr = materializeInputAsSubviewRank2(b, loc, tensorLike);
-    if (failed(memrefOr))
+    if (failed(memrefOr)) {
+      outerFor.emitRemark() << "fast-path: failed to materialize rank-2 input tile as memref subview";
       return failure();
+    }
     inputTileMemrefs.push_back(*memrefOr);
   }
 
@@ -1313,9 +1420,26 @@ materializeTileToDestination(OpBuilder &b,
     Operation *oldLoopOp = tileLoop.getOperation();
 
     auto sourceTy = dyn_cast<RankedTensorType>(source.getType());
+
+    // if (sourceTy && sourceTy.getRank() == 2) {
+    //   if (succeeded(tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop,
+    //                                                       destSubview))) {
+    //     tileOp.erase();
+    //
+    //     if (oldLoopOp->use_empty())
+    //       oldLoopOp->erase();
+    //
+    //     if (auto emptyOp = initArg.getDefiningOp<tensor::EmptyOp>())
+    //       eraseIfDead(emptyOp);
+    //
+    //     return success();
+    //   }
+    // }
+
     if (sourceTy && sourceTy.getRank() == 2) {
-      if (succeeded(tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop,
-                                                          destSubview))) {
+      if (succeeded(
+              tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop, destSubview))) {
+        tileOp.emitRemark() << "rank2/rank1 fast-path matched";
         tileOp.erase();
 
         if (oldLoopOp->use_empty())
@@ -1326,6 +1450,8 @@ materializeTileToDestination(OpBuilder &b,
 
         return success();
       }
+
+      tileOp.emitRemark() << "rank2/rank1 fast-path did not match; trying fallback paths";
     }
 
     // Keep the existing rank-1 fast-path unchanged.
@@ -1345,6 +1471,7 @@ materializeTileToDestination(OpBuilder &b,
   }
 
   // Fallback: keep the original tensor path.
+  tileOp.emitRemark() << "falling back to bufferization.materialize_in_destination";
   b.create<bufferization::MaterializeInDestinationOp>(
       loc, TypeRange{}, source, destSubview,
       /*restrict=*/false, /*writable=*/true);
