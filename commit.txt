@@ -1,19 +1,10 @@
-[NSP] Add initial rank-2 support via tile_shape in MaterializeTile
+[NSP] Add rank-2 tiled materialization fast-path
 
-Replace tile_size with tile_shape in nsp.materialize_tile to enable
-multi-dimensional tiles (initially rank-2).
+Add a dedicated NSPMaterializePass fast-path for the current 2-D
+elementwise tiled pattern.
 
-Update verification to ensure:
-
-rank consistency between source, destination, and tile_shape
-positive tile dimensions
-compatibility with source shape
-tile bounds fit within destination (when static)
-
-This enables correct materialization of 2D elementwise workloads (e.g.
-vector_add_2d) under the existing 1D sharding model (split on dim0).
-
-[shard-to-llvm] Lower rank-2 shard.all_slice via tensor.extract_slice
-
-Extend LowerAllSlice in ShardToLLVMPass to support ranked tensors
-sliced along dimension 0, instead of handling only rank-1 tensors.
+The new rewrite matches rank-2 shard-local tiles produced as nested scf.for
+loops with rank-2 [1 x C] vectorized chunks and materializes them directly
+into memref subviews of the final destination buffer. This avoids the
+fallback through bufferization.materialize_in_destination and removes the
+temporary tensor accumulation path for this case.
