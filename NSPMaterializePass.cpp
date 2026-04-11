@@ -272,11 +272,8 @@ matchRank2TensorExtractSlice(Value v, Value &source,
                              SmallVectorImpl<OpFoldResult> &offsets,
                              SmallVectorImpl<OpFoldResult> &sizes,
                              SmallVectorImpl<OpFoldResult> &strides) {
-  auto strippedOr = stripTensorCasts(v);
-  if (failed(strippedOr))
-    return failure();
-
-  auto extract = (*strippedOr).getDefiningOp<tensor::ExtractSliceOp>();
+  auto extract =
+      stripTensorCastWrappers(v).getDefiningOp<tensor::ExtractSliceOp>();
   if (!extract)
     return failure();
 
@@ -1383,7 +1380,6 @@ materializeTileToDestination(OpBuilder &b,
   }
 
   // Fallback: keep the original tensor path.
-  tileOp.emitRemark() << "falling back to bufferization.materialize_in_destination";
   b.create<bufferization::MaterializeInDestinationOp>(
       loc, TypeRange{}, source, destSubview,
       /*restrict=*/false, /*writable=*/true);
