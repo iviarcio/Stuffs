@@ -8,3 +8,112 @@ loops with rank-2 [1 x C] vectorized chunks and materializes them directly
 into memref subviews of the final destination buffer. This avoids the
 fallback through bufferization.materialize_in_destination and removes the
 temporary tensor accumulation path for this case.
+
+NSPSharding Technical Report
+
+Overview
+
+NSPSharding is the current sharding and SPMDization flow being developed for the Hexagon MLIR stack to distribute tensor computations across multiple NSP participants. At a high level, the system takes tensor-based MLIR, identifies computations that can be partitioned over a device mesh, annotates the IR with shard dialect metadata, rewrites supported operations into shard-local computation, and then reconnects those local tiles to the final destination buffers. The overall objective is to enable multi-NSP execution while preserving compatibility with the existing Hexagon tiling, vectorization, and lowering infrastructure.
+
+The design intentionally separates planning, localization, and destination materialization. This split is central to the current implementation. The planner works early, at a high tensor level, where the structure of the computation is still visible. The localization pass then converts eligible global tensor computations into shard-local tensor computations, but deliberately preserves tensor semantics so that downstream optimization passes such as tiling and vectorization can still operate on familiar linalg patterns. Only afterwards does the materialization pass reconnect the localized results to destination buffers through explicit per-shard subviews. This separation has proven important for bring-up because it avoids prematurely committing to memref-level forms that would block or complicate later optimization.
+
+In its current status, NSPSharding is operational for a focused subset of cases, especially elementwise patterns and the current 1-D grid execution model. The flow is already capable of expressing sharded execution without requiring collectives, which matches the present bring-up target of no inter-NSP traffic. Support has also progressed beyond pure rank-1 handling, with rank-2 support now present in important parts of the flow, particularly in localization and in selected materialization fast-paths. At the same time, the implementation remains intentionally conservative. It uses explicit structural constraints to avoid incorrect rewrites, and it still lacks full support for collectives, more general tensor layouts, and multi-dimensional grids.
+
+Pipeline Structure and Current Status
+
+The canonical NSP pipeline currently consists of four major phases: planning, optional sharding propagation, localization, and materialization, followed by cleanup. The planner attaches explicit shard annotations. The propagation pass then infers and transports those shardings through non-shard operations by relying on ShardingInterface models registered by NSP. Localization rewrites supported shard-annotated compute into shard-local tensor operations. Materialization then converts those local tensor tiles into writes into the final global destination buffers. Cleanup passes such as canonicalization and CSE are inserted at key boundaries.
+
+A major architectural feature of the pipeline is that tiling and vectorization are expected to run between localization and materialization. This is not an incidental detail; it is one of the core design decisions. NSPSharding does not immediately lower localized tensor computations into destination memrefs because doing so would make it harder for existing Hexagon optimization passes to recognize and transform the compute. Instead, the pipeline intentionally keeps tensor semantics alive long enough for those downstream passes to do their work.
+
+Module: NSPShardPlanner
+
+The planner is the entry point of NSPSharding. It operates on linalg.generic before bufferization-style lowering has erased the useful high-level structure of the computation. Its job is to inspect iterator types and indexing maps, choose a sharding dimension, create or reuse the shard.grid symbol, materialize explicit shard.sharding values, and rebuild the linalg.generic so that the sharding is attached in the IR. In principle, it is also the place where collective requirements are identified. The pass already computes whether a selected sharding decision would require an all-reduce for correctness.
+
+The current planner is heuristic-driven. It prefers sharding along a parallel iterator that indexes the output, which is the natural choice for straightforward elementwise or map-style computations. It also has pattern recognition for common matmul-like contractions. In that case, it can distinguish safe sharding along the output-parallel dimensions from unsafe sharding along the reduction dimension. This allows the planner to identify cases where sharding can remain purely local versus cases where global reduction semantics would be needed.
+
+In its present form, the planner is functional and useful, but still intentionally conservative. The grid model is currently 1-D. The planner assumes a single output for important parts of the analysis. Its decision process is heuristic rather than cost-model driven. Collective insertion is not yet a complete path; the pass can recognize when a plan would require all-reduce semantics, but the production handling of those collectives is still future work. Accordingly, the current recommended mode is the non-collective mode in which the planner avoids sharding decisions that would imply cross-NSP communication.
+
+The planner is already sufficient for the current bring-up targets because those targets are dominated by elementwise and locally reducible cases. However, more advanced workloads will eventually require a richer planning model, including better treatment of multi-result operations, broader contraction shapes, more nuanced legality checks, and eventually a real cost model that can balance compute distribution against communication overhead.
+
+Module: NSPShardInterfaceModels
+
+The sharding propagation stage depends on shard::ShardingInterface. In practice, many operations that appear in real MLIR graphs are not part of the shard dialect and therefore do not natively participate in propagation. The purpose of NSPShardInterfaceModels is to attach external ShardingInterface models to those boundary, view, structural, and elementwise operations so that shard information can cross them rather than stopping prematurely.
+
+This module is strategically important even though it does not itself perform computation. It provides the connective tissue that allows the planner’s sharding decisions to survive through tensor and memref boundary operations, bufferization conversions, simple arithmetic and math operations, structural control-flow scaffolding, and a number of memory-related operations. The registered models are generally conservative. When an operation is semantically transparent from a sharding perspective, the model preserves or forwards the existing sharding. For elementwise operations, the model treats the sharding of operands and results consistently. For operations that should not create new sharding semantics, the model behaves as a no-op carrier.
+
+The current coverage is already meaningful. It includes support for memref reinterpretation and allocation boundaries, copy-like operations, tensor-buffer conversions such as to_tensor and to_buffer, materialize_in_destination, structural constructs such as scf.for and scf.yield, selected arithmetic operators, and selected math functions such as exp, tanh, and erf. This coverage is enough to keep propagation alive in a significant portion of the graphs seen so far.
+
+The present limitation is that interface coverage is still selective rather than exhaustive. Each new unsupported operation that appears in application IR may require an additional external model. This is a normal stage in bring-up, but it means robustness still depends on gradually expanding the modeled frontier. In the current state, the module is stable for the patterns already encountered, but more application coverage will still require incremental extension.
+
+Module: NSPLocalizePass
+
+The localization pass is the tensor-semantic half of the current SPMD flow. It consumes shard-annotated IR and rewrites supported computations into shard-local tensor computations. Conceptually, this is the stage where the global computation is transformed into what each NSP participant should compute locally. The pass produces local slices with shard.all_slice, clones or reconstructs the corresponding local linalg.generic, and then either reconstitutes a global tensor with shard.all_gather when collectives are enabled or, in the current non-collective path, emits an explicit NSP hand-off operation to defer the final destination write to a later pass.
+
+This pass is where the current architectural split becomes concrete. In non-collective mode, it does not keep the original global linalg.generic alive as an anchor for destination writes. Instead, it replaces that older implicit contract with an explicit nsp.materialize_tile operation. This is an important improvement in the design because it makes the hand-off to the materialization phase explicit and avoids leaving around global compute that could confuse later passes or produce invalid rewrite interactions.
+
+The current localization implementation targets the simplest and most useful subset first. It supports sharded elementwise linalg.generic on ranked tensors of rank 1 and rank 2. It expects a shard.grid symbol, currently named nsp, and assumes a 1-D grid. It requires that the leading dimension be statically divisible by the number of shards. In the non-collective path, it only rewrites computations that can be connected to a recognizable materialize_in_destination sink. This restriction is deliberate: intermediate tensors in larger chains are not blindly rewritten unless the pass can preserve correctness and region integrity. For some chained elementwise cases, the pass also attempts to clone compatible producers into local-tile compute instead of slicing already materialized global intermediates.
+
+The pass also contains logic for loop distribution in the non-collective mode by using shard.process_linear_index and by expressing the distributed schedule in terms of the current participant. This is aligned with the present execution model of independent per-shard slices without inter-shard communication.
+
+The main current restrictions are explicit and important. The implementation is fundamentally centered on a 1-D grid. It presently focuses on rank-1 and rank-2 ranked tensors. It requires static divisibility of the sharded leading dimension. It prioritizes elementwise patterns with simple indexing behavior. Non-collective mode requires a direct and identifiable sink into which the final shard-local result will eventually be materialized. More general contractions, more dynamic shapes, broader indexing-map classes, and collective-heavy patterns remain outside the current localized subset.
+
+Module: NSP Dialect and nsp.materialize_tile
+
+The NSP dialect is intentionally minimal. At present, its primary role is to host a private operation, nsp.materialize_tile, which acts as a semantic contract between localization and materialization. This operation states that a source tensor already represents the tile local to the current NSP participant and that it must later be written into a given global destination memref. The operation also carries the grid reference, split axis, and tile shape that define how the destination slice should be computed.
+
+This small dialect is strategically valuable because it decouples the tensor-semantic localization phase from the buffer-semantic materialization phase. Without such an explicit hand-off, the pipeline would have to keep around global producer structure or encode fragile correlations between old and new operations. The NSP op makes the contract first-class, verifiable, and robust under cleanup passes. It also prevents canonicalization or dead-code elimination from erasing the necessary anchor before materialization has run.
+
+The current NSP dialect is therefore not a general-purpose IR layer; it is a deliberately small internal mechanism that solves a specific pipeline integration problem. That is an appropriate design for the current stage. It keeps the implementation focused and reduces the surface area of new infrastructure that must be maintained.
+
+Module: NSPMaterializePass
+
+The materialization pass consumes nsp.materialize_tile and reconnects the shard-local tensor result to the final global destination buffer. It computes the shard-local offset by using shard.process_linear_index, forms a memref.subview into the destination, and then tries to replace the tensor-level tile hand-off with more direct memref-level writes when the pattern is recognized. If no fast-path matches, it falls back to bufferization.materialize_in_destination. In all cases, once the writeback has been constructed, the temporary NSP contract operation is removed.
+
+This pass is where the current implementation has evolved most noticeably in terms of rank support. The generic tile hand-off itself already supports rank-1 and rank-2 destination materialization through tile_shape. In addition, there is a direct memref rewrite for localized simple elementwise generic operations, although this direct path is still restricted to rank-1 generics. Beyond that, there is now a dedicated fast-path for a rank-2 style pattern in which the outer tile or accumulator is rank-2 while the inner vectorized chunks are rank-1 slices corresponding to one row segment at a time. This is an important bridge toward 2-D support because it allows current vectorized 2-D elementwise patterns to avoid some of the older fallback behavior.
+
+The pass also includes helpers to materialize rank-2 inputs as subviews, to build rank-2 destination subviews, and to derive rank-1 chunk views from rank-2 bases when that matches vector transfer behavior. This means that rank-2 support is no longer just conceptual in the pipeline; it is now present in the actual destination materialization mechanics for selected patterns.
+
+The restrictions remain significant, though. The split axis is currently restricted to zero. The direct memref rewrite of a localized linalg.generic remains rank-1 only. The rank-2 fast-path is pattern-specific rather than fully general; it supports the current elementwise vectorized form with rank-2 outer structure and rank-1 inner vector chunks, but other rank-2 patterns can still fall back to materialize_in_destination. The implementation also depends on the expected shard.grid symbol and on the current Hexagon ABI conventions to compute the participant linear index from function arguments.
+
+In practical terms, this means the pass is already sufficient for the current target workloads, including the recent bring-up of rank-2 elementwise paths, but it is not yet a complete general-purpose materializer for arbitrary rank-2 or higher-rank sharded tensor programs.
+
+Module: ShardToLLVMPass
+
+After the NSP-specific phases, the remaining shard dialect operations must eventually be lowered so that the regular Hexagon lowering can continue toward LLVM. The current ShardToLLVMPass is best described as a focused and still partial lowering rather than a complete final production lowering.
+
+Its role is to rewrite the subset of shard dialect operations currently emitted by the NSP flow into standard MLIR forms such as arithmetic and tensor operations. At present, it supports shard.process_linear_index, shard.all_slice in a restricted form, shard.shard as an annotation carrier, and cleanup erasure of shard.sharding and shard.grid once they are dead. This is enough for the current SPMD-style DOALL execution on independent slices, which is exactly the current non-collective bring-up target.
+
+The pass is explicitly not yet a full communication-aware lowering. It does not materialize cross-shard data movement. Collective operations such as shard.all_reduce are not lowered. The current all_slice lowering is still described as supporting ranked 1-D tensors with static slice size, which means that although upstream NSP passes have started to support rank-2 shapes in important places, the final shard-to-standard lowering remains more limited. This is one of the clearest signals that the overall project is still in an active bring-up stage rather than a fully generalized implementation.
+
+Current End-to-End Assessment
+
+In its current status, NSPSharding should be viewed as a working vertical slice for 1-D sharding of selected tensor programs, especially elementwise computations and the associated destination writeback patterns needed to keep downstream Hexagon optimization viable. The pipeline architecture is now coherent. The planner, interface models, localization pass, private NSP hand-off op, materialization pass, and partial shard lowering all fit together in a clear way. The system is no longer just an annotation experiment; it now has an explicit execution story for supported cases.
+
+The strongest aspects of the current implementation are the separation between localization and materialization, the ability to preserve tensor semantics long enough for later tiling and vectorization, the explicit contract introduced by nsp.materialize_tile, the steadily expanding ShardingInterface coverage, and the recent progress toward rank-2 support in the materialization path. These are foundational design choices that should scale well as the feature set grows.
+
+The main limitations are also clear. The grid is effectively 1-D. The present non-collective mode is the most mature execution path. Collective semantics are recognized conceptually but not yet fully implemented across the stack. Several legality checks depend on static divisibility and on simple indexing-map structure. Rank-2 support exists, but not uniformly in every stage and not yet as a completely generic capability. Some downstream lowering stages still reflect the earlier rank-1-centric bring-up assumptions.
+
+Restrictions and Practical Boundaries
+
+At this stage, NSPSharding is best applied to tensor programs that can be partitioned along the leading dimension over a 1-D mesh and that either remain elementwise or reduce only along dimensions that stay local to each shard. Workloads that require true cross-shard reduction, replicated outputs, collective broadcasts, or more complex communication patterns are not yet part of the stable supported set. Likewise, programs that rely on arbitrary affine indexing, highly dynamic shapes, or multi-dimensional grid placement should be treated as future targets rather than current guarantees.
+
+The current flow also retains some ABI coupling, particularly in the way the participant linear index is recovered from the function signature. This is acceptable for the present Hexagon runtime integration, but it is still an implementation boundary that would need to be reconsidered if execution conventions evolve.
+
+Next Steps
+
+The next major step is collective support. The planner already reasons about whether a sharding choice would require all-reduce semantics, and the overall architecture clearly anticipates this direction. What is still needed is the end-to-end implementation: explicit collective insertion where required, legality and transformation rules in localization and materialization, and final lowering support for collective shard operations in the backend. This is the most important feature gap between the current independent-slice execution model and a more complete distributed tensor execution model.
+
+The second major step is grid-2D support. Today, both the planning heuristics and much of the concrete rewrite logic assume a 1-D grid and split-axis-zero execution model. Extending to a 2-D device mesh will require changes in several layers: sharding plan representation, grid axis assignment, offset computation, tile-shape reasoning, legality checks, and possibly the interface between localization and materialization. The current architecture appears compatible with such an extension, but it is not merely a local patch; it will require a coordinated update across the pipeline.
+
+A third priority is generalization of rank-2 support. Important progress has already been made, especially in localization and selected materialization fast-paths, but the project still needs a more uniform rank-2 story across all phases, including downstream shard lowering. Once that is in place, higher-rank generalization can be approached from a stronger base.
+
+Another necessary direction is broader application coverage through additional interface models. As more real workloads are exercised, new boundary operations will appear, and the propagation infrastructure will need to continue expanding so that sharding does not stop at unsupported nodes. This is less about redesign and more about systematic hardening.
+
+Finally, the planner itself will eventually need to become more than a heuristic chooser. A production-quality NSPSharding flow will benefit from a cost model that can decide when sharding is worth the communication cost, when replication is preferable, and how to map computations across richer device meshes. The current planner is already a sound foundation for that evolution, but not yet the final answer.
+
+Conclusion
+
+NSPSharding has reached a meaningful and coherent intermediate milestone. It already provides a practical sharding flow for a focused class of tensor computations, with a sound architectural separation between planning, local tensor rewrite, and final destination materialization. The project now has an explicit internal IR contract, growing propagation support across non-shard operations, and real progress toward rank-2 handling. At the same time, it remains a bring-up-stage implementation centered on a 1-D non-collective execution model.
+
+In executive terms, the current system can be described as operational for local-slice sharding of supported elementwise workloads, structurally prepared for future collectives, and architecturally well-positioned for the next expansion steps. The most important future investments are collective support, grid-2D support, broader rank-2 generalization, and continued hardening of the propagation and lowering boundaries.
+
