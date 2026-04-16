@@ -998,11 +998,12 @@ static LogicalResult tryRewriteScfForTileToMemref(OpBuilder &b, Location loc,
 static LogicalResult
 tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
                                       scf::ForOp outerFor,
-                                      Value destSubview) {
+                                      Value destSubview,
+                                      mlir::hexagon::nsp::MaterializeTileOp tileOp) {
 
   auto fail = [&](StringRef reason) -> LogicalResult {
-    debugAnchor->emitRemark()
-        << "NSPMaterialize rank2 fast-path failed: " << reason;
+    tileOp.emitRemark()
+        << "rank2/rank1 fast-path failed: " << reason;
     return failure();
   };
 
@@ -1418,7 +1419,7 @@ materializeTileToDestination(OpBuilder &b,
 
     if (sourceTy && sourceTy.getRank() == 2) {
       if (succeeded(tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop,
-                                                          destSubview))) {
+                                                          destSubview, tileOp))) {
         return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldLoopOp,
                                                        initArg);
       }
