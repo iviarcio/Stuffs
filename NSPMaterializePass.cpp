@@ -1102,7 +1102,7 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
   auto transferWrite =
       insertSlice.getSource().getDefiningOp<vector::TransferWriteOp>();
   if (!transferWrite)
-    return fail("!transferrWrite");
+    return fail("!transferWrite");
 
   // transfer_write base must be a rank-2 chunk extracted from the loop-carried
   // accumulator.
@@ -1418,12 +1418,28 @@ materializeTileToDestination(OpBuilder &b,
     auto sourceTy = dyn_cast<RankedTensorType>(source.getType());
 
     if (sourceTy && sourceTy.getRank() == 2) {
-      if (succeeded(tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop,
-                                                          destSubview, tileOp))) {
-        return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldLoopOp,
-                                                       initArg);
+      tileOp.emitRemark()
+          << "NSPMaterialize: trying rank2/rank1 fast-path; source type = "
+          << sourceTy << ", destSubview type = " << destSubview.getType();
+
+      if (succeeded(tryRewriteRank2TileRank1ChunkToMemref(
+              b, loc, tileLoop, destSubview, tileOp))) {
+        tileOp.emitRemark()
+            << "NSPMaterialize: rank2/rank1 fast-path matched";
+        return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldLoopOp, initArg);
       }
+
+      tileOp.emitRemark()
+          << "NSPMaterialize: rank2/rank1 fast-path did not match";
     }
+
+    // if (sourceTy && sourceTy.getRank() == 2) {
+    //   if (succeeded(tryRewriteRank2TileRank1ChunkToMemref(b, loc, tileLoop,
+    //                                                       destSubview, tileOp))) {
+    //     return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldLoopOp,
+    //                                                    initArg);
+    //   }
+    // }
 
     // Keep the existing rank-1 fast-path unchanged.
     // If rank-2 matching fails, we still fall back to the old logic below.
