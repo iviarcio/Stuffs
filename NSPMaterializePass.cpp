@@ -999,102 +999,109 @@ static LogicalResult
 tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
                                       scf::ForOp outerFor,
                                       Value destSubview) {
-  if (outerFor.getNumResults() != 1 || outerFor.getNumRegionIterArgs() != 1)
+
+  auto fail = [&](StringRef reason) -> LogicalResult {
+    debugAnchor->emitRemark()
+        << "NSPMaterialize rank2 fast-path failed: " << reason;
     return failure();
+  };
+
+  if (outerFor.getNumResults() != 1 || outerFor.getNumRegionIterArgs() != 1)
+    return fail("NumResults");
 
   auto outerResultTy =
       dyn_cast<RankedTensorType>(outerFor.getResult(0).getType());
   if (!outerResultTy || outerResultTy.getRank() != 2)
-    return failure();
+    return fail("ResultTy");
 
   Value outerInit = outerFor.getInitArgs()[0];
   if (!outerInit.getDefiningOp<tensor::EmptyOp>())
-    return failure();
+    return fail("!tensor.empty");
 
   Block *outerBody = outerFor.getBody();
   if (!outerBody)
-    return failure();
+    return fail("!outerBody");
 
   auto outerYield = dyn_cast<scf::YieldOp>(outerBody->getTerminator());
   if (!outerYield || outerYield.getNumOperands() != 1)
-    return failure();
+    return fail("!outerYield");
 
   auto innerFor = outerYield.getOperand(0).getDefiningOp<scf::ForOp>();
   if (!innerFor)
-    return failure();
+    return fail("!innerFor");
   if (innerFor->getBlock() != outerBody)
-    return failure();
+    return fail("!= outer");
 
   if (innerFor.getNumResults() != 1 || innerFor.getNumRegionIterArgs() != 1)
-    return failure();
+    return fail("iterArgs");
 
   auto innerResultTy =
       dyn_cast<RankedTensorType>(innerFor.getResult(0).getType());
   if (!innerResultTy || innerResultTy != outerResultTy)
-    return failure();
+    return fail("!ty");
 
   if (innerFor.getInitArgs()[0] != outerBody->getArgument(1))
-    return failure();
+    return fail("args");
 
   Block *innerBody = innerFor.getBody();
   if (!innerBody)
-    return failure();
+    return fail("innerBody");
 
   auto innerYield = dyn_cast<scf::YieldOp>(innerBody->getTerminator());
   if (!innerYield || innerYield.getNumOperands() != 1)
-    return failure();
+    return fail("innerYield");
 
   auto insertSlice =
       innerYield.getOperand(0).getDefiningOp<tensor::InsertSliceOp>();
   if (!insertSlice)
-    return failure();
+    return fail("!insertSlice");
   if (insertSlice.getDest() != innerBody->getArgument(1))
-    return failure();
+    return fail("innerArg");
 
   auto insertedChunkTy =
       dyn_cast<RankedTensorType>(insertSlice.getSource().getType());
   if (!insertedChunkTy || insertedChunkTy.getRank() != 2)
-    return failure();
+    return fail("insertedChunkTy");
 
   if (!ShapedType::isDynamic(insertedChunkTy.getShape()[0]) &&
       insertedChunkTy.getShape()[0] != 1)
-    return failure();
+    return fail("shape");
 
   auto insertOffsets = insertSlice.getMixedOffsets();
   auto insertSizes = insertSlice.getMixedSizes();
   auto insertStrides = insertSlice.getMixedStrides();
   if (insertOffsets.size() != 2 || insertSizes.size() != 2 ||
       insertStrides.size() != 2)
-    return failure();
+    return fail("Offset+Strride+Size");
 
   auto insRowOff = dyn_cast<Value>(insertOffsets[0]);
   auto insColOff = dyn_cast<Value>(insertOffsets[1]);
   if (!insRowOff || !insColOff)
-    return failure();
+    return fail("!row+colOff");
   if (!isLoopIV(insRowOff, outerFor) || !isLoopIV(insColOff, innerFor))
-    return failure();
+    return fail("IV");
 
   auto size0Attr = dyn_cast<Attribute>(insertSizes[0]);
   auto stride0Attr = dyn_cast<Attribute>(insertStrides[0]);
   auto stride1Attr = dyn_cast<Attribute>(insertStrides[1]);
   if (!size0Attr || !stride0Attr || !stride1Attr)
-    return failure();
+    return fail("Attr");
 
   auto size0Int = dyn_cast<IntegerAttr>(size0Attr);
   auto stride0Int = dyn_cast<IntegerAttr>(stride0Attr);
   auto stride1Int = dyn_cast<IntegerAttr>(stride1Attr);
   if (!size0Int || !stride0Int || !stride1Int)
-    return failure();
+    return fail("0Int");
 
   // Expect insert_slice [1, C] [1, 1].
   if (size0Int.getInt() != 1 || stride0Int.getInt() != 1 ||
       stride1Int.getInt() != 1)
-    return failure();
+    return fail("1Int");
 
   auto transferWrite =
       insertSlice.getSource().getDefiningOp<vector::TransferWriteOp>();
   if (!transferWrite)
-    return failure();
+    return fail("!transferrWrite");
 
   // transfer_write base must be a rank-2 chunk extracted from the loop-carried
   // accumulator.
@@ -1103,37 +1110,37 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
   if (failed(matchRank2TensorExtractSlice(transferWrite.getBase(),
                                           accChunkSource, accChunkOffsets,
                                           accChunkSizes, accChunkStrides)))
-    return failure();
+    return fail("matchRank2");
 
   if (accChunkSource != innerBody->getArgument(1))
-    return failure();
+    return fail("accChunkSource");
 
   if (accChunkOffsets.size() != 2 || accChunkSizes.size() != 2 ||
       accChunkStrides.size() != 2)
-    return failure();
+    return fail("accChunk");
 
   auto accRowOff = dyn_cast<Value>(accChunkOffsets[0]);
   auto accColOff = dyn_cast<Value>(accChunkOffsets[1]);
   if (!accRowOff || !accColOff)
-    return failure();
+    return fail("accRowOff");
   if (!isLoopIV(accRowOff, outerFor) || !isLoopIV(accColOff, innerFor))
-    return failure();
+    return fail("!isLoopIV");
 
   auto accSize0Attr = dyn_cast<Attribute>(accChunkSizes[0]);
   auto accStride0Attr = dyn_cast<Attribute>(accChunkStrides[0]);
   auto accStride1Attr = dyn_cast<Attribute>(accChunkStrides[1]);
   if (!accSize0Attr || !accStride0Attr || !accStride1Attr)
-    return failure();
+    return fail("accOAttr");
 
   auto accSize0Int = dyn_cast<IntegerAttr>(accSize0Attr);
   auto accStride0Int = dyn_cast<IntegerAttr>(accStride0Attr);
   auto accStride1Int = dyn_cast<IntegerAttr>(accStride1Attr);
   if (!accSize0Int || !accStride0Int || !accStride1Int)
-    return failure();
+    return fail("acc0Int");
 
   if (accSize0Int.getInt() != 1 || accStride0Int.getInt() != 1 ||
       accStride1Int.getInt() != 1)
-    return failure();
+    return fail("accSize");
 
   SmallVector<vector::TransferReadOp> transferReads;
   for (Operation &op : innerBody->without_terminator()) {
@@ -1141,7 +1148,7 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
       transferReads.push_back(tr);
   }
   if (transferReads.empty() || transferReads.size() > 2)
-    return failure();
+    return fail("transferReads");
 
   SmallVector<Value> inputBaseTensors;
   SmallVector<OpFoldResult> chunkColOffsets;
@@ -1154,34 +1161,34 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
     if (failed(matchRank2TensorExtractSlice(tr.getBase(), srcChunkTensor,
                                             chunkOffsets, chunkSizes,
                                             chunkStrides)))
-      return failure();
+      return fail("matchRank2TensorExtractSlice");
 
     if (chunkOffsets.size() != 2 || chunkSizes.size() != 2 ||
         chunkStrides.size() != 2)
-      return failure();
+      return fail("chunkOffsets");
 
     auto rowOff = dyn_cast<Value>(chunkOffsets[0]);
     auto colOff = dyn_cast<Value>(chunkOffsets[1]);
     if (!rowOff || !colOff)
-      return failure();
+      return fail("!rowOff+colOff");
     if (!isLoopIV(rowOff, outerFor) || !isLoopIV(colOff, innerFor))
-      return failure();
+      return fail("!isIVRowOff");
 
     auto size0Attr = dyn_cast<Attribute>(chunkSizes[0]);
     auto stride0Attr = dyn_cast<Attribute>(chunkStrides[0]);
     auto stride1Attr = dyn_cast<Attribute>(chunkStrides[1]);
     if (!size0Attr || !stride0Attr || !stride1Attr)
-      return failure();
+      return fail("size0Attr");
 
     auto size0Int = dyn_cast<IntegerAttr>(size0Attr);
     auto stride0Int = dyn_cast<IntegerAttr>(stride0Attr);
     auto stride1Int = dyn_cast<IntegerAttr>(stride1Attr);
     if (!size0Int || !stride0Int || !stride1Int)
-      return failure();
+      return fail("size0Int");
 
     if (size0Int.getInt() != 1 || stride0Int.getInt() != 1 ||
         stride1Int.getInt() != 1)
-      return failure();
+      return fail("stride1Int");
 
     Value srcTileTensor = srcChunkTensor;
     inputBaseTensors.push_back(srcTileTensor);
@@ -1195,7 +1202,7 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
   for (Value tensorLike : inputBaseTensors) {
     auto memrefOr = materializeRank2InputAsSubview(b, loc, tensorLike);
     if (failed(memrefOr))
-      return failure();
+      return fail("memrefOr");
     inputTileMemrefs.push_back(*memrefOr);
   }
 
@@ -1237,7 +1244,7 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
     auto chunkOr =
         buildRank2Subview(ib, loc, inputTileMemrefs[i], offs, sizes, strides);
     if (failed(chunkOr))
-      return failure();
+      return fail("chunkOr");
     newChunkMemrefs.push_back(*chunkOr);
   }
 
@@ -1250,7 +1257,7 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
   auto outChunkOr =
       buildRank2Subview(ib, loc, destSubview, outOffsets, outSizes, outStrides);
   if (failed(outChunkOr))
-    return failure();
+    return fail("outChunkOr");
   Value outChunkMemref = *outChunkOr;
 
   for (Operation &op : innerBody->without_terminator()) {
@@ -1267,7 +1274,7 @@ tryRewriteRank2TileRank1ChunkToMemref(OpBuilder &b, Location loc,
         }
       }
       if (!matched)
-        return failure();
+        return fail("!matched");
 
       SmallVector<Value> indices;
       indices.reserve(tr.getIndices().size());
