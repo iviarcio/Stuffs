@@ -219,3 +219,7 @@ From a project-status perspective, this example shows that the current NSPShardi
 =====
 
 In the vadd_2d flow, sharding propagation also extends the sharding information to the output sink. More specifically, the pass annotates not only the tensors consumed by linalg.generic, but also the tensor value materialized by bufferization.materialize_in_destination and, logically, its destination memref. In the propagated IR this appears as a new shard.shard wrapping the linalg.generic result before the materialize_in_destination sink. This detail is important in the current NSP pipeline because it preserves a sharding-aware connection between the tensor producer and the final destination buffer, allowing NSPLocalizePass to later recognize that sink and replace it with the explicit nsp.materialize_tile hand-off used by NSPMaterializePass.
+
+======
+
+In the current vadd_2d flow, the normal path reaches shard-to-llvm after NSPMaterializePass has already rewritten the computation into memref.subview-based accesses. As a result, shard-to-llvm mainly lowers shard.process_linear_index and removes residual shard dialect annotations, while the main compute path is already expressed through memref views, loops, and vector operations. For residual tensor-level cases that still reach this stage without being materialized away, shard-to-llvm also lowers shard.all_slice into tensor.extract_slice.
