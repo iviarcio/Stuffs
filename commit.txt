@@ -214,3 +214,8 @@ The vadd_2d example captures the current NSPSharding version well because it exe
 
 From a project-status perspective, this example shows that the current NSPSharding flow is coherent, operational, and already capable of handling a concrete rank-2 elementwise case end to end. It also shows exactly where the next extensions belong: broader rank-2 generalization, collectives, and eventually grid-2D support.
 
+
+
+=====
+
+In the vadd_2d flow, sharding propagation also extends the sharding information to the output sink. More specifically, the pass annotates not only the tensors consumed by linalg.generic, but also the tensor value materialized by bufferization.materialize_in_destination and, logically, its destination memref. In the propagated IR this appears as a new shard.shard wrapping the linalg.generic result before the materialize_in_destination sink. This detail is important in the current NSP pipeline because it preserves a sharding-aware connection between the tensor producer and the final destination buffer, allowing NSPLocalizePass to later recognize that sink and replace it with the explicit nsp.materialize_tile hand-off used by NSPMaterializePass.
