@@ -117,3 +117,100 @@ NSPSharding has reached a meaningful and coherent intermediate milestone. It alr
 
 In executive terms, the current system can be described as operational for local-slice sharding of supported elementwise workloads, structurally prepared for future collectives, and architecturally well-positioned for the next expansion steps. The most important future investments are collective support, grid-2D support, broader rank-2 generalization, and continued hardening of the propagation and lowering boundaries.
 
+
+==============
+
+NSPSharding Technical Report for the Current vadd_2d Flow
+
+Introduction
+
+This report describes the current NSPSharding flow using the vadd_2d example as the reference case. The goal is to show, in a concise and implementation-oriented way, how the IR evolves through the current pipeline and which code details matter at each stage. The report reflects the current implementation status of the planner, propagation, localization, post-localization optimization, destination materialization, and shard-to-LLVM lowering.
+
+The example is a two-dimensional elementwise addition over tensors of shape 64 x 16384. The current planner instantiates a one-dimensional shard grid with 16 participants, so the natural local tile for this case is 4 x 16384. This is the central fact that drives the rest of the pipeline: the first dimension is partitioned across NSP participants, while the second dimension remains local and fully preserved inside each shard.
+
+[Insert Figure 1 here: dump after nsp-shard-planner]
+
+Initial IR and Sharding Intent
+
+Before localization starts, the kernel is still expressed at a high tensor level. In the vadd_2d case, the function receives three memref arguments corresponding to the two inputs and the output, reinterprets them into memref<64x16384xf32, ...>, converts the inputs to tensors with bufferization.to_tensor, creates a tensor.empty for the result, and computes the addition through a linalg.generic with two parallel iterators and identity-style indexing on both dimensions.
+
+At this stage, the sharding intent is still declarative. The planner does not yet rewrite the computation into per-shard slices. Instead, it creates a shard.grid symbol named @nsp with shape 16 and materializes a shard.sharding value that expresses how the tensors are partitioned. In this example, the important detail is that the first tensor dimension is split on grid axis 0, while the second tensor dimension remains replicated. In the IR this appears as split_axes = [[0], []]. The planner then wraps the two input tensors and the result init tensor with shard.shard so that the sharding information becomes explicit in SSA form and can be consumed by later passes.
+
+This is the current design point of the planner in NSPShardPlanner.cpp. It runs on linalg.generic while the tensor structure is still visible, and it deliberately emits sharding metadata rather than immediately lowering to slices. The planner is therefore responsible for selecting the sharded iterator, creating or reusing shard.grid @nsp, creating shard.sharding, and rebuilding the linalg.generic so that the annotated tensors are the values seen by the downstream pipeline.
+
+Sharding Propagation
+
+[Insert Figure 2 here: dump after sharding-propagation]
+
+The propagation stage keeps the same overall computation shape, but it ensures that the sharding description survives across operations that are not part of the shard dialect itself. For vadd_2d, this is important because the graph around the elementwise generic includes operations such as bufferization.to_tensor and bufferization.materialize_in_destination. Without interface models, the shard annotations would stop at those boundaries and the later passes would no longer be able to reason about the sharded dataflow.
+
+The implementation for this is in NSPShardInterfaceModels.cpp. The current code attaches external ShardingInterface models to a number of operations that appear in the current flow, including bufferization.to_tensor, bufferization.to_buffer, bufferization.materialize_in_destination, structural operations such as scf.for, and selected arithmetic and math operations. In the specific vadd_2d case, the practical effect is that the sharding assigned by the planner remains valid across the tensor conversion and destination materialization boundary, so the localize pass can still identify a sharded producer and a recognizable sink.
+
+In this example, propagation is not meant to visibly transform the main computation. Its role is to preserve the declarative sharding contract so that the next phase can safely rewrite the kernel. The important point for the report is that propagation makes the planner’s annotations operational across non-shard IR.
+
+Localization into Shard-Local Tensor Compute
+
+[Insert Figure 3 here: dump after nsp-localize]
+
+The localization stage is where the current NSP flow becomes explicitly shard-local, but still remains tensor-semantic. In the vadd_2d case, NSPLocalizePass rewrites the global elementwise linalg.generic into a local linalg.generic operating on per-shard tensor slices. Since the grid has 16 participants and the original shape is 64 x 16384, the localized tensor type is expected to become 4 x 16384 for each shard.
+
+The current implementation in NSPLocalizePass.cpp is deliberately restricted to the simplest and most useful patterns for bring-up. The file explicitly documents that the pass currently targets sharded elementwise patterns expressed as linalg.generic for rank-1 and rank-2 ranked tensors. This is exactly the category to which vadd_2d belongs. The pass creates shard-local tensors through shard.all_slice, rebuilds the local linalg.generic, and marks it with the internal attributes nsp.localized, nsp.materialize_tile_shape, and nsp.materialize_split_axis. The tile shape attribute is especially important because it preserves the exact local tensor shape that the later materialization pass must write back into the destination memref.
+
+One important design choice appears here. In non-collective mode, which is the current bring-up mode, NSPLocalizePass does not reconstitute the final global tensor value and does not keep the original global linalg.generic alive as the main compute anchor. Instead, it emits nsp.materialize_tile as an explicit hand-off to the later materialization pass. This private NSP operation records that the current shard-local tensor must eventually be written into a particular global destination memref, using the grid, split axis, and tile shape. The relevant operation is defined in NSPOps.td, and its verifier in NSPOps.cpp checks the rank agreement, split-axis legality, and consistency between source shape, destination shape, and tile_shape.
+
+This split between localization and destination materialization is one of the central architectural points of the current NSP design. It allows the IR between these two stages to keep tensor semantics and therefore remain compatible with the downstream tiling and vectorization pipeline.
+
+Tiling and Vectorization on the Localized Kernel
+
+[Insert Figure 4 here: dump after tiling and vectorization]
+
+After localization, the kernel is no longer global. It is already per-shard and operates on a local tile of shape 4 x 16384. This is exactly the form expected by the downstream optimization flow. The main reason for keeping localization tensor-semantic was to let the standard Hexagon passes continue to recognize a linalg-style computation and optimize it as usual.
+
+For vadd_2d, the post-localization optimization stage transforms the localized generic into a more explicit loop-and-vector form. Conceptually, the important structural change is that the single rank-2 local tensor computation is now represented through tiled iteration and vector operations. In the current flow, this is the stage where the rank-2 local tile remains visible as the outer computation domain, while inner chunks become more fine-grained slices suitable for vector.transfer_read and vector.transfer_write.
+
+This stage is important because it validates the main architectural decision behind the current NSP design. The per-shard local computation is still available for the normal Hexagon optimization pipeline, rather than being prematurely forced into memref writes too early. In practice, the vadd_2d example shows that once the computation is localized into a 4 x 16384 tile, the standard tiling and vectorization steps can optimize that tile exactly as they would optimize a non-sharded local kernel.
+
+Materialization into the Final Destination Buffer
+
+[Insert Figure 5 here: dump after nsp-materialize]
+
+NSPMaterializePass is where the shard-local tensor result is finally connected back to the global output memref. In the current design, the pass consumes nsp.materialize_tile rather than trying to rediscover the destination pattern from the surrounding IR. This is a major simplification and also the reason the localized path is robust under later cleanup and optimization passes.
+
+The materialization contract is very direct. The source is the shard-local tensor tile, the destination is the original output memref, and the pass must compute the subview that belongs to the current NSP participant. In vadd_2d, the split axis is 0, so the destination offset is computed only along the first dimension. The current participant index is expressed through shard.process_linear_index, and the first-dimensional offset is linearIdx multiplied by the tile height, which is 4 in this example. The resulting memref.subview therefore covers a 4 x 16384 window inside the original 64 x 16384 destination.
+
+The current implementation in NSPMaterializePass.cpp supports this through a generic tile materialization path and a set of fast paths. The file explicitly states the current bring-up constraints: rank-1 and rank-2 destination materialization are supported through tile_shape, split_axis is currently restricted to 0, and the direct memref rewrite for localized linalg.generic is still rank-1 only. However, the pass also includes a dedicated rank-2 fast path for the current 2D-style elementwise pattern. This is precisely the relevant case for vadd_2d after tiling and vectorization. The outer tile or accumulator is rank-2, while the inner vectorized pieces correspond to chunk views over that rank-2 tile. The pass therefore provides helpers such as buildRank2Subview and rank-2 chunk builders so that the destination can be accessed through a rank-2 memref subview and, inside the nested loops, through smaller chunk views aligned with the vectorized form.
+
+This is the main reason the current vadd_2d example is significant. It shows the current status of rank-2 support not as a theoretical capability, but as a working path in the materialization stage. The output is no longer handled through a purely generic fallback. Instead, the pass is already able to recognize the relevant vectorized rank-2 shape and reconnect it directly to the final destination subview.
+
+The fallback path still exists. If the rank-2 fast path does not match, the pass can still use bufferization.materialize_in_destination. But for the current vadd_2d form, the important observation is that materialization now understands the two-dimensional local tile and can map it back into the correct global memref region.
+
+Lowering Shard Operations to Standard MLIR
+
+[Insert Figure 6 here: dump after shard-to-llvm]
+
+After materialization, the remaining shard dialect operations must be eliminated so that the rest of the lowering can continue into the standard Hexagon backend. This is the role of ShardToLLVMPass.cpp. Despite the name, the current pass is really a focused lowering from the shard dialect into ordinary MLIR operations such as arith and tensor operations. It is not yet a full communication-aware distributed lowering.
+
+The most important operation for the current vadd_2d flow is shard.process_linear_index. The pass lowers it using the current Hexagon entry-point ABI. The helper code recovers coreId, threadId, and numThreadsPerCore from the tail of the function arguments and computes linearIdx = coreId * ntpc + threadId. This is the same linear participant id that was conceptually used earlier to select the correct shard-local tile and the correct output subview.
+
+The next important operation is shard.all_slice. In the current code, it is lowered into tensor.extract_slice. The lowering computes offset[0] as linearIdx multiplied by sliceSize[0], while every other dimension starts at zero. For vadd_2d, this means that the per-shard 4 x 16384 tensor tile is materialized as an extract_slice from the original 64 x 16384 tensor, with a first-dimensional offset determined by the current participant. This is precisely the semantics needed for the current 1-D sharding model.
+
+Finally, shard.shard is treated as an annotation carrier and simply disappears, while shard.sharding and shard.grid are erased once dead. This is consistent with the current NSP meaning of shard.shard in which the op describes the sharding of a value but does not itself perform any data movement.
+
+What the vadd_2d Example Demonstrates About the Current NSPSharding Version
+
+The current vadd_2d pipeline demonstrates that NSPSharding is already operational for a meaningful 2D elementwise case. The planner can express the intended partitioning on the first tensor dimension. Propagation can preserve that intent across non-shard operations. Localization can transform the global rank-2 elementwise generic into a local rank-2 generic over a 4 x 16384 tile. The downstream Hexagon optimization flow can then tile and vectorize that local tensor computation. Materialization can reconnect the vectorized rank-2 local result to a rank-2 destination subview in the original output memref. Finally, shard-to-LLVM lowering can remove the remaining shard operations by converting shard.process_linear_index and shard.all_slice into standard arithmetic and tensor operations.
+
+In other words, the current vadd_2d flow is no longer just an annotation demo. It is a complete end-to-end example of the current NSP architecture working on a rank-2 elementwise kernel under the current non-collective, one-dimensional grid model.
+
+Current Restrictions Visible in This Example
+
+The same example also makes the current boundaries of the implementation clear. The grid is still one-dimensional. The split axis is still restricted to zero in the current materialization flow. The all_slice lowering assumes exact partitioning and does not yet include bounds or padding logic. Collectives are still outside the stable flow. The rank-2 support is real, but it is still specialized around the current elementwise and vectorized shape rather than being a completely general rank-2 lowering framework.
+
+These restrictions do not diminish the value of the current vadd_2d result. On the contrary, they define the current maturity point precisely. The flow is already robust for the targeted class of kernels and has moved beyond the earlier rank-1-only bring-up path in the most important places.
+
+Conclusion
+
+The vadd_2d example captures the current NSPSharding version well because it exercises the full intended architecture. The planner expresses a declarative partitioning on a 64 x 16384 kernel over a 16-way shard grid. Propagation preserves that sharding across the surrounding IR. Localization rewrites the computation into shard-local tensor semantics, producing a 4 x 16384 local kernel and making the destination hand-off explicit through nsp.materialize_tile. Tiling and vectorization optimize the localized kernel without losing the sharding semantics. Materialization computes the correct destination subview and reconnects the local rank-2 tile to the global output. Shard-to-LLVM lowering then eliminates the remaining shard operations by reducing them to ordinary arith and tensor IR.
+
+From a project-status perspective, this example shows that the current NSPSharding flow is coherent, operational, and already capable of handling a concrete rank-2 elementwise case end to end. It also shows exactly where the next extensions belong: broader rank-2 generalization, collectives, and eventually grid-2D support.
+
