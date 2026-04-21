@@ -167,13 +167,12 @@ makeValueShardingOption(shard::Sharding s) {
   return shard::ShardingOption(toShardingArray(s), s.getGridAttr());
 }
 
-/// Build a ShardingOption directly from a split-axes array and grid.
+/// Build a ShardingOption directly from a sharding array and grid.
 static FailureOr<shard::ShardingOption>
-makeShardingOptionFromAxes(ArrayRef<SmallVector<shard::GridAxis>> arr,
-                           Attribute grid) {
+makeShardingOptionFromAxes(shard::ShardingArray arr, FlatSymbolRefAttr grid) {
   if (!grid)
     return shard::ShardingOption::makeEmpty();
-  return shard::ShardingOption(arr, grid);
+  return shard::ShardingOption(std::move(arr), grid);
 }
 
 /// Convert split_axes into a fixed-size sharding array of rank `rank`.
@@ -987,9 +986,11 @@ struct TransposeShardingModel
         toFixedRankShardingArray(resultSharding, resultTy.getRank());
     auto inputArr =
         inversePermuteShardingArray(resultArr, transpose.getPermutation());
-    auto inputOpt =
-        shard::ShardingOption(inputArr, resultSharding.getGridAttr());
-    res[0] = fromShardingOption(op, inputOpt, inputTy.getRank());
+    auto inputOpt = makeShardingOptionFromAxes(std::move(inputArr),
+                                               resultSharding.getGridAttr());
+    res[0] = succeeded(inputOpt)
+                 ? fromShardingOption(op, *inputOpt, inputTy.getRank())
+                 : shard::Sharding();
 
     return res;
   }
@@ -1072,8 +1073,11 @@ struct ReduceShardingModel
 
     auto inArr = toFixedRankShardingArray(inputSharding, inputTy.getRank());
     auto outArr = projectReduceInputToOutput(inArr, dims);
-    auto outOpt = shard::ShardingOption(outArr, inputSharding.getGridAttr());
-    res[1] = fromShardingOption(op, outOpt, resultTy.getRank());
+    auto outOpt = makeShardingOptionFromAxes(std::move(outArr),
+                                             inputSharding.getGridAttr());
+    res[1] = succeeded(outOpt)
+                 ? fromShardingOption(op, *outOpt, resultTy.getRank())
+                 : shard::Sharding();
 
     return res;
   }
