@@ -1,3 +1,13 @@
+[NSP] Handle rank-reduced inner slices in materialize fast-path
+
+Extend the rank-2 NSPMaterialize fast-path to accept rank-reduced inner
+chunks produced as tensor<C> instead of tensor<1xC>.
+
+In the integrated Hexagon flow, canonicalization may collapse [1 x C]
+inner slices and transfer ops to rank-1 forms. The previous matcher
+only handled the non-reduced rank-2 representation and fell back to
+generic materialization.
+
 [NSP] Add rank-2 tiled materialization fast-path
 
 Add a dedicated NSPMaterializePass fast-path for the current 2-D
