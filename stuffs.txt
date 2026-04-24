@@ -1,3 +1,5 @@
+Expand NSP sharding support for structured tensor kernels with broadcast, transpose, reduction, and localized tile materialization.
+
 [NSP] Handle rank-reduced inner slices in materialize fast-path
 
 Extend the rank-2 NSPMaterialize fast-path to accept rank-reduced inner
