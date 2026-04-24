@@ -560,6 +560,82 @@ materializeRank1InputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
       .getResult();
 }
 
+/// Materialize a scalar value from a rank-1 local tensor at `index`.
+///
+/// Supported sources:
+///   - shard.all_slice / tensor.extract_slice over
+///   bufferization.to_tensor(memref)
+///   - simple localized rank-1 linalg.generic chains
+///
+/// This is used for row-wise broadcasted inputs that appear after localization
+/// as:
+///   tensor.extract_slice %rowVec[%i] [1] [1] : tensor<T> to tensor<f32>
+static FailureOr<Value>
+materializeScalarFromRank1TensorAtIndex(OpBuilder &b, Location loc,
+                                        Value tensorLike, Value index) {
+  Value base = stripTensorCastWrappers(tensorLike);
+
+  // Case 1: directly backed by a rank-1 memref-ish source.
+  if (succeeded(materializeRank1InputAsSubview(b, loc, base))) {
+    auto memrefOr = materializeRank1InputAsSubview(b, loc, base);
+    Value memref = *memrefOr;
+    auto memrefTy = dyn_cast<MemRefType>(memref.getType());
+    if (!memrefTy || memrefTy.getRank() != 1)
+      return failure();
+    return b.create<memref::LoadOp>(loc, memref, ValueRange{index}).getResult();
+  }
+
+  // Case 2: simple localized rank-1 generic.
+  auto generic = base.getDefiningOp<linalg::GenericOp>();
+  if (!generic || !isSimpleLocalizedElementwiseGeneric(generic))
+    return failure();
+
+  auto resultTy = dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+  if (!resultTy || resultTy.getRank() != 1)
+    return failure();
+
+  const int64_t numInputs = generic.getNumDpsInputs();
+  SmallVector<Value> scalarInputs;
+  scalarInputs.reserve(numInputs);
+
+  for (OpOperand *in : generic.getDpsInputOperands()) {
+    auto scalarOr =
+        materializeScalarFromRank1TensorAtIndex(b, loc, in->get(), index);
+    if (failed(scalarOr))
+      return failure();
+    scalarInputs.push_back(*scalarOr);
+  }
+
+  Block &srcBlock = generic.getRegion().front();
+  if (static_cast<int64_t>(srcBlock.getNumArguments()) != numInputs + 1)
+    return failure();
+
+  // Keep bring-up conservative: only support bodies that do not depend on the
+  // output argument.
+  if (!srcBlock.getArgument(numInputs).use_empty())
+    return failure();
+
+  IRMapping map;
+  for (int64_t i = 0; i < numInputs; ++i)
+    map.map(srcBlock.getArgument(i), scalarInputs[i]);
+
+  OpBuilder nb = b;
+  for (Operation &op : srcBlock.without_terminator()) {
+    auto clonedOr = cloneMappedPureOp(nb, op, map);
+    if (failed(clonedOr))
+      return failure();
+  }
+
+  auto yield = dyn_cast<linalg::YieldOp>(srcBlock.getTerminator());
+  if (!yield || yield.getNumOperands() != 1)
+    return failure();
+
+  Value yielded = map.lookupOrNull(yield.getOperand(0));
+  if (!yielded)
+    return failure();
+  return yielded;
+}
+
 static FailureOr<Value>
 materializeTensorSliceLikeAsSubview(OpBuilder &b, Location loc, Value v) {
   return materializeRank1InputAsSubview(b, loc, v);
@@ -737,6 +813,47 @@ matchRankReducedRowSliceFromRank2(Value v, Value &source, OpFoldResult &rowOff,
   rowOff = mixedOffsets[0];
   colOff = mixedOffsets[1];
   chunkSize = mixedSizes[1];
+  return success();
+}
+
+/// Match a rank-reduced tensor.extract_slice taken from a rank-1 source:
+///   %slice = tensor.extract_slice %source[%i] [1] [1]
+///            : tensor<Mxt> to tensor<t>
+///
+/// This is the canonical rank-reduced form of a scalar slice from a rank-1
+/// tensor. It is used by broadcasted row-wise operands after localization.
+static LogicalResult
+matchRankReducedScalarSliceFromRank1(Value v, Value &source,
+                                     OpFoldResult &offset) {
+  auto extract =
+      stripTensorCastWrappers(v).getDefiningOp<tensor::ExtractSliceOp>();
+  if (!extract)
+    return failure();
+
+  auto sourceTy = dyn_cast<RankedTensorType>(extract.getSource().getType());
+  auto resultTy = dyn_cast<RankedTensorType>(extract.getResult().getType());
+  if (!sourceTy || sourceTy.getRank() != 1)
+    return failure();
+  if (!resultTy || resultTy.getRank() != 0)
+    return failure();
+
+  auto mixedOffsets = extract.getMixedOffsets();
+  auto mixedSizes = extract.getMixedSizes();
+  auto mixedStrides = extract.getMixedStrides();
+  if (mixedOffsets.size() != 1 || mixedSizes.size() != 1 ||
+      mixedStrides.size() != 1)
+    return failure();
+
+  auto sizeAttr = dyn_cast<Attribute>(mixedSizes[0]);
+  auto strideAttr = dyn_cast<Attribute>(mixedStrides[0]);
+  if (!sizeAttr || !strideAttr)
+    return failure();
+  if (cast<IntegerAttr>(sizeAttr).getInt() != 1 ||
+      cast<IntegerAttr>(strideAttr).getInt() != 1)
+    return failure();
+
+  source = extract.getSource();
+  offset = mixedOffsets[0];
   return success();
 }
 
@@ -1213,86 +1330,123 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
     accChunkSize = accChunkSizeTmp;
   }
 
+  enum class InputReadKind {
+    Rank2Chunk,
+    Rank1Scalar,
+  };
+  struct InputReadSpec {
+    InputReadKind kind;
+    Value sourceTensor;
+    OpFoldResult colOff;
+    OpFoldResult chunkSize;
+    OpFoldResult scalarOff;
+  };
+
   SmallVector<vector::TransferReadOp> transferReads;
   for (Operation &op : innerBody->without_terminator()) {
     if (auto tr = dyn_cast<vector::TransferReadOp>(op))
       transferReads.push_back(tr);
   }
   if (transferReads.empty() || transferReads.size() > 2)
-    return fail("transferReads");
+    return failure();
 
-  SmallVector<Value> inputBaseTensors;
-  SmallVector<OpFoldResult> chunkColOffsets;
-  SmallVector<OpFoldResult> chunkColSizes;
-  inputBaseTensors.reserve(transferReads.size());
+  SmallVector<InputReadSpec> readSpecs;
+  readSpecs.reserve(transferReads.size());
 
   for (vector::TransferReadOp tr : transferReads) {
     Value srcTileTensor;
+
     if (chunkIsRank2) {
       SmallVector<OpFoldResult> chunkOffsets, chunkSizes, chunkStrides;
-      if (failed(matchRank2TensorExtractSlice(tr.getBase(), srcTileTensor,
-                                              chunkOffsets, chunkSizes,
-                                              chunkStrides)))
-        return failure();
+      if (succeeded(matchRank2TensorExtractSlice(tr.getBase(), srcTileTensor,
+                                                 chunkOffsets, chunkSizes,
+                                                 chunkStrides))) {
+        if (chunkOffsets.size() != 2 || chunkSizes.size() != 2 ||
+            chunkStrides.size() != 2)
+          return failure();
 
-      if (chunkOffsets.size() != 2 || chunkSizes.size() != 2 ||
-          chunkStrides.size() != 2)
-        return failure();
+        auto rowOff = dyn_cast<Value>(chunkOffsets[0]);
+        auto colOff = dyn_cast<Value>(chunkOffsets[1]);
+        if (!rowOff || !colOff)
+          return failure();
+        if (!isLoopIV(rowOff, outerFor) || !isLoopIV(colOff, innerFor))
+          return failure();
 
-      auto rowOff = dyn_cast<Value>(chunkOffsets[0]);
-      auto colOff = dyn_cast<Value>(chunkOffsets[1]);
-      if (!rowOff || !colOff)
-        return failure();
-      if (!isLoopIV(rowOff, outerFor) || !isLoopIV(colOff, innerFor))
-        return failure();
+        auto size0Attr = dyn_cast<Attribute>(chunkSizes[0]);
+        auto stride0Attr = dyn_cast<Attribute>(chunkStrides[0]);
+        auto stride1Attr = dyn_cast<Attribute>(chunkStrides[1]);
+        if (!size0Attr || !stride0Attr || !stride1Attr)
+          return failure();
 
-      auto size0Attr = dyn_cast<Attribute>(chunkSizes[0]);
-      auto stride0Attr = dyn_cast<Attribute>(chunkStrides[0]);
-      auto stride1Attr = dyn_cast<Attribute>(chunkStrides[1]);
-      if (!size0Attr || !stride0Attr || !stride1Attr)
-        return failure();
+        auto size0Int = dyn_cast<IntegerAttr>(size0Attr);
+        auto stride0Int = dyn_cast<IntegerAttr>(stride0Attr);
+        auto stride1Int = dyn_cast<IntegerAttr>(stride1Attr);
+        if (!size0Int || !stride0Int || !stride1Int)
+          return failure();
 
-      auto size0Int = dyn_cast<IntegerAttr>(size0Attr);
-      auto stride0Int = dyn_cast<IntegerAttr>(stride0Attr);
-      auto stride1Int = dyn_cast<IntegerAttr>(stride1Attr);
-      if (!size0Int || !stride0Int || !stride1Int)
-        return failure();
+        if (size0Int.getInt() != 1 || stride0Int.getInt() != 1 ||
+            stride1Int.getInt() != 1)
+          return failure();
 
-      if (size0Int.getInt() != 1 || stride0Int.getInt() != 1 ||
-          stride1Int.getInt() != 1)
-        return failure();
-
-      inputBaseTensors.push_back(srcTileTensor);
-      chunkColOffsets.push_back(chunkOffsets[1]);
-      chunkColSizes.push_back(chunkSizes[1]);
+        readSpecs.push_back(InputReadSpec{InputReadKind::Rank2Chunk,
+                                          srcTileTensor, chunkOffsets[1],
+                                          chunkSizes[1], OpFoldResult()});
+        continue;
+      }
     } else {
       OpFoldResult rowOff, colOff, chunkSize;
-      if (failed(matchRankReducedRowSliceFromRank2(tr.getBase(), srcTileTensor,
-                                                   rowOff, colOff, chunkSize)))
-        return failure();
+      if (succeeded(matchRankReducedRowSliceFromRank2(
+              tr.getBase(), srcTileTensor, rowOff, colOff, chunkSize))) {
+        auto rowOffVal = dyn_cast<Value>(rowOff);
+        auto colOffVal = dyn_cast<Value>(colOff);
+        if (!rowOffVal || !colOffVal)
+          return failure();
+        if (!isLoopIV(rowOffVal, outerFor) || !isLoopIV(colOffVal, innerFor))
+          return failure();
 
-      auto rowOffVal = dyn_cast<Value>(rowOff);
-      auto colOffVal = dyn_cast<Value>(colOff);
-      if (!rowOffVal || !colOffVal)
-        return failure();
-      if (!isLoopIV(rowOffVal, outerFor) || !isLoopIV(colOffVal, innerFor))
-        return failure();
-
-      inputBaseTensors.push_back(srcTileTensor);
-      chunkColOffsets.push_back(colOff);
-      chunkColSizes.push_back(chunkSize);
+        readSpecs.push_back(InputReadSpec{InputReadKind::Rank2Chunk,
+                                          srcTileTensor, colOff, chunkSize,
+                                          OpFoldResult()});
+        continue;
+      }
     }
+
+    // New case: rank-1 scalar broadcast.
+    OpFoldResult scalarOff;
+    if (failed(matchRankReducedScalarSliceFromRank1(tr.getBase(), srcTileTensor,
+                                                    scalarOff)))
+      return failure();
+
+    auto scalarOffVal = dyn_cast<Value>(scalarOff);
+    if (!scalarOffVal)
+      return failure();
+    if (!isLoopIV(scalarOffVal, outerFor))
+      return failure();
+
+    // Current vectorized scalar-broadcast form reads a scalar tensor with no
+    // explicit indices and broadcasts it via permutation_map = () -> (0).
+    if (!tr.getIndices().empty())
+      return failure();
+    if (tr.getMask())
+      return failure();
+
+    readSpecs.push_back(InputReadSpec{InputReadKind::Rank1Scalar, srcTileTensor,
+                                      OpFoldResult(), OpFoldResult(),
+                                      scalarOff});
   }
 
-  // Build rank-2 memref tiles for the inputs. Inner chunks may later remain
-  // rank-2 ([1 x C]) or be collapsed to rank-1 (rank-reduced [C]).
   SmallVector<Value> inputTileMemrefs;
-  inputTileMemrefs.reserve(inputBaseTensors.size());
-  for (Value tensorLike : inputBaseTensors) {
-    auto memrefOr = materializeRank2InputAsSubview(b, loc, tensorLike);
+  inputTileMemrefs.reserve(readSpecs.size());
+  for (const InputReadSpec &spec : readSpecs) {
+    FailureOr<Value> memrefOr = failure();
+    if (spec.kind == InputReadKind::Rank2Chunk)
+      memrefOr = materializeRank2InputAsSubview(b, loc, spec.sourceTensor);
+    else
+      memrefOr = materializeRank1InputAsSubview(b, loc, spec.sourceTensor);
     if (failed(memrefOr))
       return failure();
     inputTileMemrefs.push_back(*memrefOr);
+    // }
   }
 
   auto newOuter =
@@ -1318,14 +1472,21 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
 
   // Build rank-2 chunk memrefs [1 x C] from the rank-2 input tiles.
   SmallVector<Value> newChunkMemrefs;
-  newChunkMemrefs.reserve(inputTileMemrefs.size());
-  for (size_t i = 0; i < inputTileMemrefs.size(); ++i) {
+  newChunkMemrefs.reserve(readSpecs.size());
+  for (size_t i = 0; i < readSpecs.size(); ++i) {
+    const InputReadSpec &spec = readSpecs[i];
+
+    if (spec.kind == InputReadKind::Rank1Scalar) {
+      newChunkMemrefs.push_back(Value());
+      continue;
+    }
+
     FailureOr<Value> chunkOr = failure();
     if (chunkIsRank2) {
       SmallVector<OpFoldResult> offs = {
           newOuter.getInductionVar(),
-          map.lookupOrDefault(dyn_cast_if_present<Value>(chunkColOffsets[i]))};
-      SmallVector<OpFoldResult> sizes = {ib.getIndexAttr(1), chunkColSizes[i]};
+          map.lookupOrDefault(dyn_cast_if_present<Value>(spec.colOff))};
+      SmallVector<OpFoldResult> sizes = {ib.getIndexAttr(1), spec.chunkSize};
       SmallVector<OpFoldResult> strides = {ib.getIndexAttr(1),
                                            ib.getIndexAttr(1)};
       chunkOr =
@@ -1333,9 +1494,10 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
     } else {
       chunkOr = buildRank1SubviewFromRank2(
           ib, loc, inputTileMemrefs[i], newOuter.getInductionVar(),
-          map.lookupOrDefault(dyn_cast_if_present<Value>(chunkColOffsets[i])),
-          chunkColSizes[i]);
+          map.lookupOrDefault(dyn_cast_if_present<Value>(spec.colOff)),
+          spec.chunkSize);
     }
+
     if (failed(chunkOr))
       return failure();
     newChunkMemrefs.push_back(*chunkOr);
@@ -1366,6 +1528,7 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
     if (auto tr = dyn_cast<vector::TransferReadOp>(op)) {
       size_t idx = 0;
       bool matched = false;
+
       for (; idx < transferReads.size(); ++idx) {
         if (transferReads[idx] == tr) {
           matched = true;
@@ -1375,16 +1538,36 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
       if (!matched)
         return failure();
 
-      SmallVector<Value> indices;
-      indices.reserve(tr.getIndices().size());
-      for (Value iv : tr.getIndices())
-        indices.push_back(map.lookupOrDefault(iv));
+      const InputReadSpec &spec = readSpecs[idx];
+      if (spec.kind == InputReadKind::Rank1Scalar) {
+        Value scalarIndex =
+            map.lookupOrDefault(dyn_cast_if_present<Value>(spec.scalarOff));
+        if (!scalarIndex)
+          return failure();
 
-      auto newRead = ib.create<vector::TransferReadOp>(
-          tr.getLoc(), tr.getVectorType(), newChunkMemrefs[idx], indices,
-          tr.getPermutationMapAttr(), tr.getPadding(), tr.getMask(),
-          tr.getInBoundsAttr());
-      map.map(tr.getResult(), newRead.getResult());
+        auto scalarMemrefTy =
+            dyn_cast<MemRefType>(inputTileMemrefs[idx].getType());
+        if (!scalarMemrefTy || scalarMemrefTy.getRank() != 1)
+          return failure();
+
+        Value scalar = ib.create<memref::LoadOp>(
+            tr.getLoc(), inputTileMemrefs[idx], ValueRange{scalarIndex});
+        auto splat =
+            ib.create<vector::SplatOp>(tr.getLoc(), tr.getVectorType(), scalar);
+        map.map(tr.getResult(), splat.getResult());
+      } else {
+        SmallVector<Value> indices;
+        indices.reserve(tr.getIndices().size());
+        for (Value iv : tr.getIndices())
+          indices.push_back(map.lookupOrDefault(iv));
+
+        auto newRead = ib.create<vector::TransferReadOp>(
+            tr.getLoc(), tr.getVectorType(), newChunkMemrefs[idx], indices,
+            tr.getPermutationMapAttr(), tr.getPadding(), tr.getMask(),
+            tr.getInBoundsAttr());
+        map.map(tr.getResult(), newRead.getResult());
+      }
+
       continue;
     }
 
