@@ -704,6 +704,38 @@ struct NSPLocalizePass
       return false;
     };
 
+    // Compute the shard-local tensor type expected for a specific operand of
+    // a localized generic.
+    //
+    // For the current broadcast-aware path that:
+    //   - rank-2 identity inputs use the same local type as the result
+    //   - rank-1 row-broadcast inputs ((d0, d1) -> (d0)) use only the local
+    //   row extent, i.e. tensor<localRows x T> -> tensor<localRows x T>
+    //   becomes tensor<localRows x elemTy> for the rank-1 operand
+    auto getExpectedLocalTypeForOperand =
+        [&](RankedTensorType operandTy, AffineMap operandMap,
+            RankedTensorType localResultTy) -> RankedTensorType {
+      if (!operandTy || !localResultTy)
+        return RankedTensorType();
+
+      if (operandTy.getRank() == 2 && isIdentity2DMap(operandMap))
+        return localResultTy;
+
+      if (operandTy.getRank() == 1 && isRowBroadcastMap(operandMap)) {
+        if (localResultTy.getRank() != 2)
+          return RankedTensorType();
+
+        int64_t localRows = localResultTy.getShape()[0];
+        if (ShapedType::isDynamic(localRows))
+          return RankedTensorType();
+
+        return RankedTensorType::get({localRows}, operandTy.getElementType(),
+                                     operandTy.getEncoding());
+      }
+
+      return RankedTensorType();
+    };
+
     auto isSupportedElementwiseGenericShape =
         [&](mlir::linalg::GenericOp g, RankedTensorType outResTy,
             ArrayRef<RankedTensorType> inputTys) -> bool {
@@ -1085,15 +1117,39 @@ struct NSPLocalizePass
         }
 
         // Slice inputs into per-core tiles.
-        //
-        // For chained elementwise patterns, attempt to clone compatible
-        // producers into local-tile compute instead of slicing full global
-        // intermediates.
+        //   For chained elementwise patterns, attempt to clone compatible
+        //   producers into local-tile compute instead of slicing full
+        //   global intermediates.
+        // Important:
+        //   For broadcast-aware rank-2 generics, not every operand uses the
+        //   same shard-local type as the result. In particular, rank-1 inputs
+        //   with map (d0, d1) -> (d0) must localize to tensor<localRows>,
+        //   not tensor<localRows x localCols>.
         llvm::DenseMap<Value, Value> localCache;
         SmallVector<Value> localInputs;
         localInputs.reserve(numInputs);
-        for (Value in : inputs)
-          localInputs.push_back(materializeLocalValue(in, localTy, localCache));
+        auto maps = g.getIndexingMapsArray();
+        for (int64_t i = 0; i < numInputs; ++i) {
+          RankedTensorType expectedInputLocalTy = localTy;
+
+          if (supportsBroadcastRowWise) {
+            expectedInputLocalTy =
+                getExpectedLocalTypeForOperand(inputTys[i], maps[i], localTy);
+            if (!expectedInputLocalTy) {
+              g.emitError()
+                  << "NSPLocalize: cannot compute operand-local type for input "
+                  << i << " of broadcast-aware generic";
+              signalPassFailure();
+              return;
+            }
+          }
+
+          Value localIn = materializeLocalValue(inputs[i], expectedInputLocalTy,
+                                                localCache);
+          if (!localIn)
+            continue;
+          localInputs.push_back(localIn);
+        }
 
         // Localize this computation into shard-local tensor semantics.
         auto localizedOrFail = localizeGenericToTensor(
