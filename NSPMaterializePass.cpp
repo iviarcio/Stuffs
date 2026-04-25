@@ -68,6 +68,18 @@ namespace hexagon {
 namespace {
 
 //===----------------------------------------------------------------------===//
+// Forward Declarations
+//===----------------------------------------------------------------------===//
+
+static LogicalResult matchRankReducedScalarSliceFromRank1(Value v,
+                                                          Value &source,
+                                                          OpFoldResult &offset);
+
+static FailureOr<Value> materializeScalarLikeValueAtIndexImpl(
+    OpBuilder &b, Location loc, Value v, Value index,
+    llvm::SmallPtrSetImpl<Operation *> &stack, unsigned depth);
+
+//===----------------------------------------------------------------------===//
 // Grid / ABI helpers
 //===----------------------------------------------------------------------===//
 
@@ -627,10 +639,6 @@ static FailureOr<Value> materializeIndexFromOFR(OpBuilder &b, Location loc,
 
   return b.create<arith::ConstantIndexOp>(loc, intAttr.getInt()).getResult();
 }
-
-static FailureOr<Value> materializeScalarLikeValueAtIndexImpl(
-    OpBuilder &b, Location loc, Value v, Value index,
-    llvm::SmallPtrSetImpl<Operation *> &stack, unsigned depth);
 
 /// Materialize a scalar value from a rank-1 local tensor at `index`.
 ///
@@ -1739,7 +1747,7 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
 
       const InputReadSpec &spec = readSpecs[idx];
       if (spec.kind == InputReadKind::Rank1Scalar) {
-        auto scalarOr = materializeScalarLikeValueAtIndex(
+        auto scalarOr = materializeScalarFromRank1TensorAtIndex(
             ib, tr.getLoc(), spec.scalarLikeBase, newOuter.getInductionVar());
         if (failed(scalarOr))
           return failure();
