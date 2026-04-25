@@ -42,6 +42,8 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -232,6 +234,55 @@ static FailureOr<Operation *> cloneMappedPureOp(OpBuilder &b, Operation &op,
     map.map(oldResult, newResult);
 
   return newOp;
+}
+
+/// Return true iff `t` is either:
+///   - a scalar SSA type, or
+///   - a ranked tensor of rank 0 (tensor<elemTy>)
+static bool isScalarLikeType(Type t) {
+  if (!t)
+    return false;
+  if (!isa<ShapedType>(t))
+    return true;
+  auto st = dyn_cast<ShapedType>(t);
+  return st && st.hasRank() && st.getRank() == 0;
+}
+
+/// Scalarize a type for elementwise cloning:
+///   - tensor<...xT> -> T   (only for ranked rank-0 / rank-1 use here)
+///   - scalar types stay unchanged
+static Type getScalarizedType(Type t) {
+  if (auto st = dyn_cast<ShapedType>(t)) {
+    if (st.hasRank() && (st.getRank() == 0 || st.getRank() == 1))
+      return st.getElementType();
+  }
+  return t;
+}
+
+/// Clone a memory-effect-free op using already-materialized scalar operands,
+/// but scalarize ranked rank-0 / rank-1 tensor result types to their element
+/// type. This is used when rebuilding short arith/math chains that originally
+/// operated on tensor<...> values, but in the memref fast-path should operate
+/// on scalars.
+static FailureOr<Operation *>
+clonePureOpWithScalarizedTypes(OpBuilder &b, Operation &op,
+                               ValueRange operands) {
+  if (op.getNumRegions() != 0)
+    return failure();
+  if (!isMemoryEffectFree(&op))
+    return failure();
+
+  OperationState state(op.getLoc(), op.getName());
+  state.addOperands(operands);
+
+  SmallVector<Type> resultTypes;
+  resultTypes.reserve(op.getNumResults());
+  for (Type t : op.getResultTypes())
+    resultTypes.push_back(getScalarizedType(t));
+  state.addTypes(resultTypes);
+  state.addAttributes(op.getAttrs());
+
+  return b.create(state);
 }
 
 //===----------------------------------------------------------------------===//
@@ -560,6 +611,27 @@ materializeRank1InputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
       .getResult();
 }
 
+/// Convert an OpFoldResult known to represent an index into a Value.
+static FailureOr<Value> materializeIndexFromOFR(OpBuilder &b, Location loc,
+                                                OpFoldResult ofr) {
+  if (auto v = dyn_cast<Value>(ofr))
+    return castToIndexIfNeeded(v, b, loc);
+
+  auto attr = dyn_cast<Attribute>(ofr);
+  if (!attr)
+    return failure();
+
+  auto intAttr = dyn_cast<IntegerAttr>(attr);
+  if (!intAttr)
+    return failure();
+
+  return b.create<arith::ConstantIndexOp>(loc, intAttr.getInt()).getResult();
+}
+
+static FailureOr<Value> materializeScalarLikeValueAtIndexImpl(
+    OpBuilder &b, Location loc, Value v, Value index,
+    llvm::SmallPtrSetImpl<Operation *> &stack, unsigned depth);
+
 /// Materialize a scalar value from a rank-1 local tensor at `index`.
 ///
 /// Supported sources:
@@ -570,70 +642,198 @@ materializeRank1InputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
 /// This is used for row-wise broadcasted inputs that appear after localization
 /// as:
 ///   tensor.extract_slice %rowVec[%i] [1] [1] : tensor<T> to tensor<f32>
+///
+/// This helper supports:
+///   - direct rank-1 local tensor sources backed by memref
+///   - simple localized rank-1 linalg.generic chains
+///   - short pure rank-1 / rank-0 arith/math chains
+///
+/// The recursion is bounded and cycle-checked.
 static FailureOr<Value>
 materializeScalarFromRank1TensorAtIndex(OpBuilder &b, Location loc,
                                         Value tensorLike, Value index) {
-  Value base = stripTensorCastWrappers(tensorLike);
+  llvm::SmallPtrSet<Operation *, 16> stack;
+  return materializeScalarLikeValueAtIndexImpl(b, loc, tensorLike, index, stack,
+                                               /*depth=*/0);
+}
 
-  // Case 1: directly backed by a rank-1 memref-ish source.
-  if (succeeded(materializeRank1InputAsSubview(b, loc, base))) {
+static FailureOr<Value> materializeScalarLikeValueAtIndexImpl(
+    OpBuilder &b, Location loc, Value v, Value index,
+    llvm::SmallPtrSetImpl<Operation *> &stack, unsigned depth) {
+  if (depth > 16)
+    return failure();
+
+  Value base = stripTensorCastWrappers(v);
+  Type baseTy = base.getType();
+
+  // Pure scalar SSA values are already materialized.
+  if (!isa<ShapedType>(baseTy))
+    return base;
+
+  auto shapedTy = dyn_cast<ShapedType>(baseTy);
+  if (!shapedTy || !shapedTy.hasRank())
+    return failure();
+
+  // Case A: rank-1 tensor-like value -> scalar at `index`.
+  if (shapedTy.getRank() == 1) {
     auto memrefOr = materializeRank1InputAsSubview(b, loc, base);
-    Value memref = *memrefOr;
-    auto memrefTy = dyn_cast<MemRefType>(memref.getType());
-    if (!memrefTy || memrefTy.getRank() != 1)
+    if (succeeded(memrefOr)) {
+      Value memref = *memrefOr;
+      auto memrefTy = dyn_cast<MemRefType>(memref.getType());
+      if (!memrefTy || memrefTy.getRank() != 1)
+        return failure();
+      return b.create<memref::LoadOp>(loc, memref, ValueRange{index})
+          .getResult();
+    }
+
+    Operation *def = base.getDefiningOp();
+    if (!def)
       return failure();
-    return b.create<memref::LoadOp>(loc, memref, ValueRange{index}).getResult();
-  }
-
-  // Case 2: simple localized rank-1 generic.
-  auto generic = base.getDefiningOp<linalg::GenericOp>();
-  if (!generic || !isSimpleLocalizedElementwiseGeneric(generic))
-    return failure();
-
-  auto resultTy = dyn_cast<RankedTensorType>(generic.getResult(0).getType());
-  if (!resultTy || resultTy.getRank() != 1)
-    return failure();
-
-  const int64_t numInputs = generic.getNumDpsInputs();
-  SmallVector<Value> scalarInputs;
-  scalarInputs.reserve(numInputs);
-
-  for (OpOperand *in : generic.getDpsInputOperands()) {
-    auto scalarOr =
-        materializeScalarFromRank1TensorAtIndex(b, loc, in->get(), index);
-    if (failed(scalarOr))
+    if (!stack.insert(def).second)
       return failure();
-    scalarInputs.push_back(*scalarOr);
-  }
 
-  Block &srcBlock = generic.getRegion().front();
-  if (static_cast<int64_t>(srcBlock.getNumArguments()) != numInputs + 1)
-    return failure();
+    auto eraseFromStack = llvm::make_scope_exit([&]() { stack.erase(def); });
 
-  // Keep bring-up conservative: only support bodies that do not depend on the
-  // output argument.
-  if (!srcBlock.getArgument(numInputs).use_empty())
-    return failure();
+    // Case A1: simple localized rank-1 generic.
+    if (auto generic = dyn_cast<linalg::GenericOp>(def)) {
+      if (!isSimpleLocalizedElementwiseGeneric(generic))
+        return failure();
 
-  IRMapping map;
-  for (int64_t i = 0; i < numInputs; ++i)
-    map.map(srcBlock.getArgument(i), scalarInputs[i]);
+      auto resultTy =
+          dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+      if (!resultTy || resultTy.getRank() != 1)
+        return failure();
 
-  OpBuilder nb = b;
-  for (Operation &op : srcBlock.without_terminator()) {
-    auto clonedOr = cloneMappedPureOp(nb, op, map);
+      const int64_t numInputs = generic.getNumDpsInputs();
+      SmallVector<Value> scalarInputs;
+      scalarInputs.reserve(numInputs);
+
+      for (OpOperand *in : generic.getDpsInputOperands()) {
+        auto scalarOr = materializeScalarLikeValueAtIndexImpl(
+            b, loc, in->get(), index, stack, depth + 1);
+        if (failed(scalarOr))
+          return failure();
+        scalarInputs.push_back(*scalarOr);
+      }
+
+      Block &srcBlock = generic.getRegion().front();
+      if (static_cast<int64_t>(srcBlock.getNumArguments()) != numInputs + 1)
+        return failure();
+
+      // Only support bodies that do not depend on the output argument.
+      if (!srcBlock.getArgument(numInputs).use_empty())
+        return failure();
+
+      IRMapping map;
+      for (int64_t i = 0; i < numInputs; ++i)
+        map.map(srcBlock.getArgument(i), scalarInputs[i]);
+
+      OpBuilder nb = b;
+      for (Operation &op : srcBlock.without_terminator()) {
+        auto clonedOr = cloneMappedPureOp(nb, op, map);
+        if (failed(clonedOr))
+          return failure();
+      }
+
+      auto yield = dyn_cast<linalg::YieldOp>(srcBlock.getTerminator());
+      if (!yield || yield.getNumOperands() != 1)
+        return failure();
+
+      Value yielded = map.lookupOrNull(yield.getOperand(0));
+      if (!yielded)
+        return failure();
+      return yielded;
+    }
+
+    // Case A2: short pure rank-1 chain (e.g. arith/math on rank-1 tensors).
+    if (def->getNumRegions() != 0 || !isMemoryEffectFree(def) ||
+        def->getNumResults() != 1)
+      return failure();
+
+    auto defResTy = dyn_cast<ShapedType>(def->getResult(0).getType());
+    if (!defResTy || !defResTy.hasRank() || defResTy.getRank() != 1)
+      return failure();
+
+    SmallVector<Value> scalarOperands;
+    scalarOperands.reserve(def->getNumOperands());
+    for (Value operand : def->getOperands()) {
+      auto scalarOr = materializeScalarLikeValueAtIndexImpl(
+          b, loc, operand, index, stack, depth + 1);
+      if (failed(scalarOr))
+        return failure();
+      scalarOperands.push_back(*scalarOr);
+    }
+
+    auto clonedOr =
+        clonePureOpWithScalarizedTypes(b, *def, ValueRange{scalarOperands});
     if (failed(clonedOr))
       return failure();
+    if ((*clonedOr)->getNumResults() != 1)
+      return failure();
+    return (*clonedOr)->getResult(0);
   }
 
-  auto yield = dyn_cast<linalg::YieldOp>(srcBlock.getTerminator());
-  if (!yield || yield.getNumOperands() != 1)
-    return failure();
+  // Case B: rank-0 tensor-like value -> scalar.
+  if (shapedTy.getRank() == 0) {
+    // Common case: tensor.extract_slice rank-reduced from a rank-1 source.
+    Value sourceTensor;
+    OpFoldResult offset;
+    if (succeeded(
+            matchRankReducedScalarSliceFromRank1(base, sourceTensor, offset))) {
+      auto memrefOr = materializeRank1InputAsSubview(b, loc, sourceTensor);
+      if (failed(memrefOr))
+        return failure();
 
-  Value yielded = map.lookupOrNull(yield.getOperand(0));
-  if (!yielded)
-    return failure();
-  return yielded;
+      auto idxOr = materializeIndexFromOFR(b, loc, offset);
+      if (failed(idxOr))
+        return failure();
+
+      Value memref = *memrefOr;
+      auto memrefTy = dyn_cast<MemRefType>(memref.getType());
+      if (!memrefTy || memrefTy.getRank() != 1)
+        return failure();
+
+      return b.create<memref::LoadOp>(loc, memref, ValueRange{*idxOr})
+          .getResult();
+    }
+
+    Operation *def = base.getDefiningOp();
+    if (!def)
+      return failure();
+    if (!stack.insert(def).second)
+      return failure();
+    auto eraseFromStack = llvm::make_scope_exit([&]() { stack.erase(def); });
+
+    // Support short pure scalar/rank-0 chains (arith/math/etc.).
+    if (def->getNumRegions() != 0 || !isMemoryEffectFree(def) ||
+        def->getNumResults() != 1)
+      return failure();
+
+    auto defResTy = dyn_cast<ShapedType>(def->getResult(0).getType());
+    if (!defResTy || !defResTy.hasRank() || defResTy.getRank() != 0)
+      return failure();
+
+    SmallVector<Value> scalarOperands;
+    scalarOperands.reserve(def->getNumOperands());
+    for (Value operand : def->getOperands()) {
+      auto scalarOr = materializeScalarLikeValueAtIndexImpl(
+          b, loc, operand, index, stack, depth + 1);
+      if (failed(scalarOr))
+        return failure();
+      scalarOperands.push_back(*scalarOr);
+    }
+
+    auto clonedOr =
+        clonePureOpWithScalarizedTypes(b, *def, ValueRange{scalarOperands});
+    if (failed(clonedOr))
+      return failure();
+    if ((*clonedOr)->getNumResults() != 1)
+      return failure();
+    return (*clonedOr)->getResult(0);
+  }
+
+  // Higher-rank tensors are intentionally unsupported here.
+  return failure();
 }
 
 static FailureOr<Value>
@@ -1339,7 +1539,7 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
     Value sourceTensor;
     OpFoldResult colOff;
     OpFoldResult chunkSize;
-    OpFoldResult scalarOff;
+    Value scalarLikeBase;
   };
 
   SmallVector<vector::TransferReadOp> transferReads;
@@ -1390,7 +1590,7 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
 
         readSpecs.push_back(InputReadSpec{InputReadKind::Rank2Chunk,
                                           srcTileTensor, chunkOffsets[1],
-                                          chunkSizes[1], OpFoldResult()});
+                                          chunkSizes[1], Value()});
         continue;
       }
     } else {
@@ -1406,21 +1606,16 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
 
         readSpecs.push_back(InputReadSpec{InputReadKind::Rank2Chunk,
                                           srcTileTensor, colOff, chunkSize,
-                                          OpFoldResult()});
+                                          Value()});
         continue;
       }
     }
 
-    // New case: rank-1 scalar broadcast.
-    OpFoldResult scalarOff;
-    if (failed(matchRankReducedScalarSliceFromRank1(tr.getBase(), srcTileTensor,
-                                                    scalarOff)))
-      return failure();
-
-    auto scalarOffVal = dyn_cast<Value>(scalarOff);
-    if (!scalarOffVal)
-      return failure();
-    if (!isLoopIV(scalarOffVal, outerFor))
+    // Scalar-broadcast case: accept a rank-0 tensor base, including a short
+    // pure arith/math chain on top of the original scalar slice.
+    Value scalarBase = stripTensorCastWrappers(tr.getBase());
+    auto scalarBaseTy = dyn_cast<RankedTensorType>(scalarBase.getType());
+    if (!scalarBaseTy || scalarBaseTy.getRank() != 0)
       return failure();
 
     // Current vectorized scalar-broadcast form reads a scalar tensor with no
@@ -1430,9 +1625,9 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
     if (tr.getMask())
       return failure();
 
-    readSpecs.push_back(InputReadSpec{InputReadKind::Rank1Scalar, srcTileTensor,
+    readSpecs.push_back(InputReadSpec{InputReadKind::Rank1Scalar, Value(),
                                       OpFoldResult(), OpFoldResult(),
-                                      scalarOff});
+                                      scalarBase});
   }
 
   SmallVector<Value> inputTileMemrefs;
@@ -1441,12 +1636,16 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
     FailureOr<Value> memrefOr = failure();
     if (spec.kind == InputReadKind::Rank2Chunk)
       memrefOr = materializeRank2InputAsSubview(b, loc, spec.sourceTensor);
-    else
-      memrefOr = materializeRank1InputAsSubview(b, loc, spec.sourceTensor);
+
+    // Rank1Scalar is materialized directly as a scalar during cloning of the
+    // inner loop body, so no memref tile is needed up-front.
+    if (spec.kind == InputReadKind::Rank1Scalar) {
+      inputTileMemrefs.push_back(Value());
+      continue;
+    }
     if (failed(memrefOr))
       return failure();
     inputTileMemrefs.push_back(*memrefOr);
-    // }
   }
 
   auto newOuter =
@@ -1540,20 +1739,12 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
 
       const InputReadSpec &spec = readSpecs[idx];
       if (spec.kind == InputReadKind::Rank1Scalar) {
-        Value scalarIndex =
-            map.lookupOrDefault(dyn_cast_if_present<Value>(spec.scalarOff));
-        if (!scalarIndex)
+        auto scalarOr = materializeScalarLikeValueAtIndex(
+            ib, tr.getLoc(), spec.scalarLikeBase, newOuter.getInductionVar());
+        if (failed(scalarOr))
           return failure();
-
-        auto scalarMemrefTy =
-            dyn_cast<MemRefType>(inputTileMemrefs[idx].getType());
-        if (!scalarMemrefTy || scalarMemrefTy.getRank() != 1)
-          return failure();
-
-        Value scalar = ib.create<memref::LoadOp>(
-            tr.getLoc(), inputTileMemrefs[idx], ValueRange{scalarIndex});
-        auto splat =
-            ib.create<vector::SplatOp>(tr.getLoc(), tr.getVectorType(), scalar);
+        auto splat = ib.create<vector::SplatOp>(tr.getLoc(), tr.getVectorType(),
+                                                *scalarOr);
         map.map(tr.getResult(), splat.getResult());
       } else {
         SmallVector<Value> indices;
