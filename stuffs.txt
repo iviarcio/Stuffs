@@ -1,3 +1,18 @@
+[NSP} NSPLocalize: localize row-wise softmax producer chains
+
+Teach NSPLocalize to rebuild row-wise softmax-like producer chains on
+shard-local tensors before materialization.
+
+The localization helper now handles transpose, local reductions, and row-wise
+broadcast generics when cloning the producer chain that feeds a final
+materialize_in_destination sink. This lets softmax_2d shard the outer row
+dimension and keep the reduction dimension local, avoiding the previous behavior
+where most intermediates stayed global and only the final result was sliced.
+
+This keeps the non-collective path communication-free: reductions are localized
+only when the sharded dimension is preserved and the reduced dimension remains
+fully local to each shard.
+
 [NSP] Expand NSP sharding support for structured tensor kernels with broadcast, transpose, reduction, and localized tile materialization.
 
 Extend Materialize rank-2 fast-path to scalar-broadcast arith/math chains
