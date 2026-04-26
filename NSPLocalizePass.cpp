@@ -45,7 +45,6 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallDenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -94,14 +93,14 @@ localizeGenericToTensor(OpBuilder &b, linalg::GenericOp g,
                                              localTy.getElementType());
   }
 
-  auto localizedGeneric =
-      b.create<linalg::GenericOp>(loc,
-                                  /*resultTensorTypes=*/TypeRange{localTy},
-                                  /*inputs=*/ValueRange{localInputs},
-                                  /*outputs=*/ValueRange{outLocalInit},
-                                  /*indexingMaps=*/g.getIndexingMaps(),
-                                  /*iteratorTypes=*/g.getIteratorTypes(),
-                                  /*doc=*/nullptr, /*libraryCall=*/nullptr);
+  auto localizedGeneric = b.create<linalg::GenericOp>(
+      loc,
+      /*resultTensorTypes=*/TypeRange{localTy},
+      /*inputs=*/ValueRange{localInputs},
+      /*outputs=*/ValueRange{outLocalInit},
+      /*indexingMaps=*/g.getIndexingMaps(),
+      /*iteratorTypes=*/g.getIteratorTypes(),
+      /*doc=*/StringRef(), /*libraryCall=*/StringRef());
 
   // Clone the region body instead of moving it. The original global generic
   // must stay intact until NSPMaterializePass reconnects the localized result
@@ -772,11 +771,6 @@ struct NSPLocalizePass
       return true;
     };
 
-    auto buildTensorEmptyLike = [&](Location loc,
-                                    RankedTensorType ty) -> Value {
-      return b.create<tensor::EmptyOp>(loc, ty.getShape(), ty.getElementType());
-    };
-
     auto cloneLinalgRegion = [&](Region &srcRegion, Region &dstRegion) {
       dstRegion.getBlocks().clear();
 
@@ -931,6 +925,12 @@ struct NSPLocalizePass
 
     module.walk([&](mlir::func::FuncOp func) {
       OpBuilder b(func.getContext());
+
+      auto buildTensorEmptyLike = [&](Location loc,
+                                      RankedTensorType ty) -> Value {
+        return b.create<tensor::EmptyOp>(loc, ty.getShape(),
+                                         ty.getElementType());
+      };
 
       // Find a bufferization.materialize_in_destination sink for `v` while
       // allowing a trivial chain of sharding wrappers.
@@ -1145,9 +1145,9 @@ struct NSPLocalizePass
               if (!inputTy)
                 return Value();
 
-              llvm::SmallDenseSet<int64_t> reducedDims;
+              llvm::SmallSet<int64_t, 4> reducedDims;
               for (int64_t dim : reduce.getDimensions())
-                reducedDims.insert(dim);
+                (void)reducedDims.insert(dim);
 
               SmallVector<mlir::utils::IteratorType> iteratorTypes;
               iteratorTypes.reserve(inputTy.getRank());
@@ -1183,7 +1183,7 @@ struct NSPLocalizePass
                   /*outputs=*/ValueRange{localInit},
                   /*indexingMaps=*/ArrayRef<AffineMap>{inputMap, outputMap},
                   /*iteratorTypes=*/iteratorTypes,
-                  /*doc=*/nullptr, /*libraryCall=*/nullptr);
+                  /*doc=*/StringRef(), /*libraryCall=*/StringRef());
 
               cloneLinalgRegion(reduce.getRegion(), localReduce.getRegion());
 
@@ -1218,7 +1218,7 @@ struct NSPLocalizePass
                 /*outputs=*/ValueRange{outLocalInit},
                 /*indexingMaps=*/prod.getIndexingMaps(),
                 /*iteratorTypes=*/prod.getIteratorTypes(),
-                /*doc=*/nullptr, /*libraryCall=*/nullptr);
+                /*doc=*/StringRef(), /*libraryCall=*/StringRef());
 
             cloneLinalgRegion(prod.getRegion(), newProd.getRegion());
 
@@ -1281,7 +1281,7 @@ struct NSPLocalizePass
                 /*outputs=*/ValueRange{outLocalInit},
                 /*indexingMaps=*/prod.getIndexingMaps(),
                 /*iteratorTypes=*/prod.getIteratorTypes(),
-                /*doc=*/nullptr, /*libraryCall=*/nullptr);
+                /*doc=*/StringRef(), /*libraryCall=*/StringRef());
 
             cloneLinalgRegion(prod.getRegion(), newProd.getRegion());
 
