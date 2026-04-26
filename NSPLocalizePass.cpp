@@ -98,8 +98,8 @@ localizeGenericToTensor(OpBuilder &b, linalg::GenericOp g,
       /*resultTensorTypes=*/TypeRange{localTy},
       /*inputs=*/ValueRange{localInputs},
       /*outputs=*/ValueRange{outLocalInit},
-      /*indexingMaps=*/g.getIndexingMaps(),
-      /*iteratorTypes=*/g.getIteratorTypes(),
+      /*indexingMaps=*/g.getIndexingMapsArray(),
+      /*iteratorTypes=*/g.getIteratorTypesArray(),
       /*doc=*/StringRef(), /*libraryCall=*/StringRef());
 
   // Clone the region body instead of moving it. The original global generic
@@ -771,6 +771,33 @@ struct NSPLocalizePass
       return true;
     };
 
+    auto hasCompatibleRegionArgumentTypes = [](Block &block, ValueRange inputs,
+                                               ValueRange outputs) -> bool {
+      if (block.getNumArguments() != inputs.size() + outputs.size())
+        return false;
+
+      auto getElementType = [](Type t) -> Type {
+        if (auto shaped = dyn_cast<ShapedType>(t))
+          return shaped.getElementType();
+        return t;
+      };
+
+      unsigned argIdx = 0;
+      for (Value input : inputs) {
+        if (block.getArgument(argIdx++).getType() !=
+            getElementType(input.getType()))
+          return false;
+      }
+
+      for (Value output : outputs) {
+        if (block.getArgument(argIdx++).getType() !=
+            getElementType(output.getType()))
+          return false;
+      }
+
+      return true;
+    };
+
     auto cloneLinalgRegion = [&](Region &srcRegion, Region &dstRegion) {
       dstRegion.getBlocks().clear();
 
@@ -1084,9 +1111,18 @@ struct NSPLocalizePass
         // linalg.fill: produce a local constant tile.
         if (auto fill =
                 dyn_cast_or_null<mlir::linalg::FillOp>(base.getDefiningOp())) {
+          auto fillResTy = dyn_cast<RankedTensorType>(base.getType());
+          if (!fillResTy)
+            return Value();
+
+          RankedTensorType fillLocalTy =
+              getLocalTypeWithShape(fillResTy, expectedLocalTy.getShape());
+          if (!fillLocalTy)
+            return Value();
+
           Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
-              fill.getLoc(), expectedLocalTy.getShape(),
-              expectedLocalTy.getElementType());
+              fill.getLoc(), fillLocalTy.getShape(),
+              fillLocalTy.getElementType());
           auto localFill = b.create<mlir::linalg::FillOp>(
               fill.getLoc(), /*inputs=*/fill.getInputs(),
               /*outputs=*/ValueRange{outLocalInit});
@@ -1185,6 +1221,11 @@ struct NSPLocalizePass
                   /*iteratorTypes=*/iteratorTypes,
                   /*doc=*/StringRef(), /*libraryCall=*/StringRef());
 
+              if (!hasCompatibleRegionArgumentTypes(reduce.getRegion().front(),
+                                                    ValueRange{localInput},
+                                                    ValueRange{localInit}))
+                return Value();
+
               cloneLinalgRegion(reduce.getRegion(), localReduce.getRegion());
 
               Value localRes = localReduce.getResult(0);
@@ -1203,8 +1244,25 @@ struct NSPLocalizePass
             prodInputs.reserve(nIn);
             for (int64_t i = 0; i < nIn; ++i) {
               Value inV = prod.getDpsInputOperand(i)->get();
+              auto inTy = dyn_cast<RankedTensorType>(inV.getType());
+              if (!inTy)
+                return Value();
+
+              // Preserve the input element type.  Some producer chains
+              // contain type-changing generics, for example f16 -> f32.
+              // The local result type is driven by expectedLocalTy, but each
+              // localized input must keep the element type of the original
+              // input tensor.  Reusing expectedLocalTy for inputs would
+              // incorrectly turn tensor<...xf16> inputs into tensor<...xf32>
+              // and may make the cloned region yield a value whose type no
+              // longer matches the enclosing linalg.generic output.
+              RankedTensorType inputLocalTy =
+                  getLocalTypeWithShape(inTy, expectedLocalTy.getShape());
+              if (!inputLocalTy)
+                return Value();
+
               prodInputs.push_back(
-                  materializeLocalValue(inV, expectedLocalTy, cache));
+                  materializeLocalValue(inV, inputLocalTy, cache));
             }
 
             Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
@@ -1216,9 +1274,14 @@ struct NSPLocalizePass
                 /*resultTensorTypes=*/TypeRange{expectedLocalTy},
                 /*inputs=*/ValueRange{prodInputs},
                 /*outputs=*/ValueRange{outLocalInit},
-                /*indexingMaps=*/prod.getIndexingMaps(),
-                /*iteratorTypes=*/prod.getIteratorTypes(),
+                /*indexingMaps=*/prod.getIndexingMapsArray(),
+                /*iteratorTypes=*/prod.getIteratorTypesArray(),
                 /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+            if (!hasCompatibleRegionArgumentTypes(prod.getRegion().front(),
+                                                  prodInputs,
+                                                  ValueRange{outLocalInit}))
+              return Value();
 
             cloneLinalgRegion(prod.getRegion(), newProd.getRegion());
 
@@ -1279,9 +1342,14 @@ struct NSPLocalizePass
                 /*resultTensorTypes=*/TypeRange{expectedLocalTy},
                 /*inputs=*/ValueRange{prodInputs},
                 /*outputs=*/ValueRange{outLocalInit},
-                /*indexingMaps=*/prod.getIndexingMaps(),
-                /*iteratorTypes=*/prod.getIteratorTypes(),
+                /*indexingMaps=*/prod.getIndexingMapsArray(),
+                /*iteratorTypes=*/prod.getIteratorTypesArray(),
                 /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+            if (!hasCompatibleRegionArgumentTypes(prod.getRegion().front(),
+                                                  prodInputs,
+                                                  ValueRange{outLocalInit}))
+              return Value();
 
             cloneLinalgRegion(prod.getRegion(), newProd.getRegion());
 
