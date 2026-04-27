@@ -1,3 +1,32 @@
+NSPSharding Update: Localized Row-Wise Softmax Support
+
+* Extended NSPLocalize to clone softmax producer chains into shard-local tensor computation.
+
+* The localization helper now handles:
+
+  * linalg.transpose
+  * local reductions
+  * row-wise broadcast linalg.generic patterns
+  * type-changing producer chains such as f16 to f32
+
+* This enables block_ptr softmax to shard the outer row dimension while keeping the reduction dimension fully local.
+
+* The generated SPMD structure now follows this local computation flow:
+
+  * Slice the input by rows using shard.all_slice on slice_axis = 0.
+  * Transpose the local input row tile when required by the softmax pattern.
+  * Cast/extend the local tile through linalg.generic.
+  * Compute the row-wise max using a local reduction.
+  * Compute exp(input_row - max_row) locally.
+  * Transpose the exp tile when required by the sum-reduction pattern.
+  * Compute the row-wise sum using a local reduction.
+  * Compute the final normalized output row locally.
+  * Materialize only the local output tile into the destination buffer.
+
+* This avoids the previous behavior where most softmax intermediates remained global and only the final output was sliced.
+
+* The current implementation remains communication-free: no all-reduce is needed because each NSP owns complete rows and performs reductions only within its local row tile.
+
 [NSP} NSPLocalize: localize row-wise softmax producer chains
 
 Teach NSPLocalize to rebuild row-wise softmax-like producer chains on
