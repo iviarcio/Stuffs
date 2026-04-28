@@ -299,3 +299,25 @@ The second transpose has the same purpose. After computing "exp(input - row_max)
 
 From the NSPSharding perspective, the important point is that the transpose does not change the logical sharding intent. The desired sharding is still along the original outer row dimension M, while the softmax reduction dimension N must remain local inside each NSP tile.
 
+One possible follow-up optimization  in NSPSharding is to simplify the localized softmax producer chain in `NSPLocalize`.
+Today, some softmax variants reach NSPSharding in a normalized form where a row-wise reduction is expressed as "input<M x N> -> transpose<N x M> -> reduce(dim 0) -> result<M>". This is semantically equivalent to "input<M x N> -> reduce(dim 1) -> result<M>". Inside `NSPLocalize`, we could detect this restricted pattern when rebuilding the local producer chain and avoid recreating the local transpose. For each NSP tile, instead of producing:
+input<localM x N> -> transpose<N x localM> -> reduce(dim 0). We would directly build "input<localM x N> -> reduce(dim 1)"
+This should be applicable to both row-wise reductions in softmax: the max reduction and the sum-of-exp reduction.
+
+The expected benefit is lower temporary tensor pressure and less local work, since we may avoid one or two `tensor.empty` allocations and the corresponding local transpose computations. This is not required for correctness, but it is worth evaluating as a performance cleanup for the softmax NSPSharding path.
+
+
+Here is the updated English version of your technical note, incorporating the specific modifications regarding the `NSPLocalizePass` and the specific softmax variants:
+
+---
+
+One possible optimization in NSPSharding that We can implement is to simplify the localized softmax producer chain in NSPLocalizePass.
+
+Currently, some softmax variants (block_ptr, online, etc.) reach NSPSharding in a normalized form where a row-wise reduction is expressed as:
+"input<M x N> -> transpose<N x M> -> reduce(dim 0) -> result<M>". This is semantically equivalent to "input<M x N> -> reduce(dim 1) -> result<M>".
+
+Within NSPLocalize, we could detect this restricted pattern when rebuilding the local producer chain and avoid recreating the local transpose. For each tile, instead of producing "input<localM x N> -> transpose<N x localM> -> reduce(dim 0)", we would directly build "input<localM x N> -> reduce(dim 1)".
+
+This can be applied to both row-wise reductions in softmax: the max reduction and the sum-of-exp reduction.
+
+The expected benefit is lower temporary tensor pressure and less local work, since we could avoid one or two tensor.empty allocations and the corresponding local transpose computations. It might be worth evaluating this implementation as a performance improvement for the softmax NSPSharding path.
