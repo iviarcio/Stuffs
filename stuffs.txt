@@ -281,3 +281,21 @@ In the vadd_2d flow, sharding propagation also extends the sharding information 
 ======
 
 In the current vadd_2d flow, the normal path reaches shard-to-llvm after NSPMaterializePass has already rewritten the computation into memref.subview-based accesses. As a result, shard-to-llvm mainly lowers shard.process_linear_index and removes residual shard dialect annotations, while the main compute path is already expressed through memref views, loops, and vector operations. For residual tensor-level cases that still reach this stage without being materialized away, shard-to-llvm also lowers shard.all_slice into tensor.extract_slice.
+
+
+=======
+
+The transpose is not semantically required for row-wise softmax. For an input tensor<M x N> a row-wise reduction can be represented directly as "linalg.reduce ... dimensions = [1]". This reduces the N dimension for each of the M rows and produces tensor<M>. However, the IR we are seeing represents the same computation in a normalized form:
+tensor<M x N>
+  -> linalg.transpose permutation = [1, 0]
+  -> tensor<N x M>
+  -> linalg.reduce dimensions = [0]
+  -> tensor<M>
+
+These two forms are equivalent: reduce dim [1] of tensor<M x N> versus transpose to tensor<N x M> + reduce dim [0]
+So the transpose is not needed by softmax itself. It is likely introduced by an earlier lowering/canonicalization step that prefers to express reductions over dimension 0. This can simplify downstream matching or lowering because reductions always appear on a fixed dimension.
+
+The second transpose has the same purpose. After computing "exp(input - row_max)" the softmax needs another row-wise reduction to compute the row sum. Instead of reducing dimension [1]directly, the IR transposes the tensor again and reduces dimension [0].
+
+From the NSPSharding perspective, the important point is that the transpose does not change the logical sharding intent. The desired sharding is still along the original outer row dimension M, while the softmax reduction dimension N must remain local inside each NSP tile.
+
