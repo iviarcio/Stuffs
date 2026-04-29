@@ -950,45 +950,6 @@ struct NSPLocalizePass
                                    inputTy.getEncoding());
     };
 
-    auto isTransposeReduceCanonicalSoftmaxPattern =
-        [&](linalg::ReduceOp reduce, linalg::TransposeOp &transpose) -> bool {
-      if (!reduce || reduce.getInputs().size() != 1 ||
-          reduce.getInits().size() != 1)
-        return false;
-
-      // Match:
-      //   transpose permutation [1, 0]
-      //   reduce dimensions = [0]
-      //
-      // This is the canonicalized form of a row-wise reduction:
-      //   input<M x N> -> transpose<N x M> -> reduce(dim 0) -> tensor<M>
-      //
-      // Locally, this can be rebuilt more directly as:
-      //   input<localM x N> -> reduce(dim 1) -> tensor<localM>
-      transpose =
-          reduce.getInputs()[0].getDefiningOp<mlir::linalg::TransposeOp>();
-      if (!transpose)
-        return false;
-
-      auto inputTy = dyn_cast<RankedTensorType>(transpose.getInput().getType());
-      auto transposeResultTy =
-          dyn_cast<RankedTensorType>(transpose.getResult()[0].getType());
-      auto reduceResultTy =
-          dyn_cast<RankedTensorType>(reduce.getResult()[0].getType());
-      if (!inputTy || !transposeResultTy || !reduceResultTy)
-        return false;
-      if (inputTy.getRank() != 2 || transposeResultTy.getRank() != 2 ||
-          reduceResultTy.getRank() != 1)
-        return false;
-
-      auto perm = transpose.getPermutation();
-      if (perm.size() != 2 || perm[0] != 1 || perm[1] != 0)
-        return false;
-
-      auto dims = reduce.getDimensions();
-      return dims.size() == 1 && dims[0] == 0;
-    };
-
     module.walk([&](mlir::func::FuncOp func) {
       OpBuilder b(func.getContext());
 
@@ -1072,6 +1033,152 @@ struct NSPLocalizePass
           break;
         }
         return cur;
+      };
+
+      struct TransposeReduceChainMatch {
+        mlir::linalg::TransposeOp transpose;
+        mlir::linalg::GenericOp unaryGeneric;
+      };
+
+      auto isUnaryRank2IdentityGeneric =
+          [&](mlir::linalg::GenericOp generic) -> bool {
+        if (!generic)
+          return false;
+
+        if (generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1)
+          return false;
+
+        if (generic.getNumLoops() != 2)
+          return false;
+
+        auto iters = generic.getIteratorTypesArray();
+        if (iters.size() != 2)
+          return false;
+        if (!llvm::all_of(iters, [](mlir::utils::IteratorType it) {
+              return it == mlir::utils::IteratorType::parallel;
+            }))
+          return false;
+
+        auto maps = generic.getIndexingMapsArray();
+        if (maps.size() != 2)
+          return false;
+        if (!isIdentity2DMap(maps[0]) || !isIdentity2DMap(maps[1]))
+          return false;
+
+        auto inputTy = dyn_cast<RankedTensorType>(
+            generic.getDpsInputOperand(0)->get().getType());
+        auto resultTy =
+            dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+        if (!inputTy || !resultTy)
+          return false;
+
+        if (inputTy.getRank() != 2 || resultTy.getRank() != 2)
+          return false;
+
+        if (inputTy.getShape() != resultTy.getShape())
+          return false;
+
+        return true;
+      };
+
+      auto matchTransposeReduceChain =
+          [&](mlir::linalg::ReduceOp reduce,
+              TransposeReduceChainMatch &match) -> bool {
+        if (!reduce || reduce.getInputs().size() != 1 ||
+            reduce.getInits().size() != 1)
+          return false;
+
+        auto reduceResultTy =
+            dyn_cast<RankedTensorType>(reduce->getResult(0).getType());
+        if (!reduceResultTy || reduceResultTy.getRank() != 1)
+          return false;
+
+        auto dims = reduce.getDimensions();
+        if (dims.size() != 1 || dims[0] != 0)
+          return false;
+
+        Value reduceInput = stripTrivialWrappers(reduce.getInputs()[0]);
+
+        // Common blocked-softmax form:
+        //   transpose -> unary identity generic, usually extf -> reduce(dim 0)
+        if (auto generic =
+                reduceInput.getDefiningOp<mlir::linalg::GenericOp>()) {
+          if (!isUnaryRank2IdentityGeneric(generic))
+            return false;
+
+          Value genericInput =
+              stripTrivialWrappers(generic.getDpsInputOperand(0)->get());
+          auto transpose =
+              genericInput.getDefiningOp<mlir::linalg::TransposeOp>();
+          if (!transpose)
+            return false;
+
+          match.transpose = transpose;
+          match.unaryGeneric = generic;
+        } else {
+          // Simpler form:
+          //   transpose -> reduce(dim 0)
+          auto transpose =
+              reduceInput.getDefiningOp<mlir::linalg::TransposeOp>();
+          if (!transpose)
+            return false;
+
+          match.transpose = transpose;
+          match.unaryGeneric = mlir::linalg::GenericOp();
+        }
+
+        auto inputTy =
+            dyn_cast<RankedTensorType>(match.transpose.getInput().getType());
+        auto transposeResultTy =
+            dyn_cast<RankedTensorType>(match.transpose->getResult(0).getType());
+        if (!inputTy || !transposeResultTy)
+          return false;
+
+        if (inputTy.getRank() != 2 || transposeResultTy.getRank() != 2)
+          return false;
+
+        auto perm = match.transpose.getPermutation();
+        if (perm.size() != 2 || perm[0] != 1 || perm[1] != 0)
+          return false;
+
+        return true;
+      };
+
+      auto cloneUnaryGenericOnLocalInput = [&](mlir::linalg::GenericOp generic,
+                                               Value localInput) -> Value {
+        if (!generic || !localInput)
+          return Value();
+
+        auto inputTy = dyn_cast<RankedTensorType>(localInput.getType());
+        auto oldResultTy =
+            dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+        if (!inputTy || !oldResultTy)
+          return Value();
+
+        RankedTensorType localResultTy = RankedTensorType::get(
+            inputTy.getShape(), oldResultTy.getElementType(),
+            oldResultTy.getEncoding());
+
+        Value localInit = b.create<tensor::EmptyOp>(
+            generic.getLoc(), localResultTy.getShape(),
+            localResultTy.getElementType());
+
+        auto localGeneric = b.create<mlir::linalg::GenericOp>(
+            generic.getLoc(),
+            /*resultTensorTypes=*/TypeRange{localResultTy},
+            /*inputs=*/ValueRange{localInput},
+            /*outputs=*/ValueRange{localInit},
+            /*indexingMaps=*/generic.getIndexingMapsArray(),
+            /*iteratorTypes=*/generic.getIteratorTypesArray(),
+            /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+        if (!hasCompatibleRegionArgumentTypes(generic.getRegion().front(),
+                                              ValueRange{localInput},
+                                              ValueRange{localInit}))
+          return Value();
+
+        cloneLinalgRegion(generic.getRegion(), localGeneric.getRegion());
+        return localGeneric.getResult(0);
       };
 
       auto isCompatibleElementwiseGeneric =
@@ -1209,91 +1316,114 @@ struct NSPLocalizePass
         if (auto reduce = dyn_cast_or_null<mlir::linalg::ReduceOp>(
                 base.getDefiningOp())) {
 
-          // Optimization for canonicalized row-wise softmax reductions.
-          // Some inputs reach NSPSharding in this normalized form:
+          // Optimize the canonicalized row-wise softmax reduction form.
+          //
+          // Some softmax variants reach NSPSharding as:
           //   input<M x N>
-          //     -> transpose permutation [1, 0]
-          //     -> tensor<N x M>
+          //     -> transpose [1, 0]
+          //     -> optional unary identity generic, usually f16 -> f32
           //     -> reduce(dim 0)
           //     -> tensor<M>
-          // For the localized producer chain, rebuilding the transpose is not
-          // necessary.  The same local computation can be expressed as:
+          //
+          // The localized fallback would rebuild:
           //   input<localM x N>
+          //     -> transpose<N x localM>
+          //     -> optional unary generic
+          //     -> reduce(dim 0)
+          //
+          // Rebuild this directly as:
+          //   input<localM x N>
+          //     -> optional unary generic
           //     -> reduce(dim 1)
-          //     -> tensor<localM>
-          // This avoids creating the local transpose result tensor and the
-          // transpose operation itself.  The rewrite is intentionally local to
-          // NSPLocalize and does not canonicalize the original global IR.
-          linalg::TransposeOp transpose;
-          if (isTransposeReduceCanonicalSoftmaxPattern(reduce, transpose)) {
-            RankedTensorType transposedLocalTy =
+          //
+          // This preserves the row-wise reduction semantics and avoids the
+          // local transpose tensor and transpose operation.
+          TransposeReduceChainMatch chain;
+          if (matchTransposeReduceChain(reduce, chain)) {
+            RankedTensorType oldReduceInputLocalTy =
                 getReduceInputLocalType(reduce, expectedLocalTy);
-            RankedTensorType sourceLocalTy =
-                getTransposeInputLocalType(transpose, transposedLocalTy);
+            RankedTensorType sourceLocalTy = getTransposeInputLocalType(
+                chain.transpose, oldReduceInputLocalTy);
 
             if (sourceLocalTy) {
-              Value localInput = materializeLocalValue(transpose.getInput(),
-                                                       sourceLocalTy, cache);
-              Value localInit = materializeLocalValue(reduce.getInits()[0],
-                                                      expectedLocalTy, cache);
+              Value localSource = materializeLocalValue(
+                  chain.transpose.getInput(), sourceLocalTy, cache);
 
-              if (localInput && localInit) {
-                auto inputTy = dyn_cast<RankedTensorType>(localInput.getType());
-                if (!inputTy)
-                  return Value();
+              if (localSource) {
+                Value localReduceInput = localSource;
 
-                // The matched transpose is [1, 0], and the original reduce
-                // dimension is 0 in the transposed tensor.  Therefore the
-                // equivalent reduction dimension in the pre-transpose tensor
-                // is 1.
-                constexpr int64_t sourceReductionDim = 1;
-
-                SmallVector<mlir::utils::IteratorType> iteratorTypes;
-                iteratorTypes.reserve(inputTy.getRank());
-                for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
-                  iteratorTypes.push_back(
-                      dim == sourceReductionDim
-                          ? mlir::utils::IteratorType::reduction
-                          : mlir::utils::IteratorType::parallel);
+                if (chain.unaryGeneric) {
+                  localReduceInput = cloneUnaryGenericOnLocalInput(
+                      chain.unaryGeneric, localSource);
                 }
 
-                MLIRContext *ctx = b.getContext();
-                SmallVector<AffineExpr> inputExprs;
-                SmallVector<AffineExpr> outputExprs;
-                inputExprs.reserve(inputTy.getRank());
-                outputExprs.reserve(expectedLocalTy.getRank());
+                Value localInit = materializeLocalValue(reduce.getInits()[0],
+                                                        expectedLocalTy, cache);
 
-                for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
-                  auto expr = getAffineDimExpr(dim, ctx);
-                  inputExprs.push_back(expr);
-                  if (dim != sourceReductionDim)
-                    outputExprs.push_back(expr);
+                if (localReduceInput && localInit) {
+                  auto inputTy =
+                      dyn_cast<RankedTensorType>(localReduceInput.getType());
+                  if (!inputTy)
+                    return Value();
+
+                  // The matched transpose is [1, 0], and the original reduce
+                  // dimension is 0 in the transposed tensor. Therefore the
+                  // equivalent reduction dimension in the pre-transpose local
+                  // tensor is 1.
+                  constexpr int64_t sourceReductionDim = 1;
+
+                  if (inputTy.getRank() != 2)
+                    return Value();
+
+                  SmallVector<mlir::utils::IteratorType> iteratorTypes;
+                  iteratorTypes.reserve(inputTy.getRank());
+                  for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
+                    iteratorTypes.push_back(
+                        dim == sourceReductionDim
+                            ? mlir::utils::IteratorType::reduction
+                            : mlir::utils::IteratorType::parallel);
+                  }
+
+                  MLIRContext *ctx = b.getContext();
+                  SmallVector<AffineExpr> inputExprs;
+                  SmallVector<AffineExpr> outputExprs;
+                  inputExprs.reserve(inputTy.getRank());
+                  outputExprs.reserve(expectedLocalTy.getRank());
+
+                  for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
+                    auto expr = getAffineDimExpr(dim, ctx);
+                    inputExprs.push_back(expr);
+                    if (dim != sourceReductionDim)
+                      outputExprs.push_back(expr);
+                  }
+
+                  AffineMap inputMap =
+                      AffineMap::get(inputTy.getRank(), 0, inputExprs, ctx);
+                  AffineMap outputMap =
+                      AffineMap::get(inputTy.getRank(), 0, outputExprs, ctx);
+
+                  auto localReduce = b.create<mlir::linalg::GenericOp>(
+                      reduce.getLoc(),
+                      /*resultTensorTypes=*/TypeRange{expectedLocalTy},
+                      /*inputs=*/ValueRange{localReduceInput},
+                      /*outputs=*/ValueRange{localInit},
+                      /*indexingMaps=*/
+                      ArrayRef<AffineMap>{inputMap, outputMap},
+                      /*iteratorTypes=*/iteratorTypes,
+                      /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+                  if (!hasCompatibleRegionArgumentTypes(
+                          reduce.getRegion().front(),
+                          ValueRange{localReduceInput}, ValueRange{localInit}))
+                    return Value();
+
+                  cloneLinalgRegion(reduce.getRegion(),
+                                    localReduce.getRegion());
+
+                  Value localRes = localReduce.getResult(0);
+                  cache[base] = localRes;
+                  return localRes;
                 }
-
-                AffineMap inputMap =
-                    AffineMap::get(inputTy.getRank(), 0, inputExprs, ctx);
-                AffineMap outputMap =
-                    AffineMap::get(inputTy.getRank(), 0, outputExprs, ctx);
-
-                auto localReduce = b.create<mlir::linalg::GenericOp>(
-                    reduce.getLoc(),
-                    /*resultTensorTypes=*/TypeRange{expectedLocalTy},
-                    /*inputs=*/ValueRange{localInput},
-                    /*outputs=*/ValueRange{localInit},
-                    /*indexingMaps=*/ArrayRef<AffineMap>{inputMap, outputMap},
-                    /*iteratorTypes=*/iteratorTypes,
-                    /*doc=*/StringRef(), /*libraryCall=*/StringRef());
-
-                if (!hasCompatibleRegionArgumentTypes(
-                        reduce.getRegion().front(), ValueRange{localInput},
-                        ValueRange{localInit}))
-                  return Value();
-
-                cloneLinalgRegion(reduce.getRegion(), localReduce.getRegion());
-
-                Value localRes = localReduce.getResult(0);
-                cache[base] = localRes;
-                return localRes;
               }
             }
           }
