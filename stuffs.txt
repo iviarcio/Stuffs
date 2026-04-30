@@ -1,3 +1,14 @@
+NSP: fold transpose-reduce softmax chains during localization
+
+Teach NSPLocalize to recognize row-wise softmax reductions expressed as a
+transpose followed by an optional unary identity generic and a reduction over
+dimension zero.
+
+When rebuilding the local producer chain, fold this pattern into a direct
+reduction over dimension one of the original local tensor. This avoids
+materializing the local transposed tensor while preserving the original
+row-wise reduction semantics.
+
 NSPSharding Update: Localized Row-Wise Softmax Support
 
 * Extended NSPLocalize to clone softmax producer chains into shard-local tensor computation.
