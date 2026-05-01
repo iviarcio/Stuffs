@@ -362,10 +362,9 @@ static FailureOr<Value> buildRank1SubviewFromRank2(OpBuilder &b, Location loc,
   auto full2D =
       memref::SubViewOp::create(b, loc, baseMemref, offsets, sizes, strides);
 
-  auto collapsedOp =
-      memref::CollapseShapeOp::create(
-          b, loc, subviewTy, full2D.getResult(),
-          ReassociationIndices{{0, 1}}) return collapsedOp.getResult();
+  auto collapsedOp = memref::CollapseShapeOp::create(
+      b, loc, subviewTy, full2D.getResult(), ReassociationIndices{{0, 1}});
+  return collapsedOp.getResult();
 }
 
 /// Match a rank-2 tensor.extract_slice with:
@@ -699,7 +698,7 @@ static FailureOr<Value> materializeScalarLikeValueAtIndexImpl(
     if (!stack.insert(def).second)
       return failure();
 
-    auto eraseFromStack = llvm::make_scope_exit([&]() { stack.erase(def); });
+    auto eraseFromStack = llvm::scope_exit([&]() { stack.erase(def); });
 
     // Case A1: simple localized rank-1 generic.
     if (auto generic = dyn_cast<linalg::GenericOp>(def)) {
@@ -809,7 +808,8 @@ static FailureOr<Value> materializeScalarLikeValueAtIndexImpl(
       return failure();
     if (!stack.insert(def).second)
       return failure();
-    auto eraseFromStack = llvm::make_scope_exit([&]() { stack.erase(def); });
+
+    auto eraseFromStack = llvm::scope_exit([&]() { stack.erase(def); });
 
     // Support short pure scalar/rank-0 chains (arith/math/etc.).
     if (def->getNumRegions() != 0 || !isMemoryEffectFree(def) ||
@@ -1749,9 +1749,11 @@ static LogicalResult tryRewriteRank2TileRank1ChunkToMemref(
             ib, tr.getLoc(), spec.scalarLikeBase, newOuter.getInductionVar());
         if (failed(scalarOr))
           return failure();
-        auto splat = vector::SplatOp::create(ib, tr.getLoc(),
-                                             tr.getVectorType(), *scalarOr);
-        map.map(tr.getResult(), splat.getResult());
+
+        auto broadcast = vector::BroadcastOp::create(
+            ib, tr.getLoc(), tr.getVectorType(), *scalarOr);
+        map.map(tr.getResult(), broadcast.getResult());
+
       } else {
         SmallVector<Value> indices;
         indices.reserve(tr.getIndices().size());

@@ -348,8 +348,7 @@ struct EraseGrid final : public RewritePattern {
   }
 };
 
-struct ShardToLLVMPass : public impl::ShardToLLVMBase<ShardToLLVMPass> {
-  using Base = impl::ShardToLLVMBase<ShardToLLVMPass>;
+struct ShardToLLVMPass : public ::impl::ShardToLLVMBase<ShardToLLVMPass> {
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, tensor::TensorDialect,

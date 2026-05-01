@@ -542,7 +542,7 @@ struct NSPLocalizePass
 
         // procIdx: index in [0, numShards)
         Value procIdx =
-            mlir::shard::ProcessLinearIndexOp::crreate(b, loc, grid);
+            mlir::shard::ProcessLinearIndexOp::create(b, loc, grid);
         // Cast procIdx to the IV type (index stays index; integer gets
         // index_cast).
         Value procInIvTy = procIdx;
@@ -1859,8 +1859,7 @@ struct NSPLocalizePass
 
         // Emit the explicit hand-off op for NSPMaterializePass.
         b.setInsertionPoint(mat);
-        mlir::hexagon::nsp::MaterializeTileOp
-            : create(b, loc,
+        mlir::hexagon::nsp::MaterializeTileOp::create(b, loc,
                      /*source=*/localResult,
                      /*dest=*/dest,
                      /*grid=*/SymbolRefAttr::get(ctx, grid.getSymName()),
