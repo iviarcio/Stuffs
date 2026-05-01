@@ -89,12 +89,12 @@ localizeGenericToTensor(OpBuilder &b, linalg::GenericOp g,
   Value outLocalInit = oldInit;
   auto oldInitTy = dyn_cast<RankedTensorType>(oldInit.getType());
   if (!oldInitTy || oldInitTy != localTy) {
-    outLocalInit = b.create<tensor::EmptyOp>(loc, localTy.getShape(),
-                                             localTy.getElementType());
+    outLocalInit = tensor::EmptyOp::create(b, loc, localTy.getShape(),
+                                           localTy.getElementType());
   }
 
-  auto localizedGeneric = b.create<linalg::GenericOp>(
-      loc,
+  auto localizedGeneric = linalg::GenericOp::create(
+      b, loc,
       /*resultTensorTypes=*/TypeRange{localTy},
       /*inputs=*/ValueRange{localInputs},
       /*outputs=*/ValueRange{outLocalInit},
@@ -541,28 +541,29 @@ struct NSPLocalizePass
         b.setInsertionPoint(forOp);
 
         // procIdx: index in [0, numShards)
-        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
+        Value procIdx =
+            mlir::shard::ProcessLinearIndexOp::crreate(b, loc, grid);
         // Cast procIdx to the IV type (index stays index; integer gets
         // index_cast).
         Value procInIvTy = procIdx;
         if (!ivIsIndex)
-          procInIvTy = b.create<arith::IndexCastOp>(loc, ivTy, procIdx);
+          procInIvTy = arith::IndexCastOp::create(b, loc, ivTy, procIdx);
 
         // newLb = lb + procI32 * step
-        Value offset = b.create<arith::MulIOp>(loc, procInIvTy, step);
-        Value newLb = b.create<arith::AddIOp>(loc, lb, offset);
+        Value offset = arith::MulIOp::create(b, loc, procInIvTy, step);
+        Value newLb = arith::AddIOp::create(b, loc, lb, offset);
 
         // newStep = step * numShards
-        Value cNum = ivIsIndex
-                         ? static_cast<Value>(
-                               b.create<arith::ConstantIndexOp>(loc, numShards))
-                         : static_cast<Value>(b.create<arith::ConstantIntOp>(
-                               loc, numShards, ivIntTy.getWidth()));
+        Value cNum =
+            ivIsIndex ? static_cast<Value>(
+                            arith::ConstantIndexOp::create(b, loc, numShards))
+                      : static_cast<Value>(arith::ConstantIntOp::create(
+                            b, loc, numShards, ivIntTy.getWidth()));
 
-        Value newStep = b.create<arith::MulIOp>(loc, step, cNum);
+        Value newStep = arith::MulIOp::create(b, loc, step, cNum);
 
         // Create the distributed loop.
-        auto newFor = b.create<mlir::scf::ForOp>(loc, newLb, ub, newStep);
+        auto newFor = mlir::scf::ForOp::create(b, loc, newLb, ub, newStep);
         // Mark this loop so we can precisely clean up stale shard annotations
         // only within distributed loops (non-collective mode).
         newFor->setAttr("nsp.distributed", b.getUnitAttr());
@@ -582,7 +583,7 @@ struct NSPLocalizePass
           b.clone(op, mapping);
         }
         b.setInsertionPointToEnd(newBody);
-        b.create<mlir::scf::YieldOp>(loc);
+        mlir::scf::YieldOp::create(b, loc);
 
         // Replace uses of the old loop results (none here) and erase old loop.
         forOp.erase();
@@ -955,8 +956,8 @@ struct NSPLocalizePass
 
       auto buildTensorEmptyLike = [&](Location loc,
                                       RankedTensorType ty) -> Value {
-        return b.create<tensor::EmptyOp>(loc, ty.getShape(),
-                                         ty.getElementType());
+        return tensor::EmptyOp::create(b, loc, ty.getShape(),
+                                       ty.getElementType());
       };
 
       // Find a bufferization.materialize_in_destination sink for `v` while
@@ -1159,12 +1160,12 @@ struct NSPLocalizePass
             inputTy.getShape(), oldResultTy.getElementType(),
             oldResultTy.getEncoding());
 
-        Value localInit = b.create<tensor::EmptyOp>(
-            generic.getLoc(), localResultTy.getShape(),
+        Value localInit = tensor::EmptyOp::create(
+            b, generic.getLoc(), localResultTy.getShape(),
             localResultTy.getElementType());
 
-        auto localGeneric = b.create<mlir::linalg::GenericOp>(
-            generic.getLoc(),
+        auto localGeneric = mlir::linalg::GenericOp::create(
+            b, generic.getLoc(),
             /*resultTensorTypes=*/TypeRange{localResultTy},
             /*inputs=*/ValueRange{localInput},
             /*outputs=*/ValueRange{localInit},
@@ -1266,11 +1267,11 @@ struct NSPLocalizePass
           if (!fillLocalTy)
             return Value();
 
-          Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
-              fill.getLoc(), fillLocalTy.getShape(),
+          Value outLocalInit = mlir::tensor::EmptyOp::create(
+              b, fill.getLoc(), fillLocalTy.getShape(),
               fillLocalTy.getElementType());
-          auto localFill = b.create<mlir::linalg::FillOp>(
-              fill.getLoc(), /*inputs=*/fill.getInputs(),
+          auto localFill = mlir::linalg::FillOp::create(
+              b, fill.getLoc(), /*inputs=*/fill.getInputs(),
               /*outputs=*/ValueRange{outLocalInit});
           Value localRes = localFill.getResult(0);
           cache[base] = localRes;
@@ -1296,8 +1297,8 @@ struct NSPLocalizePass
             if (localInput) {
               Value outLocalInit =
                   buildTensorEmptyLike(transpose.getLoc(), expectedLocalTy);
-              auto localTranspose = b.create<mlir::linalg::TransposeOp>(
-                  transpose.getLoc(),
+              auto localTranspose = mlir::linalg::TransposeOp::create(
+                  b, transpose.getLoc(),
                   /*input=*/localInput,
                   /*init=*/outLocalInit,
                   /*permutation=*/transpose.getPermutation());
@@ -1402,8 +1403,8 @@ struct NSPLocalizePass
                   AffineMap outputMap =
                       AffineMap::get(inputTy.getRank(), 0, outputExprs, ctx);
 
-                  auto localReduce = b.create<mlir::linalg::GenericOp>(
-                      reduce.getLoc(),
+                  auto localReduce = mlir::linalg::GenericOp::create(
+                      b, reduce.getLoc(),
                       /*resultTensorTypes=*/TypeRange{expectedLocalTy},
                       /*inputs=*/ValueRange{localReduceInput},
                       /*outputs=*/ValueRange{localInit},
@@ -1471,8 +1472,8 @@ struct NSPLocalizePass
               AffineMap outputMap =
                   AffineMap::get(inputTy.getRank(), 0, outputExprs, ctx);
 
-              auto localReduce = b.create<mlir::linalg::GenericOp>(
-                  reduce.getLoc(),
+              auto localReduce = mlir::linalg::GenericOp::create(
+                  b, reduce.getLoc(),
                   /*resultTensorTypes=*/TypeRange{expectedLocalTy},
                   /*inputs=*/ValueRange{localInput},
                   /*outputs=*/ValueRange{localInit},
@@ -1524,12 +1525,12 @@ struct NSPLocalizePass
                   materializeLocalValue(inV, inputLocalTy, cache));
             }
 
-            Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
-                prod.getLoc(), expectedLocalTy.getShape(),
+            Value outLocalInit = mlir::tensor::EmptyOp::create(
+                b, prod.getLoc(), expectedLocalTy.getShape(),
                 expectedLocalTy.getElementType());
 
-            auto newProd = b.create<mlir::linalg::GenericOp>(
-                prod.getLoc(),
+            auto newProd = mlir::linalg::GenericOp::create(
+                b, prod.getLoc(),
                 /*resultTensorTypes=*/TypeRange{expectedLocalTy},
                 /*inputs=*/ValueRange{prodInputs},
                 /*outputs=*/ValueRange{outLocalInit},
@@ -1596,8 +1597,8 @@ struct NSPLocalizePass
 
             Value outLocalInit =
                 buildTensorEmptyLike(prod.getLoc(), expectedLocalTy);
-            auto newProd = b.create<mlir::linalg::GenericOp>(
-                prod.getLoc(),
+            auto newProd = mlir::linalg::GenericOp::create(
+                b, prod.getLoc(),
                 /*resultTensorTypes=*/TypeRange{expectedLocalTy},
                 /*inputs=*/ValueRange{prodInputs},
                 /*outputs=*/ValueRange{outLocalInit},
@@ -1858,13 +1859,13 @@ struct NSPLocalizePass
 
         // Emit the explicit hand-off op for NSPMaterializePass.
         b.setInsertionPoint(mat);
-        b.create<mlir::hexagon::nsp::MaterializeTileOp>(
-            loc,
-            /*source=*/localResult,
-            /*dest=*/dest,
-            /*grid=*/SymbolRefAttr::get(ctx, grid.getSymName()),
-            /*splitAxis=*/splitAxisAttr,
-            /*tileShape=*/tileShapeArrayAttr);
+        mlir::hexagon::nsp::MaterializeTileOp
+            : create(b, loc,
+                     /*source=*/localResult,
+                     /*dest=*/dest,
+                     /*grid=*/SymbolRefAttr::get(ctx, grid.getSymName()),
+                     /*splitAxis=*/splitAxisAttr,
+                     /*tileShape=*/tileShapeArrayAttr);
 
         // The old sink chain is now replaced by the explicit NSP
         // materialization anchor, so the old sink/wrappers/global generic can

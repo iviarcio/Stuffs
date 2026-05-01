@@ -1,3 +1,15 @@
+[NSP] Update code for recent LLVM/MLIR API changes
+
+Adapt the pass implementation to API/namespace changes introduced by the
+newer LLVM/MLIR version.
+
+Replace deprecated OpBuilder::create<OpTy>(...) calls with the new
+OpTy::create(builder, ...) form where required, and update generated pass base
+references to use the namespace emitted by the current TableGen output.
+
+This is a mechanical compatibility update and does not change the lowering
+semantics.
+
 NSP: fold transpose-reduce softmax chains during localization
 
 Teach NSPLocalize to recognize row-wise softmax reductions expressed as a
