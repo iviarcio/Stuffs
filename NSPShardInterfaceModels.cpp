@@ -839,52 +839,17 @@ struct MaterializeInDestShardingModel
           MaterializeInDestShardingModel,
           bufferization::MaterializeInDestinationOp> {
 
-  static std::optional<int64_t> getRankedShapedRank(Type ty) {
-    auto shapedTy = dyn_cast<ShapedType>(ty);
-    if (!shapedTy || !shapedTy.hasRank())
-      return std::nullopt;
-    return shapedTy.getRank();
-  }
-
-  static std::optional<int64_t>
-  getCompatibleOperandRank(bufferization::MaterializeInDestinationOp mat) {
-    if (!mat || mat->getNumOperands() != 2 || mat->getNumResults() != 0)
-      return std::nullopt;
-
-    auto srcRank = getRankedShapedRank(mat->getOperand(0).getType());
-    auto dstRank = getRankedShapedRank(mat->getOperand(1).getType());
-    if (!srcRank || !dstRank)
-      return std::nullopt;
-
-    // The materialize_in_destination op is a sink, not an elementwise compute
-    // op. Only model it as sharding-transparent when the tensor source and
-    // destination buffer have the same logical rank.
-    //
-    // Rank-changing cases, rank-reduced stores, subviews, or other destination
-    // views are handled later by NSPLocalize/NSPMaterialize and should not be
-    // interpreted as regular propagation compute here.
-    if (*srcRank != *dstRank)
-      return std::nullopt;
-
-    return *srcRank;
-  }
-
   SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
-    auto mat = dyn_cast<bufferization::MaterializeInDestinationOp>(op);
-    auto rank = getCompatibleOperandRank(mat);
-    if (!rank)
-      return {};
-
-    return makeIdentityMapsForOp(op, rank);
+    // bufferization.materialize_in_destination is a tensor-to-buffer sink.
+    // It is not a tensor compute op and should not expose indexing maps for
+    // sharding propagation. The source tensor may already carry a shard.shard
+    // annotation, but the destination memref is handled later by
+    // NSPLocalize/NSPMaterialize.
+    return {};
   }
 
   SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
-    auto mat = dyn_cast<bufferization::MaterializeInDestinationOp>(op);
-    auto rank = getCompatibleOperandRank(mat);
-    if (!rank)
-      return {};
-
-    return makeParallelIters(*rank);
+    return {};
   }
 
   SmallVector<shard::ReductionKind>
@@ -895,15 +860,9 @@ struct MaterializeInDestShardingModel
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
                     ArrayRef<shard::Sharding>) const {
-    auto mat = dyn_cast<bufferization::MaterializeInDestinationOp>(op);
-    auto rank = getCompatibleOperandRank(mat);
-    if (!rank)
-      return shard::ShardingOption::makeEmpty();
 
-    // Operand(0) is the tensor to materialize. If it has sharding, accept it.
-    if (!operandShardings.empty() && operandShardings[0])
-      return makeValueShardingOption(operandShardings[0]);
-
+    (void)op;
+    (void)operandShardings;
     return shard::ShardingOption::makeEmpty();
   }
 
@@ -911,21 +870,9 @@ struct MaterializeInDestShardingModel
   getShardingAnnotations(Operation *op,
                          const shard::ShardingOption &opt) const {
 
+    (void)opt;
     std::vector<shard::Sharding> res;
     res.resize(op->getNumOperands() + op->getNumResults(), shard::Sharding());
-
-    auto mat = dyn_cast<bufferization::MaterializeInDestinationOp>(op);
-    auto rank = getCompatibleOperandRank(mat);
-    if (!rank)
-      return res;
-
-    shard::Sharding s = fromShardingOption(op, opt, *rank);
-
-    // Both operands get the same logical sharding info (tensor + destination
-    // memref).
-    res[0] = s;
-    res[1] = s;
-
     return res;
   }
 
