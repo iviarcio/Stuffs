@@ -1,3 +1,9 @@
+Upstream Synchronization: Successfully synced the `celera/NSPSharding` branch with the latest `upstream/main` via rebase to ensure codebase alignment.
+LLVM Version Integration: Resolved build errors and API incompatibilities triggered by recent LLVM/MLIR version increments.
+Submodule Maintenance: Updated and synchronized project submodules (including `triton` and `triton_shared`) to match the new upstream requirements.
+Regression Testing: Verified that all previously passing test cases remain stable; no regressions were introduced during the synchronization or version-fix process.
+Environment Status: Local environment is fully reconciled with the remote branch after a successful forced-with-lease push.
+
 [NSP] Update code for recent LLVM/MLIR API changes
 
 Adapt the pass implementation to API/namespace changes introduced by the
