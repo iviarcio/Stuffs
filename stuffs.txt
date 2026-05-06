@@ -1,3 +1,16 @@
+Add NSP-specific sharding propagation pass
+
+Introduce NSPShardingPropagationPass as a local wrapper around the Shard
+dialect propagation logic.
+
+The new pass preserves the upstream propagation behavior for tensor operations,
+but treats bufferization.materialize_in_destination as an NSP boundary. This
+avoids propagating sharding through a tensor-to-buffer sink whose destination is
+a memref, which is rejected by newer LLVM/MLIR ShardingInterface verification.
+
+Update the NSP pipeline to use the local propagation pass instead of calling the
+upstream shard propagation pass directly.
+
 Upstream Synchronization: Successfully synced the `celera/NSPSharding` branch with the latest `upstream/main` via rebase to ensure codebase alignment.
 LLVM Version Integration: Resolved build errors and API incompatibilities triggered by recent LLVM/MLIR version increments.
 Submodule Maintenance: Updated and synchronized project submodules (including `triton` and `triton_shared`) to match the new upstream requirements.
