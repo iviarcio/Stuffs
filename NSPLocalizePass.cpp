@@ -541,8 +541,7 @@ struct NSPLocalizePass
         b.setInsertionPoint(forOp);
 
         // procIdx: index in [0, numShards)
-        Value procIdx =
-            mlir::shard::ProcessLinearIndexOp::create(b, loc, grid);
+        Value procIdx = mlir::shard::ProcessLinearIndexOp::create(b, loc, grid);
         // Cast procIdx to the IV type (index stays index; integer gets
         // index_cast).
         Value procInIvTy = procIdx;
@@ -965,11 +964,9 @@ struct NSPLocalizePass
     //
     // General reshapes are not supported here, because they are not simple
     // view-like sharding projections.
-    auto getUnitExpandRepresentativeDims =
-        [&](tensor::ExpandShapeOp expand)
-            -> std::optional<SmallVector<int64_t>> {
-      auto srcTy =
-          dyn_cast<RankedTensorType>(expand->getOperand(0).getType());
+    auto getUnitExpandRepresentativeDims = [&](tensor::ExpandShapeOp expand)
+        -> std::optional<SmallVector<int64_t>> {
+      auto srcTy = dyn_cast<RankedTensorType>(expand->getOperand(0).getType());
       auto resultTy =
           dyn_cast<RankedTensorType>(expand->getResult(0).getType());
       if (!srcTy || !resultTy)
@@ -1094,8 +1091,12 @@ struct NSPLocalizePass
                                        ty.getElementType());
       };
 
-      // Find a bufferization.materialize_in_destination sink for `v` while
-      // allowing a trivial chain of sharding wrappers.
+      using MaterializeSink =
+          std::pair<bufferization::MaterializeInDestinationOp,
+                    SmallVector<Operation *>>;
+
+      // Find a bufferization.materialize_in_destination sink reachable from
+      // `v` through a supported wrapper path.
       //
       // Sharding propagation often wraps values with shard.shard, so the IR can
       // look like:
@@ -1103,73 +1104,103 @@ struct NSPLocalizePass
       //   %r1 = shard.shard %r to %sharding
       //   bufferization.materialize_in_destination %r1 in %dst
       //
+      // In producer/consumer chains, the wrapper result may have additional
+      // users, for example:
+      //   %r1 = shard.shard %r to %sharding
+      //   %e  = tensor.expand_shape %r1 ...
+      //   bufferization.materialize_in_destination %e in %dst
+      //   %r2 = shard.shard %r1 to %other_sharding annotate_for_users
+      //   %next = linalg.generic ins(%r2, ...)
+      //
+      // The materialization side path is still valid and should be localized.
+      // Therefore this helper searches among the users instead of requiring
+      // every value in the wrapper chain to be single-use.
+      //
       // In store-by-tile mode, we rewrite the materialization to store the
-      // local tile into a subview of %dst, and erase the wrapper chain.
-      auto findMaterializeSink = [&](Value v)
-          -> std::optional<std::pair<bufferization::MaterializeInDestinationOp,
-                                     SmallVector<Operation *>>> {
+      // local tile into a subview of %dst. Only now-dead wrappers are erased;
+      // wrappers/producers that still feed downstream computation are kept.
+      auto findMaterializeSink =
+          [&](Value v) -> std::optional<MaterializeSink> {
         SmallVector<Operation *> wrappers;
-        Value cur = v;
 
-        while (true) {
-          // Keep bring-up simple: require a single-use chain.
-          if (!cur.hasOneUse())
+        std::function<std::optional<MaterializeSink>(Value, unsigned)> search =
+            [&](Value cur, unsigned depth) -> std::optional<MaterializeSink> {
+          if (depth > 8)
             return std::nullopt;
 
-          Operation *user = *cur.getUsers().begin();
+          SmallVector<Operation *> users;
+          for (Operation *user : cur.getUsers())
+            users.push_back(user);
 
-          // Allow shard.shard wrappers.
-          if (auto shardOp = dyn_cast<mlir::shard::ShardOp>(user)) {
-            // Be robust to ShardOp operand naming differences across versions.
-            if (shardOp->getNumOperands() < 1 || shardOp->getOperand(0) != cur)
-              return std::nullopt;
-            wrappers.push_back(user);
-            cur = shardOp->getResult(0);
-            continue;
+          // Prefer a direct materialization sink when present.
+          for (Operation *user : users) {
+            if (auto mat =
+                    dyn_cast<bufferization::MaterializeInDestinationOp>(user)) {
+              if (mat->getOperand(0) != cur)
+                continue;
+              return std::make_optional(std::make_pair(mat, wrappers));
+            }
           }
 
-          // Allow an optional tensor.cast in between.
-          if (auto castOp = dyn_cast<tensor::CastOp>(user)) {
-            if (castOp.getSource() != cur)
-              return std::nullopt;
-            wrappers.push_back(user);
-            cur = castOp.getResult();
-            continue;
-          }
+          // Otherwise search through supported tensor/shard wrappers.
+          for (Operation *user : users) {
+            // Allow shard.shard wrappers.
+            if (auto shardOp = dyn_cast<mlir::shard::ShardOp>(user)) {
+              if (shardOp->getNumOperands() < 1 ||
+                  shardOp->getOperand(0) != cur)
+                continue;
 
-          // Allow a unit-expanding tensor.expand_shape in the final sink chain.
-          //
-          // Example:
-          //   %r = linalg.generic ... : tensor<Mxf32>
-          //   %e = tensor.expand_shape %r [[0, 1]]
-          //          output_shape [M, 1]
-          //          : tensor<Mxf32> into tensor<Mx1xf32>
-          //   bufferization.materialize_in_destination %e in %dst
-          //
-          // In store-by-tile mode, the localized chain must become:
-          //   %r.local = ...
-          //   %e.local = tensor.expand_shape %r.local [[0, 1]]
-          //                : tensor<tileMxf32> into tensor<tileMx1xf32>
-          if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(user)) {
-            if (expandOp->getOperand(0) != cur)
-              return std::nullopt;
-            if (!getUnitExpandRepresentativeDims(expandOp))
-              return std::nullopt;
-            wrappers.push_back(user);
-            cur = expandOp->getResult(0);
-            continue;
-          }
+              wrappers.push_back(user);
+              auto found = search(shardOp->getResult(0), depth + 1);
+              if (found)
+                return found;
+              wrappers.pop_back();
+              continue;
+            }
 
-          // Accept bufferization.materialize_in_destination.
-          if (auto mat =
-                  dyn_cast<bufferization::MaterializeInDestinationOp>(user)) {
-            if (mat->getOperand(0) != cur)
-              return std::nullopt;
-            return std::make_optional(std::make_pair(mat, wrappers));
+            // Allow an optional tensor.cast in between.
+            if (auto castOp = dyn_cast<tensor::CastOp>(user)) {
+              if (castOp.getSource() != cur)
+                continue;
+              wrappers.push_back(user);
+              auto found = search(castOp.getResult(), depth + 1);
+              if (found)
+                return found;
+              wrappers.pop_back();
+              continue;
+            }
+
+            // Allow a unit-expanding tensor.expand_shape in the final sink
+            // chain. Example:
+            //   %r = linalg.generic ... : tensor<Mxf32>
+            //   %e = tensor.expand_shape %r [[0, 1]]
+            //          output_shape [M, 1]
+            //          : tensor<Mxf32> into tensor<Mx1xf32>
+            //   bufferization.materialize_in_destination %e in %dst
+            //
+            // In store-by-tile mode, the localized chain must become:
+            //   %r.local = ...
+            //   %e.local = tensor.expand_shape %r.local [[0, 1]]
+            //                : tensor<tileMxf32> into tensor<tileMx1xf32>
+            if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(user)) {
+              if (expandOp->getOperand(0) != cur)
+                continue;
+              if (!getUnitExpandRepresentativeDims(expandOp))
+                continue;
+
+              wrappers.push_back(user);
+              auto found = search(expandOp->getResult(0), depth + 1);
+              if (found)
+                return found;
+              wrappers.pop_back();
+              continue;
+            }
           }
 
           return std::nullopt;
-        }
+        };
+
+        return search(v, /*depth=*/0);
       };
 
       // Strip trivial wrapper ops (shard.shard, tensor.cast) to expose a real
@@ -1654,8 +1685,8 @@ struct NSPLocalizePass
 
         // tensor.expand_shape: localize the source and rebuild the same
         // unit-expansion over the local tile.
-        if (auto expand = dyn_cast_or_null<tensor::ExpandShapeOp>(
-                base.getDefiningOp())) {
+        if (auto expand =
+                dyn_cast_or_null<tensor::ExpandShapeOp>(base.getDefiningOp())) {
           RankedTensorType inputLocalTy =
               getExpandShapeInputLocalType(expand, expectedLocalTy);
           if (inputLocalTy) {
@@ -1985,8 +2016,7 @@ struct NSPLocalizePass
         Value localResult = localizedGeneric.getResult(0);
 
         auto rebuildPostSinkTensorChain =
-            [&](Value baseLocal,
-                ArrayRef<Operation *> wrappers) -> Value {
+            [&](Value baseLocal, ArrayRef<Operation *> wrappers) -> Value {
           Value curLocal = baseLocal;
 
           for (Operation *wrapper : wrappers) {
@@ -2118,20 +2148,32 @@ struct NSPLocalizePass
 
         // Emit the explicit hand-off op for NSPMaterializePass.
         b.setInsertionPoint(mat);
-        mlir::hexagon::nsp::MaterializeTileOp::create(b, loc,
-                     /*source=*/materializeSource,
-                     /*dest=*/dest,
-                     /*grid=*/SymbolRefAttr::get(ctx, grid.getSymName()),
-                     /*splitAxis=*/splitAxisAttr,
-                     /*tileShape=*/tileShapeArrayAttr);
+        mlir::hexagon::nsp::MaterializeTileOp::create(
+            b, loc,
+            /*source=*/materializeSource,
+            /*dest=*/dest,
+            /*grid=*/SymbolRefAttr::get(ctx, grid.getSymName()),
+            /*splitAxis=*/splitAxisAttr,
+            /*tileShape=*/tileShapeArrayAttr);
 
         // The old sink chain is now replaced by the explicit NSP
-        // materialization anchor, so the old sink/wrappers/global generic can
-        // go away now.
+        // materialization anchor.
+        //
+        // Only erase operations that became dead. In blocked_layer_norm, the
+        // same sharded value may feed both:
+        //   1. tensor.expand_shape -> materialize_in_destination
+        //   2. downstream linalg.generic consumers
+        //
+        // In that case, the side materialization path should disappear, but
+        // the global producer/wrapper chain must remain available for the
+        // downstream computation.
         mat.erase();
         for (Operation *op : llvm::reverse(wrappers))
-          op->erase();
-        g.erase();
+          if (op->use_empty())
+            op->erase();
+
+        if (g->use_empty())
+          g.erase();
 
         continue;
 
