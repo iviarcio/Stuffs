@@ -293,8 +293,9 @@ getUnitExpandRepresentativeDims(tensor::ExpandShapeOp expand) {
   if (!srcTy || !resultTy)
     return std::nullopt;
 
-  ArrayRef<ReassociationIndices> reassociation =
+  SmallVector<ReassociationIndices> reassociation =
       expand.getReassociationIndices();
+
   if ((int64_t)reassociation.size() != srcTy.getRank())
     return std::nullopt;
 
