@@ -171,17 +171,31 @@ static bool isRowBroadcastMap(AffineMap map) {
   return d0.getPosition() == 0;
 }
 
-/// Return true iff `g` matches the following elementwise pattern:
+/// Return true iff `map` is the column-broadcast projection:
+///   (d0, d1) -> (d1)
+static bool isColumnBroadcastMap(AffineMap map) {
+  if (!map || map.getNumResults() != 1)
+    return false;
+
+  auto d1 = dyn_cast<AffineDimExpr>(map.getResult(0));
+  if (!d1)
+    return false;
+
+  return d1.getPosition() == 1;
+}
+
+/// Return true iff `g` matches a supported rank-2 broadcast elementwise
+/// generic:
 ///   - rank-2 result
 ///   - all-parallel iterators
 ///   - output map is identity 2D
 ///   - each input is either:
-///       * rank-2 with identity 2D map, or
-///       * rank-1 with row-broadcast map (d0, d1) -> (d0)
-static bool
-isSupportedBroadcastRowWiseGeneric(linalg::GenericOp g,
-                                   RankedTensorType outResTy,
-                                   ArrayRef<RankedTensorType> inputTys) {
+///       * rank-2 with identity 2D map,
+///       * rank-1 with row-broadcast map (d0, d1) -> (d0), or
+///       * rank-1 with column-broadcast map (d0, d1) -> (d1)
+static bool isSupportedBroadcast2DGeneric(linalg::GenericOp g,
+                                          RankedTensorType outResTy,
+                                          ArrayRef<RankedTensorType> inputTys) {
   if (!outResTy || outResTy.getRank() != 2)
     return false;
 
@@ -210,6 +224,7 @@ isSupportedBroadcastRowWiseGeneric(linalg::GenericOp g,
   // Inputs may be:
   //   - rank-2 + identity 2D
   //   - rank-1 + row-broadcast projection
+  //   - rank-1 + column-broadcast projection
   for (int64_t i = 0, e = static_cast<int64_t>(inputTys.size()); i < e; ++i) {
     RankedTensorType inTy = inputTys[i];
     if (!inTy)
@@ -223,7 +238,7 @@ isSupportedBroadcastRowWiseGeneric(linalg::GenericOp g,
     }
 
     if (inTy.getRank() == 1) {
-      if (!isRowBroadcastMap(map))
+      if (!isRowBroadcastMap(map) && !isColumnBroadcastMap(map))
         return false;
       continue;
     }
@@ -677,7 +692,8 @@ struct NSPLocalizePass
     };
 
     auto isCompatibleInputForBroadcastLocalize =
-        [&](RankedTensorType inTy, RankedTensorType outTy) -> bool {
+        [&](RankedTensorType inTy, AffineMap inputMap,
+            RankedTensorType outTy) -> bool {
       if (!inTy || !outTy || outTy.getRank() != 2)
         return false;
 
@@ -686,13 +702,15 @@ struct NSPLocalizePass
         return false;
 
       if (inTy.getRank() == 2) {
+        if (!isIdentity2DMap(inputMap))
+          return false;
         auto inLocalTy = getLocalType(inTy);
         if (!inLocalTy)
           return false;
         return inLocalTy.getShape() == outLocalTy.getShape();
       }
 
-      if (inTy.getRank() == 1) {
+      if (inTy.getRank() == 1 && isRowBroadcastMap(inputMap)) {
         auto inLocalTy = getLocalType(inTy);
         if (!inLocalTy)
           return false;
@@ -701,17 +719,29 @@ struct NSPLocalizePass
                inLocalTy.getShape()[0] == outLocalTy.getShape()[0];
       }
 
+      if (inTy.getRank() == 1 && isColumnBroadcastMap(inputMap)) {
+        if (outLocalTy.getShape().size() != 2)
+          return false;
+        int64_t colExtent = inTy.getDimSize(0);
+        int64_t localCols = outLocalTy.getShape()[1];
+        if (ShapedType::isDynamic(colExtent) ||
+            ShapedType::isDynamic(localCols))
+          return false;
+        return colExtent == localCols;
+      }
+
       return false;
     };
 
     // Compute the shard-local tensor type expected for a specific operand of
     // a localized generic.
     //
-    // For the current broadcast-aware path that:
-    //   - rank-2 identity inputs use the same local type as the result
+    // For the current broadcast-aware path:
+    //   - rank-2 identity inputs use the same local type as the result,
     //   - rank-1 row-broadcast inputs ((d0, d1) -> (d0)) use only the local
-    //   row extent, i.e. tensor<localRows x T> -> tensor<localRows x T>
-    //   becomes tensor<localRows x elemTy> for the rank-1 operand
+    //     row extent, and
+    //   - rank-1 column-broadcast inputs ((d0, d1) -> (d1)) are replicated and
+    //     keep the full column extent.
     auto getExpectedLocalTypeForOperand =
         [&](RankedTensorType operandTy, AffineMap operandMap,
             RankedTensorType localResultTy) -> RankedTensorType {
@@ -730,6 +760,20 @@ struct NSPLocalizePass
           return RankedTensorType();
 
         return RankedTensorType::get({localRows}, operandTy.getElementType(),
+                                     operandTy.getEncoding());
+      }
+
+      if (operandTy.getRank() == 1 && isColumnBroadcastMap(operandMap)) {
+        if (localResultTy.getRank() != 2)
+          return RankedTensorType();
+
+        int64_t localCols = localResultTy.getShape()[1];
+        int64_t operandCols = operandTy.getDimSize(0);
+        if (ShapedType::isDynamic(localCols) ||
+            ShapedType::isDynamic(operandCols) || localCols != operandCols)
+          return RankedTensorType();
+
+        return RankedTensorType::get({localCols}, operandTy.getElementType(),
                                      operandTy.getEncoding());
       }
 
@@ -1443,6 +1487,17 @@ struct NSPLocalizePass
         if (it != cache.end())
           return it->second;
 
+        // Replicated values do not need slicing. This is required for
+        // column-wise broadcast operands such as layer-norm gamma/beta:
+        //   tensor<N>, map (d0, d1) -> (d1)
+        // where N is the full column extent and must remain available on every
+        // NSP participant.
+        auto baseTy = dyn_cast<RankedTensorType>(base.getType());
+        if (baseTy && baseTy == expectedLocalTy) {
+          cache[base] = base;
+          return base;
+        }
+
         // linalg.fill: produce a local constant tile.
         if (auto fill =
                 dyn_cast_or_null<mlir::linalg::FillOp>(base.getDefiningOp())) {
@@ -1770,17 +1825,19 @@ struct NSPLocalizePass
             return localRes;
           }
 
-          // Row-wise broadcast elementwise producer:
+          // Broadcast-aware rank-2 elementwise producer:
+          //   tensor<MxN>, tensor<M>, tensor<N> -> tensor<MxN>
           //
-          //   tensor<MxN>, tensor<M> -> tensor<MxN>
-          //
-          // When expectedLocalTy is tensor<localM x N>, the rank-2 inputs are
-          // localized to tensor<localM x N> and rank-1 broadcast inputs are
-          // localized to tensor<localM>. This lets a full softmax chain remain
-          // local instead of slicing only the final result.
+          // When expectedLocalTy is tensor<localM x N>, rank-2 identity inputs
+          // are localized to tensor<localM x N>, row-broadcast inputs are
+          // localized to tensor<localM>, and column-broadcast inputs remain
+          // tensor<N> replicated on every participant. This covers the final
+          // blocked-layer-norm generic:
+          //   x[row, col], rstd[row], gamma[col], beta[col]
           auto prodResTy =
               dyn_cast<RankedTensorType>(prod.getResult(0).getType());
-          if (isSupportedBroadcastRowWiseGeneric(
+          auto prodMaps = prod.getIndexingMapsArray();
+          if (isSupportedBroadcast2DGeneric(
                   prod, prodResTy,
                   [&]() {
                     SmallVector<RankedTensorType> tys;
@@ -1799,15 +1856,8 @@ struct NSPLocalizePass
               if (!inTy)
                 return Value();
 
-              RankedTensorType inputLocalTy;
-              if (inTy.getRank() == 2) {
-                inputLocalTy =
-                    getLocalTypeWithShape(inTy, expectedLocalTy.getShape());
-              } else if (inTy.getRank() == 1) {
-                SmallVector<int64_t> rowShape = {expectedLocalTy.getDimSize(0)};
-                inputLocalTy = getLocalTypeWithShape(inTy, rowShape);
-              }
-
+              RankedTensorType inputLocalTy = getExpectedLocalTypeForOperand(
+                  inTy, prodMaps[in->getOperandNumber()], expectedLocalTy);
               if (!inputLocalTy)
                 return Value();
 
@@ -1859,7 +1909,7 @@ struct NSPLocalizePass
 
         // Initial structural filter.
         const int64_t numInputs = g.getNumDpsInputs();
-        if (numInputs < 1 || numInputs > 3 || g.getNumDpsInits() != 1)
+        if (numInputs < 1 || numInputs > 4 || g.getNumDpsInits() != 1)
           continue;
 
         SmallVector<Value> inputs;
@@ -1887,10 +1937,10 @@ struct NSPLocalizePass
 
         bool supportsIdentityElementwise =
             isSupportedElementwiseGenericShape(g, outResTy, inputTys);
-        bool supportsBroadcastRowWise =
-            isSupportedBroadcastRowWiseGeneric(g, outResTy, inputTys);
+        bool supportsBroadcast2D =
+            isSupportedBroadcast2DGeneric(g, outResTy, inputTys);
 
-        if (!supportsIdentityElementwise && !supportsBroadcastRowWise)
+        if (!supportsIdentityElementwise && !supportsBroadcast2D)
           continue;
 
         auto localTy = getLocalType(outResTy);
@@ -1908,9 +1958,11 @@ struct NSPLocalizePass
         // compatible when their shard-local extent matches the row dimension
         // of the output tile.
         bool compatibleLocalShapes = true;
-        for (RankedTensorType t : inputTys) {
-          if (supportsBroadcastRowWise) {
-            if (!isCompatibleInputForBroadcastLocalize(t, outResTy)) {
+        auto inputMaps = g.getIndexingMapsArray();
+        for (auto [idx, t] : llvm::enumerate(inputTys)) {
+          if (supportsBroadcast2D) {
+            if (!isCompatibleInputForBroadcastLocalize(t, inputMaps[idx],
+                                                       outResTy)) {
               compatibleLocalShapes = false;
               break;
             }
@@ -1983,7 +2035,7 @@ struct NSPLocalizePass
         for (int64_t i = 0; i < numInputs; ++i) {
           RankedTensorType expectedInputLocalTy = localTy;
 
-          if (supportsBroadcastRowWise) {
+          if (supportsBroadcast2D) {
             expectedInputLocalTy =
                 getExpectedLocalTypeForOperand(inputTys[i], maps[i], localTy);
             if (!expectedInputLocalTy) {
