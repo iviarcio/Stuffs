@@ -1773,6 +1773,168 @@ struct NSPLocalizePass
         // linalg.generic: clone producer locally if compatible.
         if (auto prod = dyn_cast_or_null<mlir::linalg::GenericOp>(
                 base.getDefiningOp())) {
+
+          // Multi-result broadcast-aware producer.
+          //
+          // This covers patterns such as:
+          //   %centered, %square = linalg.generic
+          //     ins(%x, %mean : tensor<MxN>, tensor<M>)
+          //     outs(%empty0, %empty1 : tensor<MxN>, tensor<MxN>)
+          //
+          // E.g., the final layer-norm generic may consume both
+          // %centered and %square through different result numbers.
+          // The multi-result producer once over localized operands,
+          // then cache all local results:
+          //   cache[%producer#0] = %local_producer#0
+          //   cache[%producer#1] = %local_producer#1
+          auto tryLocalizeMultiResultGeneric = [&]() -> Value {
+            if (prod->getNumResults() <= 1)
+              return Value();
+
+            auto requestedResult = dyn_cast<OpResult>(base);
+            if (!requestedResult ||
+                requestedResult.getOwner() != prod.getOperation())
+              return Value();
+
+            const unsigned requestedResultNumber =
+                requestedResult.getResultNumber();
+
+            const int64_t numInputs = prod.getNumDpsInputs();
+            const int64_t numOutputs = prod.getNumDpsInits();
+
+            if (numInputs < 1 || numOutputs < 2)
+              return Value();
+
+            if (numOutputs != static_cast<int64_t>(prod->getNumResults()))
+              return Value();
+
+            if (requestedResultNumber >= static_cast<unsigned>(numOutputs))
+              return Value();
+
+            if (!expectedLocalTy || expectedLocalTy.getRank() != 2)
+              return Value();
+
+            if (prod.getNumLoops() != expectedLocalTy.getRank())
+              return Value();
+
+            auto iteratorTypes = prod.getIteratorTypesArray();
+            if (static_cast<int64_t>(iteratorTypes.size()) !=
+                expectedLocalTy.getRank())
+              return Value();
+
+            if (!llvm::all_of(iteratorTypes, [](mlir::utils::IteratorType it) {
+                  return it == mlir::utils::IteratorType::parallel;
+                }))
+              return Value();
+
+            auto maps = prod.getIndexingMapsArray();
+            if (static_cast<int64_t>(maps.size()) != numInputs + numOutputs)
+              return Value();
+
+            // All tensor outputs must be rank-2 identity maps. This matches,
+            // for instance, the blocked-layer-norm producer:
+            //   both results have shape tensor<MxN>.
+            for (int64_t i = 0; i < numOutputs; ++i) {
+              if (!isIdentity2DMap(maps[numInputs + i]))
+                return Value();
+            }
+
+            SmallVector<RankedTensorType> localResultTypes;
+            localResultTypes.reserve(numOutputs);
+
+            SmallVector<Type> resultTensorTypes;
+            resultTensorTypes.reserve(numOutputs);
+
+            for (Value result : prod->getResults()) {
+              auto resultTy = dyn_cast<RankedTensorType>(result.getType());
+              if (!resultTy || resultTy.getRank() != expectedLocalTy.getRank())
+                return Value();
+
+              RankedTensorType localResultTy =
+                  getLocalTypeWithShape(resultTy, expectedLocalTy.getShape());
+              if (!localResultTy)
+                return Value();
+
+              localResultTypes.push_back(localResultTy);
+              resultTensorTypes.push_back(localResultTy);
+            }
+
+            // The caller requested a specific result. We Make sure the
+            // requested local type is exactly the one the caller expects.
+            if (localResultTypes[requestedResultNumber] != expectedLocalTy)
+              return Value();
+
+            SmallVector<Value> localInputs;
+            localInputs.reserve(numInputs);
+
+            for (int64_t i = 0; i < numInputs; ++i) {
+              OpOperand *in = prod.getDpsInputOperand(i);
+              auto inTy = dyn_cast<RankedTensorType>(in->get().getType());
+              if (!inTy)
+                return Value();
+
+              AffineMap inputMap = maps[i];
+              RankedTensorType inputLocalTy;
+
+              // Rank-2 identity inputs shard like the rank-2 results, but
+              // preserve the input element type.
+              if (inTy.getRank() == 2 && isIdentity2DMap(inputMap)) {
+                inputLocalTy =
+                    getLocalTypeWithShape(inTy, expectedLocalTy.getShape());
+              }
+
+              // Rank-1 broadcast inputs use the same rule as the final
+              // broadcast-aware consumer:
+              //   row broadcast    (d0, d1) -> (d0): tensor<M> -> tensor<tileM>
+              //   column broadcast (d0, d1) -> (d1): tensor<N> -> tensor<N>
+              if (inTy.getRank() == 1 && (isRowBroadcastMap(inputMap) ||
+                                          isColumnBroadcastMap(inputMap))) {
+                inputLocalTy = getExpectedLocalTypeForOperand(inTy, inputMap,
+                                                              expectedLocalTy);
+              }
+
+              if (!inputLocalTy)
+                return Value();
+
+              Value localInput =
+                  materializeLocalValue(in->get(), inputLocalTy, cache);
+              if (!localInput)
+                return Value();
+
+              localInputs.push_back(localInput);
+            }
+
+            SmallVector<Value> localOutputs;
+            localOutputs.reserve(numOutputs);
+            for (RankedTensorType localResultTy : localResultTypes)
+              localOutputs.push_back(
+                  buildTensorEmptyLike(prod.getLoc(), localResultTy));
+
+            auto localProd = mlir::linalg::GenericOp::create(
+                b, prod.getLoc(),
+                /*resultTensorTypes=*/TypeRange(resultTensorTypes),
+                /*inputs=*/ValueRange(localInputs),
+                /*outputs=*/ValueRange(localOutputs),
+                /*indexingMaps=*/prod.getIndexingMapsArray(),
+                /*iteratorTypes=*/prod.getIteratorTypesArray(),
+                /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+            if (!hasCompatibleRegionArgumentTypes(prod.getRegion().front(),
+                                                  localInputs, localOutputs))
+              return Value();
+
+            cloneLinalgRegion(prod.getRegion(), localProd.getRegion());
+
+            for (auto [oldResult, newResult] :
+                 llvm::zip(prod->getResults(), localProd->getResults()))
+              cache[oldResult] = newResult;
+
+            return localProd->getResult(requestedResultNumber);
+          };
+
+          if (Value localMultiResult = tryLocalizeMultiResultGeneric())
+            return localMultiResult;
+
           if (isShapePreservingElementwiseGeneric(prod, expectedLocalTy)) {
             SmallVector<Value> prodInputs;
             const int64_t nIn = prod.getNumDpsInputs();
