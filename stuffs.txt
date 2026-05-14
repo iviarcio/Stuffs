@@ -1,3 +1,20 @@
+[NSP] Localize expand_shape and broadcasted multi-result chains
+
+Extend NSPLocalize to handle tensor.expand_shape in materialization sink
+chains and rebuild the expand locally before emitting nsp.materialize_tile.
+
+Generalize the rank-2 broadcast localization path to support both row-wise
+and column-wise rank-1 broadcasts. This allows patterns such as layer norm to
+keep gamma/beta replicated while slicing row-dependent tensors across NSPs.
+
+Also add support for localizing multi-result linalg.generic producers. When a
+consumer needs one result of a multi-result producer, the producer is cloned
+locally once and all local results are cached, avoiding fallback all_slice over
+global intermediate results.
+
+Together, these changes allow blocked layer norm to form a fully local compute
+chain before materialization.
+
 Add NSP-specific sharding propagation pass
 
 Introduce NSPShardingPropagationPass as a local wrapper around the Shard
