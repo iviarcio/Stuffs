@@ -1,3 +1,19 @@
+[NSP] Generalize sharding localization/materialization for 4D tensors
+
+Extend NSPSharding to handle rank-4 tensor elementwise kernels such as
+gelu_block_ptr. The planner now avoids blindly selecting axis 0 when that
+dimension cannot be partitioned, and instead chooses a parallel output
+dimension whose static extent is divisible by the NSP grid size.
+
+Update NSPLocalize to preserve the selected split axis when building local
+tensor slices and to support identity-map elementwise generics beyond the
+previous rank-1/rank-2 restriction. Update NSPMaterialize to consume
+rank-N tile shapes, build destination subviews using the recorded split axis,
+and materialize tensor slice-like inputs as matching memref subviews.
+
+Also teach shard-to-llvm to lower shard.all_slice using the op slice_axis
+instead of assuming axis 0.
+
 [NSP] Localize expand_shape and broadcasted multi-result chains
 
 Extend NSPLocalize to handle tensor.expand_shape in materialization sink
