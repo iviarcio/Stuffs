@@ -23,9 +23,9 @@
 // Bring-up constraints:
 //   - the generic tile hand-off supports rank-1 through rank-4 destination
 //     materialization through tile_shape,
-//   - split_axis is currently restricted to 0,
+//   - split_axis is honored when building destination/input tile subviews,
 //   - the direct memref rewrite for localized identity linalg.generic supports
-//     ranks up to 4,
+//     ranks up to 4, including rank-reduced canonicalized rank-3 views,
 //   - a dedicated fast-path exists for the elementwise 2d-style pattern:
 //       * rank-2 outer tile / accumulator
 //       * rank-1 inner vectorized chunks
@@ -157,6 +157,31 @@ static Value stripTensorCastWrappers(Value v) {
   Value cur = v;
   while (auto castOp = cur.getDefiningOp<tensor::CastOp>())
     cur = castOp.getSource();
+  return cur;
+}
+
+/// Return the semantic source value after stripping tensor.cast and
+/// bufferization.alloc_tensor copy wrappers.
+///
+/// Canonicalization/bufferization preparation may turn a localized tensor value
+/// into:
+///   %copy = bufferization.alloc_tensor() copy(%value)
+///
+/// That copy is a tensor materialization artifact.  The NSP memref fast-path
+/// should look through it when it is trying to recover the original producer or
+/// the original slice-like input.  Plain alloc_tensor without a copy is not
+/// stripped because it represents an init/temporary value, not an alias to a
+/// source tensor.
+static Value stripTensorMaterializationWrappers(Value v) {
+  Value cur = stripTensorCastWrappers(v);
+
+  while (auto allocTensor = cur.getDefiningOp<bufferization::AllocTensorOp>()) {
+    Value copy = allocTensor.getCopy();
+    if (!copy)
+      break;
+    cur = stripTensorCastWrappers(copy);
+  }
+
   return cur;
 }
 
@@ -331,6 +356,50 @@ static FailureOr<Value> buildRankedSubview(OpBuilder &b, Location loc,
   return subview.getResult();
 }
 
+/// Build a rank-reduced memref.collapse_shape view corresponding to a
+/// tensor.collapse_shape / tensor.expand_shape reassociation.
+///
+/// The collapsed view is used by the fast-path when canonicalization removes a
+/// leading unit dimension from a localized rank-4 tile, for example:
+///   tensor<1x16x512x4xf16> -> tensor<16x512x4xf16>
+///
+/// Keep the layout fully dynamic.  The source subview already carries the
+/// precise offset/stride information, and the downstream linalg.generic only
+/// requires a ranked strided memref view with the right element type and rank.
+static FailureOr<Value>
+buildCollapsedMemrefView(OpBuilder &b, Location loc, Value sourceMemref,
+                         ArrayRef<ReassociationIndices> reassociation,
+                         RankedTensorType collapsedTensorTy) {
+  auto sourceMemrefTy = dyn_cast<MemRefType>(sourceMemref.getType());
+  if (!sourceMemrefTy || !collapsedTensorTy)
+    return failure();
+
+  if (sourceMemrefTy.getElementType() != collapsedTensorTy.getElementType())
+    return failure();
+
+  const int64_t collapsedRank = collapsedTensorTy.getRank();
+  if (collapsedRank < 1 || collapsedRank >= sourceMemrefTy.getRank())
+    return failure();
+
+  if ((int64_t)reassociation.size() != collapsedRank)
+    return failure();
+
+  SmallVector<int64_t> collapsedShape(collapsedTensorTy.getShape().begin(),
+                                      collapsedTensorTy.getShape().end());
+  SmallVector<int64_t> collapsedStrides(collapsedRank, ShapedType::kDynamic);
+  auto layout = StridedLayoutAttr::get(sourceMemrefTy.getContext(),
+                                       /*offset=*/ShapedType::kDynamic,
+                                       /*strides=*/collapsedStrides);
+
+  auto collapsedMemrefTy =
+      MemRefType::get(collapsedShape, sourceMemrefTy.getElementType(), layout,
+                      sourceMemrefTy.getMemorySpace());
+
+  auto collapse = memref::CollapseShapeOp::create(b, loc, collapsedMemrefTy,
+                                                  sourceMemref, reassociation);
+  return collapse.getResult();
+}
+
 /// Build a rank-2 memref.subview at the current insertion point.
 static FailureOr<Value> buildRank2Subview(OpBuilder &b, Location loc,
                                           Value baseMemref,
@@ -450,7 +519,30 @@ static FailureOr<int64_t> getAllSliceAxis(Operation *op, int64_t rank) {
 /// fast-paths that require additional rank-reduced matching.
 static FailureOr<Value>
 materializeRankedInputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
-  Value base = stripTensorCastWrappers(inputTensor);
+  Value base = stripTensorMaterializationWrappers(inputTensor);
+
+  // Canonicalization may fold a leading unit dimension away from the localized
+  // rank-4 tile before materialization:
+  //   tensor.collapse_shape %tile [[0, 1], [2], [3]]
+  //     : tensor<1x16x512x4xf16> into tensor<16x512x4xf16>
+  // Materialize the source tile as a memref subview first, then build the
+  // equivalent memref.collapse_shape view so the rank-3 linalg.generic can be
+  // rewritten directly to memref semantics.
+  if (auto collapse = base.getDefiningOp<tensor::CollapseShapeOp>()) {
+    auto resultTy = dyn_cast<RankedTensorType>(collapse.getResult().getType());
+    if (!resultTy || !isSupportedIdentityElementwiseRank(resultTy.getRank()))
+      return failure();
+
+    auto sourceSubviewOr =
+        materializeRankedInputAsSubview(b, loc, collapse->getOperand(0));
+    if (failed(sourceSubviewOr))
+      return failure();
+
+    SmallVector<ReassociationIndices> reassociation =
+        collapse.getReassociationIndices();
+    return buildCollapsedMemrefView(b, loc, *sourceSubviewOr, reassociation,
+                                    resultTy);
+  }
 
   Value sourceTensor;
   SmallVector<OpFoldResult> offsets;
@@ -532,7 +624,7 @@ materializeRankedInputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
     return failure();
   }
 
-  Value baseTensor = stripTensorCastWrappers(sourceTensor);
+  Value baseTensor = stripTensorMaterializationWrappers(sourceTensor);
   auto toTensor = baseTensor.getDefiningOp<bufferization::ToTensorOp>();
   if (!toTensor)
     return failure();
@@ -1113,6 +1205,79 @@ static LogicalResult finalizeSuccessfulTensorToMemrefRewrite(
     eraseIfDead(emptyOp);
 
   return success();
+}
+
+/// Try to lower a localized identity-map elementwise tensor producer directly
+/// to a memref linalg.generic writing into `destSubview`.
+///
+/// This recognizes both forms produced around NSP localization:
+///   1. Direct rank-N localized generic:
+///        %tile = linalg.generic ... -> tensor<...>
+///   2. Canonicalized rank-reduced generic re-expanded to the tile rank:
+///        %collapsed_in = tensor.collapse_shape %all_slice_or_copy ...
+///        %generic = linalg.generic ... -> tensor<16x512x4xf16>
+///        %expanded = tensor.expand_shape %generic
+///                    : tensor<16x512x4xf16> into tensor<1x16x512x4xf16>
+///
+/// Case (2) is important for rank-4 block_ptr tensors with a leading unit
+/// dimension.  The fast-path preserves the rank-3 generic and collapses the
+/// rank-4 destination/input subviews to matching rank-3 memref views, avoiding
+/// alloc_tensor copies around the compute.
+static LogicalResult tryRewriteLocalizedElementwiseGenericToMemref(
+    OpBuilder &b, Location loc, mlir::hexagon::nsp::MaterializeTileOp tileOp,
+    Value source, Value destSubview) {
+  Value producer = stripTensorMaterializationWrappers(source);
+  Value genericResult = producer;
+  Value genericDestSubview = destSubview;
+
+  if (auto expand = producer.getDefiningOp<tensor::ExpandShapeOp>()) {
+    auto expandedTy = dyn_cast<RankedTensorType>(expand.getResult().getType());
+    auto collapsedTy =
+        dyn_cast<RankedTensorType>(expand->getOperand(0).getType());
+    auto destSubviewTy = dyn_cast<MemRefType>(destSubview.getType());
+    if (!expandedTy || !collapsedTy || !destSubviewTy)
+      return failure();
+
+    if (destSubviewTy.getRank() != expandedTy.getRank())
+      return failure();
+    if (destSubviewTy.getElementType() != expandedTy.getElementType())
+      return failure();
+
+    SmallVector<ReassociationIndices> reassociation =
+        expand.getReassociationIndices();
+    auto collapsedDestOr = buildCollapsedMemrefView(b, loc, destSubview,
+                                                    reassociation, collapsedTy);
+    if (failed(collapsedDestOr))
+      return failure();
+
+    genericDestSubview = *collapsedDestOr;
+    genericResult = stripTensorMaterializationWrappers(expand->getOperand(0));
+  }
+
+  auto localizedGeneric = genericResult.getDefiningOp<linalg::GenericOp>();
+  if (!isSimpleLocalizedElementwiseGeneric(localizedGeneric))
+    return failure();
+
+  Value oldInit = localizedGeneric.getDpsInitOperand(0)->get();
+  Operation *oldGenericOp = localizedGeneric.getOperation();
+
+  SmallVector<Value> memrefInputs;
+  memrefInputs.reserve(localizedGeneric.getNumDpsInputs());
+
+  for (OpOperand *in : localizedGeneric.getDpsInputOperands()) {
+    auto subviewOr = materializeRankedInputAsSubview(b, loc, in->get());
+    if (failed(subviewOr))
+      return failure();
+    memrefInputs.push_back(*subviewOr);
+  }
+
+  auto newGenericOr = createMemrefGenericAtCurrentInsertionPoint(
+      b, localizedGeneric, memrefInputs, genericDestSubview);
+  if (failed(newGenericOr))
+    return failure();
+
+  removeNSPLocalizedAttrs(localizedGeneric);
+  return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldGenericOp, oldInit);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2035,35 +2200,14 @@ materializeTileToDestination(OpBuilder &b,
   Value destSubview = subview.getResult();
 
   // Pattern 1: localized elementwise linalg.generic.
-  if (auto localizedGeneric = source.getDefiningOp<linalg::GenericOp>()) {
-    Value oldInit = localizedGeneric.getDpsInitOperand(0)->get();
-    Operation *oldGenericOp = localizedGeneric.getOperation();
-
-    if (isSimpleLocalizedElementwiseGeneric(localizedGeneric)) {
-      SmallVector<Value> memrefInputs;
-      memrefInputs.reserve(localizedGeneric.getNumDpsInputs());
-
-      bool canRewriteAllInputs = true;
-      for (OpOperand *in : localizedGeneric.getDpsInputOperands()) {
-        auto subviewOr = materializeRankedInputAsSubview(b, loc, in->get());
-        if (failed(subviewOr)) {
-          canRewriteAllInputs = false;
-          break;
-        }
-        memrefInputs.push_back(*subviewOr);
-      }
-
-      if (canRewriteAllInputs) {
-        auto newGenericOr = createMemrefGenericAtCurrentInsertionPoint(
-            b, localizedGeneric, memrefInputs, destSubview);
-        if (succeeded(newGenericOr)) {
-          removeNSPLocalizedAttrs(localizedGeneric);
-          return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldGenericOp,
-                                                         oldInit);
-        }
-      }
-    }
-  }
+  //
+  // Accept both the direct localized generic and the canonicalized
+  // collapse/generic/expand form produced for rank-4 tiles with a leading unit
+  // dimension.  This is the path expected to handle GELU block_ptr without
+  // alloc_tensor copies around the local compute.
+  if (succeeded(tryRewriteLocalizedElementwiseGenericToMemref(
+          b, loc, tileOp, source, destSubview)))
+    return success();
 
   // Pattern 2: tiled tensor scf.for building the local tile by insert_slice.
   if (auto tileLoop = source.getDefiningOp<scf::ForOp>()) {
@@ -2083,7 +2227,7 @@ materializeTileToDestination(OpBuilder &b,
     }
 
     // Keep the existing rank-1 fast-path unchanged.
-    // If rank-2 matching fails, we still fall back to the old logic below.
+    // If rank-2 matching fails, we still fall back to the logic below.
     if (succeeded(
             tryRewriteScfForTileToMemref(b, loc, tileLoop, destSubview))) {
       return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldLoopOp,
