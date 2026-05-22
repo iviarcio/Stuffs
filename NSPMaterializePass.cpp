@@ -356,6 +356,30 @@ static FailureOr<Value> buildRankedSubview(OpBuilder &b, Location loc,
   return subview.getResult();
 }
 
+/// Extract static strides and offset from a strided memref type.
+///
+/// Some MLIR/LLVM versions do not expose the free `getStridesAndOffset`
+/// helper in the headers used by this pass.  Keep this local helper limited to
+/// the strided layouts produced by memref.subview in the NSP materialization
+/// path.
+static LogicalResult getMemRefStaticStridesAndOffset(
+    MemRefType type, SmallVectorImpl<int64_t> &strides, int64_t &offset) {
+  if (!type)
+    return failure();
+
+  auto stridedLayout = dyn_cast_or_null<StridedLayoutAttr>(type.getLayout());
+  if (!stridedLayout)
+    return failure();
+
+  ArrayRef<int64_t> layoutStrides = stridedLayout.getStrides();
+  if ((int64_t)layoutStrides.size() != type.getRank())
+    return failure();
+
+  offset = stridedLayout.getOffset();
+  strides.assign(layoutStrides.begin(), layoutStrides.end());
+  return success();
+}
+
 /// Build a rank-reduced memref.collapse_shape view corresponding to a
 /// tensor.collapse_shape / tensor.expand_shape reassociation.
 ///
@@ -391,7 +415,8 @@ buildCollapsedMemrefView(OpBuilder &b, Location loc, Value sourceMemref,
 
   SmallVector<int64_t> sourceStrides;
   int64_t sourceOffset = ShapedType::kDynamic;
-  if (failed(getStridesAndOffset(sourceMemrefTy, sourceStrides, sourceOffset)))
+  if (failed(getMemRefStaticStridesAndOffset(sourceMemrefTy, sourceStrides,
+                                             sourceOffset)))
     return failure();
 
   ArrayRef<int64_t> sourceShape = sourceMemrefTy.getShape();
