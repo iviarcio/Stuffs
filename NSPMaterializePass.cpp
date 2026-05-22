@@ -363,9 +363,13 @@ static FailureOr<Value> buildRankedSubview(OpBuilder &b, Location loc,
 /// leading unit dimension from a localized rank-4 tile, for example:
 ///   tensor<1x16x512x4xf16> -> tensor<16x512x4xf16>
 ///
-/// Keep the layout fully dynamic.  The source subview already carries the
-/// precise offset/stride information, and the downstream linalg.generic only
-/// requires a ranked strided memref view with the right element type and rank.
+/// The result type must use the layout inferred from the source subview.  In
+/// particular, memref.collapse_shape does not accept an arbitrary dynamic
+/// strided layout when the source layout determines a more precise collapsed
+/// stride.  For the GELU 4-D tile, collapsing:
+///   memref<1x16x512x4xf16, strided<[1048576, 2048, 4, 1], offset: ?>>
+/// through [[0, 1], [2], [3]] must produce:
+///   memref<16x512x4xf16, strided<[2048, 4, 1], offset: ?>>
 static FailureOr<Value>
 buildCollapsedMemrefView(OpBuilder &b, Location loc, Value sourceMemref,
                          ArrayRef<ReassociationIndices> reassociation,
@@ -377,18 +381,91 @@ buildCollapsedMemrefView(OpBuilder &b, Location loc, Value sourceMemref,
   if (sourceMemrefTy.getElementType() != collapsedTensorTy.getElementType())
     return failure();
 
+  const int64_t sourceRank = sourceMemrefTy.getRank();
   const int64_t collapsedRank = collapsedTensorTy.getRank();
-  if (collapsedRank < 1 || collapsedRank >= sourceMemrefTy.getRank())
+  if (collapsedRank < 1 || collapsedRank >= sourceRank)
     return failure();
 
   if ((int64_t)reassociation.size() != collapsedRank)
     return failure();
 
+  SmallVector<int64_t> sourceStrides;
+  int64_t sourceOffset = ShapedType::kDynamic;
+  if (failed(getStridesAndOffset(sourceMemrefTy, sourceStrides, sourceOffset)))
+    return failure();
+
+  ArrayRef<int64_t> sourceShape = sourceMemrefTy.getShape();
   SmallVector<int64_t> collapsedShape(collapsedTensorTy.getShape().begin(),
                                       collapsedTensorTy.getShape().end());
-  SmallVector<int64_t> collapsedStrides(collapsedRank, ShapedType::kDynamic);
+  SmallVector<int64_t> collapsedStrides;
+  collapsedStrides.reserve(collapsedRank);
+
+  int64_t nextExpectedSourceDim = 0;
+  for (auto [collapsedDim, group] : llvm::enumerate(reassociation)) {
+    if (group.empty())
+      return failure();
+
+    // Require reassociation groups to be ordered and non-overlapping.  This is
+    // what tensor.collapse_shape / memref.collapse_shape expect, and it keeps
+    // the layout projection below simple and auditable.
+    if (group.front() != nextExpectedSourceDim)
+      return failure();
+    for (int64_t i = 1, e = static_cast<int64_t>(group.size()); i < e; ++i)
+      if (group[i] != group[i - 1] + 1)
+        return failure();
+    nextExpectedSourceDim = group.back() + 1;
+    if (nextExpectedSourceDim > sourceRank)
+      return failure();
+
+    // Validate the static collapsed dimension when it is statically known on
+    // both sides.  Unit dimensions are common here and are intentionally folded
+    // into the following non-unit dimension.
+    int64_t product = 1;
+    bool hasDynamicProduct = false;
+    for (int64_t sourceDim : group) {
+      int64_t dimSize = sourceShape[sourceDim];
+      if (ShapedType::isDynamic(dimSize)) {
+        hasDynamicProduct = true;
+        break;
+      }
+      product *= dimSize;
+    }
+
+    int64_t collapsedSize = collapsedShape[collapsedDim];
+    if (!hasDynamicProduct && !ShapedType::isDynamic(collapsedSize) &&
+        product != collapsedSize)
+      return failure();
+
+    // The collapsed stride is the stride of the innermost dimension in the
+    // reassociation group.  Check contiguity for non-unit outer dimensions;
+    // unit dimensions may have arbitrary strides and can still be collapsed.
+    for (int64_t i = static_cast<int64_t>(group.size()) - 2; i >= 0; --i) {
+      int64_t outerDim = group[i];
+      int64_t innerDim = group[i + 1];
+
+      if (sourceShape[outerDim] == 1)
+        continue;
+
+      int64_t outerStride = sourceStrides[outerDim];
+      int64_t innerStride = sourceStrides[innerDim];
+      int64_t innerSize = sourceShape[innerDim];
+      if (ShapedType::isDynamic(outerStride) ||
+          ShapedType::isDynamic(innerStride) ||
+          ShapedType::isDynamic(innerSize))
+        continue;
+
+      if (outerStride != innerStride * innerSize)
+        return failure();
+    }
+
+    collapsedStrides.push_back(sourceStrides[group.back()]);
+  }
+
+  if (nextExpectedSourceDim != sourceRank)
+    return failure();
+
   auto layout = StridedLayoutAttr::get(sourceMemrefTy.getContext(),
-                                       /*offset=*/ShapedType::kDynamic,
+                                       /*offset=*/sourceOffset,
                                        /*strides=*/collapsedStrides);
 
   auto collapsedMemrefTy =
