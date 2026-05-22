@@ -1307,6 +1307,64 @@ static void removeNSPLocalizedAttrs(linalg::GenericOp generic) {
   generic->removeAttr("nsp.group_id");
 }
 
+/// Return true iff `op` is a tensor-only producer that is safe to erase when
+/// all of its results are dead.
+///
+/// The rank-3/rank-4 materialization fast-path rebuilds the localized compute
+/// directly on memrefs.  When it succeeds, the old tensor producer chain must be
+/// removed explicitly; otherwise allocation/copy-like ops such as
+/// bufferization.alloc_tensor may survive canonicalization and keep executing
+/// even though the final result is now produced by the memref generic.
+static bool isDeadTensorProducerSafeToErase(Operation *op) {
+  if (!op || !op->use_empty())
+    return false;
+
+  if (isa<tensor::CastOp, tensor::CollapseShapeOp, tensor::ExpandShapeOp,
+          tensor::EmptyOp, tensor::ExtractSliceOp,
+          bufferization::AllocTensorOp, bufferization::ToTensorOp,
+          mlir::shard::AllSliceOp>(op))
+    return true;
+
+  if (auto generic = dyn_cast<linalg::GenericOp>(op))
+    return generic.hasPureTensorSemantics();
+
+  return false;
+}
+
+/// Recursively erase a dead tensor producer chain rooted at `value`.
+///
+/// This intentionally erases only tensor/view/allocation artifacts that are
+/// known to be side-effect-free with respect to the final destination.  It does
+/// not erase memref producers, loops, or arbitrary operations.
+static void eraseDeadTensorProducerChain(Value value,
+                                         llvm::SmallPtrSetImpl<Operation *> &seen) {
+  Operation *op = value.getDefiningOp();
+  if (!op)
+    return;
+  if (!seen.insert(op).second)
+    return;
+  if (!isDeadTensorProducerSafeToErase(op))
+    return;
+
+  SmallVector<Value> operands(op->operand_begin(), op->operand_end());
+  op->erase();
+
+  for (Value operand : operands)
+    eraseDeadTensorProducerChain(operand, seen);
+}
+
+static void eraseDeadTensorProducerChain(Value value) {
+  llvm::SmallPtrSet<Operation *, 16> seen;
+  eraseDeadTensorProducerChain(value, seen);
+}
+
+static LogicalResult finalizeSuccessfulTensorChainToMemrefRewrite(
+    mlir::hexagon::nsp::MaterializeTileOp tileOp, Value oldTensorSource) {
+  tileOp.erase();
+  eraseDeadTensorProducerChain(oldTensorSource);
+  return success();
+}
+
 static LogicalResult finalizeSuccessfulTensorToMemrefRewrite(
     mlir::hexagon::nsp::MaterializeTileOp tileOp, Operation *oldOp,
     Value initArg) {
@@ -1395,8 +1453,10 @@ static LogicalResult tryRewriteLocalizedElementwiseGenericToMemref(
   if (failed(newGenericOr))
     return failure();
 
+  (void)oldGenericOp;
+  (void)oldInit;
   removeNSPLocalizedAttrs(localizedGeneric);
-  return finalizeSuccessfulTensorToMemrefRewrite(tileOp, oldGenericOp, oldInit);
+  return finalizeSuccessfulTensorChainToMemrefRewrite(tileOp, source);
 }
 
 //===----------------------------------------------------------------------===//
