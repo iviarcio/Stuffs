@@ -195,14 +195,25 @@ static bool isSupportedIdentityElementwiseRank(int64_t rank) {
 /// be safely rewritten from tensor semantics to memref semantics.
 ///
 /// Current pattern constraints:
-///   - carries the `nsp.localized` marker
+///   - carries the `nsp.localized` marker by default
 ///   - 1 to 4 DPS inputs
 ///   - exactly 1 DPS init/output
 ///   - ranked tensor shape with rank in [1, 4]
 ///   - all-parallel iterator space
 ///   - identity indexing maps
-static bool isSimpleLocalizedElementwiseGeneric(linalg::GenericOp g) {
-  if (!g || !g->hasAttr("nsp.localized"))
+///
+/// `requireLocalizedAttr` is relaxed only for the canonicalized rank-reduced
+/// form reached directly from an nsp.materialize_tile source.  In that case,
+/// canonicalization may have rebuilt the intermediate rank-3 generic and
+/// dropped discardable NSP attributes, even though the surrounding
+/// nsp.materialize_tile still proves that this producer belongs to the
+/// localized tile hand-off.
+static bool isSimpleLocalizedElementwiseGeneric(linalg::GenericOp g,
+                                                bool requireLocalizedAttr = true) {
+  if (!g)
+    return false;
+
+  if (requireLocalizedAttr && !g->hasAttr("nsp.localized"))
     return false;
 
   const int64_t numInputs = g.getNumDpsInputs();
@@ -1217,8 +1228,9 @@ materializeTensorSliceLikeAsSubview(OpBuilder &b, Location loc, Value v) {
 /// the new generic.
 static FailureOr<linalg::GenericOp> createMemrefGenericAtCurrentInsertionPoint(
     OpBuilder &b, linalg::GenericOp localizedGeneric, ValueRange memrefInputs,
-    Value destSubview) {
-  if (!isSimpleLocalizedElementwiseGeneric(localizedGeneric))
+    Value destSubview, bool requireLocalizedAttr = true) {
+  if (!isSimpleLocalizedElementwiseGeneric(localizedGeneric,
+                                           requireLocalizedAttr))
     return failure();
 
   auto destSubviewTy = dyn_cast<MemRefType>(destSubview.getType());
@@ -1331,6 +1343,7 @@ static LogicalResult tryRewriteLocalizedElementwiseGenericToMemref(
   Value producer = stripTensorMaterializationWrappers(source);
   Value genericResult = producer;
   Value genericDestSubview = destSubview;
+  bool cameThroughRankReducedExpand = false;
 
   if (auto expand = producer.getDefiningOp<tensor::ExpandShapeOp>()) {
     auto expandedTy = dyn_cast<RankedTensorType>(expand.getResult().getType());
@@ -1354,10 +1367,13 @@ static LogicalResult tryRewriteLocalizedElementwiseGenericToMemref(
 
     genericDestSubview = *collapsedDestOr;
     genericResult = stripTensorMaterializationWrappers(expand->getOperand(0));
+    cameThroughRankReducedExpand = true;
   }
 
   auto localizedGeneric = genericResult.getDefiningOp<linalg::GenericOp>();
-  if (!isSimpleLocalizedElementwiseGeneric(localizedGeneric))
+  const bool requireLocalizedAttr = !cameThroughRankReducedExpand;
+  if (!isSimpleLocalizedElementwiseGeneric(localizedGeneric,
+                                           requireLocalizedAttr))
     return failure();
 
   Value oldInit = localizedGeneric.getDpsInitOperand(0)->get();
@@ -1374,7 +1390,8 @@ static LogicalResult tryRewriteLocalizedElementwiseGenericToMemref(
   }
 
   auto newGenericOr = createMemrefGenericAtCurrentInsertionPoint(
-      b, localizedGeneric, memrefInputs, genericDestSubview);
+      b, localizedGeneric, memrefInputs, genericDestSubview,
+      requireLocalizedAttr);
   if (failed(newGenericOr))
     return failure();
 
