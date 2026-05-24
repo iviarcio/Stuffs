@@ -1,3 +1,17 @@
+[NSP] Add sharding interface model for tensor.collapse_shape
+
+Add an NSP ShardingInterface external model for tensor.collapse_shape.
+
+The model handles conservative unit-collapse reshapes, such as collapsing
+tensor<1xMxNxK> into tensor<MxNxK>. In this case the operation is view-like for
+sharding purposes: the sharding attached to the non-unit source dimension is
+projected to the corresponding result dimension, while collapsed unit dimensions
+remain replicated.
+
+This lets nsp-sharding-propagation traverse tensor.collapse_shape instead of
+failing on ops without a sharding interface. General reshape/flattening cases
+remain unsupported and are rejected conservatively.
+
 [NSP] Generalize sharding localization/materialization for 4D tensors
 
 Extend NSPSharding to handle rank-4 tensor elementwise kernels such as
