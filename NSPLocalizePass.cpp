@@ -32,14 +32,9 @@
 //   - Sharding descriptors (!shard.sharding) are produced and attached/used
 //     as part of the propagation/planning flow.
 //   - In non-collective mode, computations with an identifiable
-//     materialize_in_destination sink are usually rewritten into:
+//     materialize_in_destination sink are rewritten into:
 //         * shard-local tensor compute
 //         * nsp.materialize_tile for the final destination hand-off
-//   - Alternatively, if the computation is enclosed by a safe outer DOALL
-//     scf.for, the pass may distribute that loop directly across the NSP grid.
-//     In that mode the existing materialize_in_destination remains in the loop
-//     body and NSPMaterializePass has no nsp.materialize_tile hand-off to
-//     lower.
 //
 //===----------------------------------------------------------------------===//
 
@@ -346,8 +341,23 @@ struct NSPLocalizePass
       return;
     }
 
+    auto isNspDistributedLoop = [](mlir::scf::ForOp forOp) -> bool {
+      return forOp && (forOp->hasAttr("nsp.distributed") ||
+                       forOp->hasAttr("nsp.distribution"));
+    };
+
+    auto hasNspDistributedLoopAncestor = [&](Operation *op) -> bool {
+      for (Operation *parent = op ? op->getParentOp() : nullptr; parent;
+           parent = parent->getParentOp()) {
+        if (auto parentFor = dyn_cast<mlir::scf::ForOp>(parent))
+          if (isNspDistributedLoop(parentFor))
+            return true;
+      }
+      return false;
+    };
+
     // Helper for strip shard tensor annotations inside loops that were
-    // explicitly distributed by this pass (marked with 'nsp.distributed').
+    // explicitly distributed by this pass.
     //
     // Rationale:
     // In non-collective mode, the SPMD partitioning is expressed by the loop
@@ -362,7 +372,7 @@ struct NSPLocalizePass
           SmallVector<Operation *> eraseList;
 
           func.walk([&](mlir::scf::ForOp forOp) {
-            if (!forOp->hasAttr("nsp.distributed"))
+            if (!isNspDistributedLoop(forOp))
               return;
 
             Block *body = forOp.getBody();
@@ -472,66 +482,11 @@ struct NSPLocalizePass
         return false;
       };
 
-      auto isSubviewOffsetDerivedFromIv = [&](Value iv,
-                                              memref::SubViewOp sub) -> bool {
-        for (OpFoldResult ofr : sub.getMixedOffsets())
-          if (ofrReachesFromIv(iv, ofr))
-            return true;
-        return false;
-      };
-
-      auto isReinterpretCastIndexDerivedFromIv =
-          [&](Value iv, memref::ReinterpretCastOp rc) -> bool {
-        // Operands: source, offset, sizes..., strides...
-        // Conservatively check all dynamic operands except the source.
-        for (unsigned oi = 1, oe = rc->getNumOperands(); oi < oe; ++oi)
-          if (reachesFromIv(iv, rc->getOperand(oi)))
-            return true;
-        return false;
-      };
-
-      auto isMaterializeDestinationDerivedFromIv =
-          [&](Value iv, bufferization::MaterializeInDestinationOp mat) -> bool {
-        Value dest = mat->getOperand(1);
-
-        // Strip trivial casts.
-        while (auto c = dest.getDefiningOp<memref::CastOp>())
-          dest = c.getSource();
-
-        if (auto sub = dest.getDefiningOp<memref::SubViewOp>())
-          return isSubviewOffsetDerivedFromIv(iv, sub);
-
-        if (auto rc = dest.getDefiningOp<memref::ReinterpretCastOp>())
-          return isReinterpretCastIndexDerivedFromIv(iv, rc);
-
-        return false;
-      };
-
-      auto hasDistributedAncestor = [](mlir::scf::ForOp forOp) -> bool {
-        Operation *parent = forOp->getParentOp();
-        while (parent) {
-          if (auto parentFor = dyn_cast<mlir::scf::ForOp>(parent))
-            if (parentFor->hasAttr("nsp.distributed"))
-              return true;
-          parent = parent->getParentOp();
-        }
-        return false;
-      };
-
       // Returns true iff the loop appears to perform per-iteration output
       // writes whose address depends on the IV, i.e. a DOALL-style tiled store.
-      //
-      // This accepts the store forms currently seen around row-wise kernels:
-      //   * memref.store
-      //   * affine.store
-      //   * bufferization.materialize_in_destination into an IV-derived view
-      //
-      // The loop-distribution path is an alternative localization strategy. It
-      // intentionally leaves the existing tensor-to-buffer sink in place, since
-      // the surrounding loop schedule already partitions the destination
-      // writes.
       auto shouldDistributeLoop = [&](mlir::scf::ForOp forOp) -> bool {
-        if (forOp->hasAttr("nsp.distributed") || hasDistributedAncestor(forOp))
+        if (isNspDistributedLoop(forOp) ||
+            hasNspDistributedLoopAncestor(forOp.getOperation()))
           return false;
 
         Value iv = forOp.getInductionVar();
@@ -539,7 +494,7 @@ struct NSPLocalizePass
         bool foundIvIndexedStore = false;
 
         // Direct memref.store with IV-derived indices.
-        WalkResult memrefStoreWalk = forOp.walk([&](memref::StoreOp st) {
+        forOp.walk([&](memref::StoreOp st) {
           for (Value idx : st.getIndices()) {
             if (reachesFromIv(iv, idx)) {
               foundIvIndexedStore = true;
@@ -548,12 +503,14 @@ struct NSPLocalizePass
           }
           return WalkResult::advance();
         });
-        if (memrefStoreWalk.wasInterrupted())
+        if (foundIvIndexedStore)
           return true;
 
-        // Direct affine.store with IV-derived indices. LayerNorm-like kernels
-        // commonly store per-row side results such as mean/rstd this way.
-        WalkResult affineStoreWalk = forOp.walk([&](affine::AffineStoreOp st) {
+        // Direct affine.store with IV-derived map operands. LayerNorm-like
+        // kernels commonly store per-row side results such as mean/rstd this
+        // way. These stores are safe for outer-loop distribution when their
+        // address depends on the distributed IV.
+        forOp.walk([&](affine::AffineStoreOp st) {
           for (Value idx : st.getMapOperands()) {
             if (reachesFromIv(iv, idx)) {
               foundIvIndexedStore = true;
@@ -562,7 +519,7 @@ struct NSPLocalizePass
           }
           return WalkResult::advance();
         });
-        if (affineStoreWalk.wasInterrupted())
+        if (foundIvIndexedStore)
           return true;
 
         // bufferization.materialize_in_destination where dest is a view into
@@ -573,16 +530,40 @@ struct NSPLocalizePass
         // as well as:
         //   %rc = memref.reinterpret_cast %dst to offset: [%off], sizes: [...]
         //   bufferization.materialize_in_destination %t, %rc
-        WalkResult materializeWalk =
-            forOp.walk([&](bufferization::MaterializeInDestinationOp mat) {
-              if (isMaterializeDestinationDerivedFromIv(iv, mat)) {
+        forOp.walk([&](bufferization::MaterializeInDestinationOp mat) {
+          Value dest = mat->getOperand(1);
+
+          // Strip trivial casts.
+          while (auto c = dest.getDefiningOp<memref::CastOp>())
+            dest = c.getSource();
+
+          // Case 1: memref.subview with dynamic offsets.
+          if (auto sub = dest.getDefiningOp<memref::SubViewOp>()) {
+            for (OpFoldResult ofr : sub.getMixedOffsets()) {
+              if (ofrReachesFromIv(iv, ofr)) {
                 foundIvIndexedStore = true;
                 return WalkResult::interrupt();
               }
+            }
+            return WalkResult::advance();
+          }
 
-              return WalkResult::advance();
-            });
-        return foundIvIndexedStore || materializeWalk.wasInterrupted();
+          // Case 2: memref.reinterpret_cast with dynamic offset/sizes/strides.
+          if (auto rc = dest.getDefiningOp<memref::ReinterpretCastOp>()) {
+            // Operands: source, offset, sizes..., strides...
+            // Conservatively check all dynamic operands except the source.
+            for (unsigned oi = 1, oe = rc->getNumOperands(); oi < oe; ++oi) {
+              if (reachesFromIv(iv, rc->getOperand(oi))) {
+                foundIvIndexedStore = true;
+                return WalkResult::interrupt();
+              }
+            }
+          }
+
+          return WalkResult::advance();
+        });
+
+        return foundIvIndexedStore;
       };
 
       for (mlir::scf::ForOp forOp : loops) {
@@ -2168,6 +2149,12 @@ struct NSPLocalizePass
       func.walk([&](mlir::linalg::GenericOp g) { worklist.push_back(g); });
 
       for (mlir::linalg::GenericOp g : worklist) {
+        // If this generic is enclosed by a DOALL loop already distributed by
+        // this pass, do not also apply tensor tile localization. The loop
+        // schedule already partitions the destination writes, so emitting
+        // nsp.materialize_tile here would double-partition the inner tensor.
+        if (!allowCollectives && hasNspDistributedLoopAncestor(g.getOperation()))
+          continue;
 
         // Initial structural filter.
         const int64_t numInputs = g.getNumDpsInputs();
@@ -2281,10 +2268,8 @@ struct NSPLocalizePass
         //   the surrounding scf.for schedule:
         //     lb'   = lb + procIdx * step
         //     step' = step * numShards
-        if (!allowCollectives)
-          if (auto parentFor = g->getParentOfType<mlir::scf::ForOp>())
-            if (parentFor->hasAttr("nsp.distributed"))
-              continue;
+        if (!allowCollectives && hasNspDistributedLoopAncestor(g.getOperation()))
+          continue;
 
         // Non-collective path must ONLY rewrite ops that directly materialize
         // into a destination memref. Intermediate elementwise ops (common in
