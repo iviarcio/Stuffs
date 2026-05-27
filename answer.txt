@@ -1,0 +1,102 @@
+The conceptual NSPSharding approach can generalize beyond `linalg`, but the current implementation is still partially `linalg`-centric.
+
+The project uses the upstream MLIR `shard` dialect as a declarative partitioning IR. In other words, the sharding decision is represented as an SSA-level annotation on tensor values, and later NSP-specific passes lower those annotations into per-NSP local computation. At a high level, the current pipeline is organized as follows:
+
+1. the planner attaches sharding annotations to tensors;
+2. propagation infers and propagates sharding through operations using `ShardingInterface`;
+3. localization rewrites supported shard-annotated computation into per-NSP local tensor computation;
+4. materialization connects the local results back to the final destination buffers;
+5. cleanup canonicalizes and removes redundant IR.
+
+The upstream `shard` dialect defines attributes, operations, and interfaces for tensor sharding and device communication, and it is explicitly inspired by GSPMD. It also assumes an SPMD execution model where all participants execute the same program and synchronize through collectives when needed.
+
+1. Does this approach generalize beyond `linalg`-centric kernels?
+
+Conceptually, yes. However, the current implementation does not generalize fully yet.
+
+The current `NSPShardPlanner` is explicitly oriented around `linalg.generic`: it inspects `linalg.generic` operations, uses their `iterator_types` and `indexing_maps`, and annotates operands/results using the `shard` dialect. This means that, for kernels that are well structured as `linalg`, the planner has a clear source of information: which loops are parallel, which loops are reductions, and how those loops index each tensor dimension.
+
+The approach is not intrinsically limited to `linalg`, because sharding is represented as a property of data/tensor values rather than as a property of a particular loop nest. However, the current planner derives most automatic decisions from `linalg.generic`. For purely `scf`-based IR, the current support is more restricted and relies on recognizing safe DOALL loops, rather than performing a general dependence analysis for arbitrary deeply nested loop nests.
+
+2. Since sharding is driven by tensor/data annotations, how do iteration-space constructs such as `scf` nesting influence the final partitioning?
+
+The annotations describe what is partitioned. For example, they may say that a tensor is split along dimension 0 across the NSP grid.
+
+The loops describe how that partition is executed: which iteration produces which slice, where the final store happens, whether there are loop-carried dependencies, whether there is a reduction, and whether the loop induction variable participates in the output address computation.
+
+For `linalg`, this relationship is explicit because `iterator_types` and `indexing_maps` directly connect the iteration space to tensor dimensions. The planner chooses a sharding iterator, typically a parallel iterator that appears in the output map, and converts that choice into tensor `split_axes`. In the current implementation, a tensor dimension is sharded only when it is directly indexed by the selected iterator; all other dimensions remain replicated.
+
+For `scf`, this relationship has to be reconstructed by analysis. `NSPLocalize` performs a conservative taint-style analysis to check whether the loop induction variable participates in output addressing, for example through `memref.store`, `memref.subview`, `memref.reinterpret_cast`, or `bufferization.materialize_in_destination`. If the induction variable controls the output slice, the loop may be a candidate for distribution.
+
+3. Are there practical limits on tensor rank or nesting depth?
+
+Yes. In the current implementation, there are explicit rank limits. For nesting depth, the limit is more semantic than numerical.
+
+In `NSPLocalize`, the identity-map elementwise path is currently limited to ranked tensors up to rank 4. Selected rank-2 broadcast patterns are also supported. For higher-rank tensors, such as those that may appear in multimodal models, the approach can still be extended, provided that:
+
+1. there is a static shardable dimension divisible by the number of NSPs (core & trheads);
+2. the maps and view-like operations preserve a clear relationship between global and local dimensions;
+3. `Localize` and `Materialize` are generalized to build `all_slice`, `extract_slice`, `subview`, and `tile_shape` in a rank-polymorphic way.
+
+For `scf` nesting depth, there is no inherent conceptual limit such as “up to N loops.” The real question is whether the compiler can prove that the selected loop is DOALL and that distributing it will not break dependencies. The current implementation recognizes some safe cases, but it is not yet a full dependence-analysis framework for arbitrary deeply nested `scf` programs.
+
+4. How well does this approach compose with fusion?
+
+Composition with fusion depends heavily on pass staging.
+
+In an integrated pipeline, fusion may already have happened before the NSP planner runs. However, the NSPSharding architecture also leaves a natural window between `NSPLocalizePass` and `NSPMaterializePass`. After localization, the IR still preserves pure tensor semantics, which means downstream tiling, vectorization, and potentially fusion can still operate on local tensor computation before the result is finally materialized into destination buffers.
+
+This is an important design point. If materialization happens too early, the IR is lowered into `memref.subview`, stores, and buffer-oriented patterns, which makes high-level fusion harder. If localization happens first and materialization is delayed, fusion and vectorization can operate on the per-NSP local version of the computation.
+
+Therefore, the approach can compose cleanly with fusion, but the best staging is usually:
+
+1. perform high-level fusion when it preserves analyzable `linalg` structure;
+2. run NSP planning and propagation;
+3. localize the computation into per-NSP tensor IR;
+4. run local tiling/vectorization/fusion opportunities;
+5. materialize into destination buffers.
+
+5. Is this purely the upstream MLIR `shard` dialect, or are there extensions? How does it differ from GSPMD-style systems?
+
+It is not purely upstream.
+
+The project uses the upstream MLIR `shard` dialect as the central representation for grids, sharding descriptors, annotations, and operations such as `shard.shard`, `shard.sharding`, `shard.all_slice`, and `shard.process_linear_index`.
+
+However, NSPSharding adds at least three NSP-specific pieces:
+
+a) a custom planner that chooses sharding for `linalg.generic`, currently favoring a parallel output iterator when possible;
+
+b) external `ShardingInterface` models, so propagation can cross operations that commonly appear in the NSP pipeline, such as bufferization ops, memref ops, tensor views, `arith`, `math`, `linalg.transpose`, `linalg.reduce`, `tensor.expand_shape`, and `tensor.collapse_shape`;
+
+c) a private `nsp` dialect, especially `nsp.materialize_tile`, which acts as a contract between `NSPLocalizePass` and `NSPMaterializePass`. This operation states that a tensor value already represents the local tile for the current NSP participant and must later be written into the correct slice of the global destination buffer.
+
+Compared with GSPMD, the main difference is maturity and scope. GSPMD is a broad automatic parallelization system for ML computations: the user writes a mostly single-device program, provides some distribution annotations, and the system infers partitioning for operators across a distributed device mesh.
+
+NSPSharding is currently a specialized implementation for the Hexagon/NSP backend. It uses similar principles — tensor annotations, sharding propagation, and SPMD-style lowering — but today it has a narrower scope: limited collective support, enumerated localization/materialization patterns, and lowering tied to the Hexagon ABI, where the participant index is computed from `coreId`, `threadId`, and `numThreadsPerCore`.
+
+6. Can the model express more complex parallel patterns like pipelining or expert parallelism, including non-uniform or dynamic partitioning?
+
+Not fully in the current NSPSharding implementation.
+
+The upstream `shard` dialect has a richer vocabulary than what NSPSharding currently exercises, including collectives, `send`, `recv`, `broadcast`, `scatter`, `gather`, `update_halo`, multidimensional grids, and communication over device groups. So, at the MLIR infrastructure level, there is vocabulary that could express more complex communication patterns.
+
+However, the current NSPSharding flow is focused on static tensor/data parallelism: uniform slicing, mostly 1-D grid sharding, per-NSP local computation, and limited/no collective communication by default.
+
+For expert parallelism, the compiler would need to represent dynamic or semi-dynamic token routing to experts, potentially non-uniform partitioning, load balancing, cross-NSP communication, and dispatch/combine behavior. That goes beyond simply splitting a static tensor dimension across NSP participants.
+
+For pipeline parallelism, the compiler would need to model stages, temporal dependencies, intermediate buffers, possibly double buffering, and overlap between producer and consumer stages. Tensor sharding is part of the problem, but it does not by itself express the pipeline schedule.
+
+7. Is this just a data-centric re-expression of classical loop tiling plus SPMD? What new optimization opportunities does this enable?
+
+Yes, in part, it is a data-centric re-expression of classical ideas: loop tiling, iteration distribution, and SPMD execution. However, there are important advantages to representing partitioning at the tensor/data level rather than only at the loop level.
+
+The first opportunity is inter-operation propagation. In traditional loop-tiling compilers, each loop nest tends to be analyzed locally. With SSA-level sharding, a decision made for one tensor can be propagated through operations such as `transpose`, `reduce`, `expand_shape`, `collapse_shape`, `arith`, `math`, and bufferization boundaries. This is exactly the role of the NSP `ShardingInterface` models: preserve sharding when it is semantically safe, and treat unsupported operations as propagation boundaries rather than as computation semantics.
+
+The second opportunity is separating planning from materialization. The pipeline first decides and propagates sharding, then localizes computation while preserving tensor semantics, and only later materializes into memrefs and subviews. This is more flexible than lowering early to loops and buffers, where high-level structure is lost.
+
+The third opportunity is better communication reasoning. When sharding is represented as a property of values, it becomes clearer when a reduction is local, when it requires `all_reduce`, when a dimension is replicated, when a broadcast is local, or when an `all_gather` would be needed to reconstruct a global value.
+
+The fourth opportunity is avoiding unnecessary global materialization. The private `nsp.materialize_tile` operation makes the hand-off between localized tensor computation and final destination materialization explicit, without keeping the original global producer alive as the computation that downstream passes should optimize.
+
+In short, traditional loop tiling asks: “Which iterations run where?” NSPSharding asks first: “Where does each logical tensor value live?” It then derives local computation and destination materialization from that. This enables cleaner propagation across producer-consumer graphs, view-like operations, reductions, broadcasts, and bufferization boundaries before committing to low-level loop and memref code.
+
