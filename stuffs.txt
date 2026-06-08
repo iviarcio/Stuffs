@@ -1,3 +1,29 @@
+[NSP][Planner] Remove stub all-reduce materialization and fail explicitly on collective-required plans
+
+Keep `requiresAllReduce` as analysis-only in the planner and make
+collective-required cases fail explicitly instead of silently using
+a no-op placeholder.
+
+The NSP shard planner no longer carries a silent no-op hook for
+collective materialization. The old `materializeAllReduceIfNeeded()`
+helper was only a placeholder from the early bring-up phase and no
+longer matches the current NSP pipeline structure.
+
+This change keeps `requiresAllReduce` as analysis information in the
+sharding plan, but makes the current limitation explicit:
+collective materialization is not implemented in the planner or in the
+downstream NSP Localize/Materialize/ShardToLLVM flow.
+
+Behavior after this change:
+
+* plans that require collectives are still skipped when
+  `allowCollectives=false`
+* when `allowCollectives=true`, the planner now emits an explicit error
+  and fails instead of silently pretending support exists
+
+This keeps the planner focused on sharding decisions/annotations and
+avoids giving a false impression of end-to-end collective support.
+
 [NSP] Add sharding interface model for tensor.collapse_shape
 
 Add an NSP ShardingInterface external model for tensor.collapse_shape.
