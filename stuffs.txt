@@ -1,3 +1,18 @@
+[NSP][Planner] Hoist shard descriptors in NSP shard planner
+
+Hoist `shard.sharding` descriptors to the function entry block when
+creating cached sharding values in `NSPShardPlanner`.
+
+The planner caches sharding descriptors by grid and split axes. When the
+first descriptor for a given key was created inside a nested region, such as
+an `scf.for`, later reuse outside that region could produce invalid IR because
+the cached SSA value did not dominate the new use.
+
+Create descriptors at a dominance-safe function-level insertion point instead.
+Also avoid reusing existing `shard.shard` wrapper users, since those wrappers
+may likewise be local to a nested region and not dominate the current insertion
+point.
+
 [NSP][Planner] Remove stub all-reduce materialization and fail explicitly on collective-required plans
 
 Keep `requiresAllReduce` as analysis-only in the planner and make
