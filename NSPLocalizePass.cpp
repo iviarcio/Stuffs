@@ -264,7 +264,7 @@ static bool isSupportedBroadcast2DGeneric(linalg::GenericOp g,
 
 //===----------------------------------------------------------------------===//
 // Drop stale shard.shard wrappers after localization has consumed sharding
-// annotations. 
+// annotations.
 //===----------------------------------------------------------------------===//
 static void stripShardAnnotationWrappers(ModuleOp module) {
   SmallVector<Operation *> eraseList;
@@ -1589,6 +1589,12 @@ struct NSPLocalizePass
         return true;
       };
 
+      llvm::DenseMap<Operation *, mlir::scf::ForOp> localizedScfForCache;
+
+      std::function<LogicalResult(mlir::scf::ForOp,
+                                  llvm::DenseMap<Value, Value> &)>
+          localizeScfForWithTensorIterArgs;
+
       // Build a local-tile version of a global value by cloning a chain of
       // compatible producers. This avoids materializing full global
       // intermediates when only the final store is tiled.
@@ -2170,6 +2176,23 @@ struct NSPLocalizePass
           }
         }
 
+        // scf.for with tensor iter_args: build a shard-local clone of the
+        // loop on demand and return the corresponding local loop result.
+        //
+        // This path does not distribute the IV. It keeps the recurrence loop
+        // intact on every NSP thread, but carries only shard-local tensor
+        // state through the loop. This is the non-collective strategy for
+        // online recurrences over K/V blocks.
+        if (auto forOp =
+                dyn_cast_or_null<mlir::scf::ForOp>(base.getDefiningOp())) {
+          if (succeeded(localizeScfForWithTensorIterArgs(forOp, cache))) {
+            auto localIt = cache.find(base);
+            if (localIt != cache.end() &&
+                localIt->second.getType() == expectedLocalTy)
+              return localIt->second;
+          }
+        }
+
         // Fallback: slice the global value.
         Value local = mlir::shard::AllSliceOp::create(
                           b, base.getLoc(), /*result_type=*/expectedLocalTy,
@@ -2182,6 +2205,489 @@ struct NSPLocalizePass
         return local;
       };
 
+      // Build a shard-local clone of an scf.for with tensor iter_args.
+      //
+      // The helper is called from materializeLocalValue when a downstream
+      // localized consumer requests a local version of one of the loop
+      // results. This avoids replacing the original loop results with
+      // different-typed local values.
+      localizeScfForWithTensorIterArgs =
+          [&](mlir::scf::ForOp forOp,
+              llvm::DenseMap<Value, Value> &cache) -> LogicalResult {
+        if (!forOp || forOp.getResults().empty() || forOp.getInitArgs().empty())
+          return failure();
+
+        if (isNspDistributedLoop(forOp) ||
+            hasNspDistributedLoopAncestor(forOp.getOperation()))
+          return failure();
+
+        if (auto cached = localizedScfForCache.lookup(forOp.getOperation())) {
+          for (auto [oldResult, newResult] :
+               llvm::zip(forOp.getResults(), cached.getResults()))
+            cache[oldResult] = newResult;
+          return success();
+        }
+
+        constexpr int64_t loopSplitAxis = 0;
+
+        auto getAxisLocalType = [&](RankedTensorType globalTy,
+                                    int64_t axis) -> RankedTensorType {
+          if (!globalTy || globalTy.getRank() == 0 || axis < 0 ||
+              axis >= globalTy.getRank())
+            return RankedTensorType();
+          int64_t dim = globalTy.getDimSize(axis);
+          if (ShapedType::isDynamic(dim) || dim <= 0 || dim % numShards != 0)
+            return RankedTensorType();
+          SmallVector<int64_t> shape(globalTy.getShape().begin(),
+                                     globalTy.getShape().end());
+          shape[axis] = dim / numShards;
+          return RankedTensorType::get(shape, globalTy.getElementType(),
+                                       globalTy.getEncoding());
+        };
+
+        SmallVector<char> localizeResult(forOp.getNumResults(), false);
+        SmallVector<RankedTensorType> localResultTypes(forOp.getNumResults());
+        llvm::SmallSet<int64_t, 4> shardedLeadingExtents;
+
+        for (auto [idx, it] : llvm::enumerate(
+                 llvm::zip(forOp.getInitArgs(), forOp.getResults()))) {
+          Value init = std::get<0>(it);
+          Value result = std::get<1>(it);
+
+          auto initTy = dyn_cast<RankedTensorType>(init.getType());
+          auto resultTy = dyn_cast<RankedTensorType>(result.getType());
+          if (!initTy || !resultTy || initTy != resultTy)
+            continue;
+
+          RankedTensorType localTy = getAxisLocalType(resultTy, loopSplitAxis);
+          if (!localTy)
+            continue;
+
+          localizeResult[idx] = true;
+          localResultTypes[idx] = localTy;
+          (void)shardedLeadingExtents.insert(
+              resultTy.getDimSize(loopSplitAxis));
+        }
+
+        if (!llvm::any_of(localizeResult, [](char v) { return v; }))
+          return failure();
+
+        auto isLoopRowShardedType = [&](RankedTensorType ty) -> bool {
+          if (!ty || ty.getRank() == 0)
+            return false;
+          int64_t dim0 = ty.getDimSize(loopSplitAxis);
+          return !ShapedType::isDynamic(dim0) &&
+                 shardedLeadingExtents.contains(dim0);
+        };
+
+        auto getLoopRowLocalType =
+            [&](RankedTensorType ty) -> RankedTensorType {
+          if (!isLoopRowShardedType(ty))
+            return RankedTensorType();
+          return getAxisLocalType(ty, loopSplitAxis);
+        };
+
+        auto isDefinedInsideLoop = [&](Value v) -> bool {
+          Operation *def = v.getDefiningOp();
+          return def && def->getParentOfType<mlir::scf::ForOp>() == forOp;
+        };
+
+        OpBuilder preBuilder(forOp);
+        Location loc = forOp.getLoc();
+
+        llvm::DenseMap<Value, Value> externalLocalCache;
+        auto getOrCreateExternalLocal = [&](Value v,
+                                            RankedTensorType localTy) -> Value {
+          if (!v || !localTy)
+            return Value();
+          if (v.getType() == localTy)
+            return v;
+          if (isDefinedInsideLoop(v))
+            return Value();
+          if (Value cached = externalLocalCache.lookup(v))
+            return cached;
+
+          auto globalTy = dyn_cast<RankedTensorType>(v.getType());
+          if (!globalTy)
+            return Value();
+
+          Value local = mlir::shard::AllSliceOp::create(
+                            preBuilder, v.getLoc(), /*result_type=*/localTy,
+                            /*input=*/v,
+                            /*grid=*/"nsp",
+                            /*gridAxes=*/gridAxes,
+                            /*sliceAxis=*/loopSplitAxis)
+                            .getResult();
+          externalLocalCache[v] = local;
+          return local;
+        };
+
+        SmallVector<Value> newInitArgs;
+        newInitArgs.reserve(forOp.getInitArgs().size());
+        for (auto [idx, init] : llvm::enumerate(forOp.getInitArgs())) {
+          if (!localizeResult[idx]) {
+            newInitArgs.push_back(init);
+            continue;
+          }
+
+          Value localInit =
+              getOrCreateExternalLocal(init, localResultTypes[idx]);
+          if (!localInit)
+            return failure();
+          newInitArgs.push_back(localInit);
+        }
+
+        auto newFor = mlir::scf::ForOp::create(
+            preBuilder, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+            forOp.getStep(), newInitArgs);
+        newFor->setAttr("nsp.localized_loop", preBuilder.getUnitAttr());
+        localizedScfForCache[forOp.getOperation()] = newFor;
+
+        Block *oldBody = forOp.getBody();
+        Block *newBody = newFor.getBody();
+        newBody->getOperations().clear();
+
+        IRMapping mapping;
+        mapping.map(forOp.getInductionVar(), newFor.getInductionVar());
+        for (auto [oldArg, newArg] :
+             llvm::zip(forOp.getRegionIterArgs(), newFor.getRegionIterArgs()))
+          mapping.map(oldArg, newArg);
+
+        auto lookupMappedOrSelf = [&](Value v) -> Value {
+          if (Value mapped = mapping.lookupOrNull(v))
+            return mapped;
+          return v;
+        };
+
+        auto cloneRegionInto = [&](Region &src, Region &dst) {
+          dst.getBlocks().clear();
+
+          Block &srcBlock = src.front();
+          Block *dstBlock = new Block();
+          dst.push_back(dstBlock);
+
+          for (BlockArgument arg : srcBlock.getArguments())
+            dstBlock->addArgument(arg.getType(), arg.getLoc());
+
+          IRMapping regionMap;
+          for (auto [srcArg, dstArg] :
+               llvm::zip(srcBlock.getArguments(), dstBlock->getArguments()))
+            regionMap.map(srcArg, dstArg);
+
+          OpBuilder nb = OpBuilder::atBlockEnd(dstBlock);
+          for (Operation &nested : srcBlock.getOperations())
+            nb.clone(nested, regionMap);
+        };
+
+        auto remapOperandForMap = [&](Value operand, AffineMap map,
+                                      int64_t shardedLoopDim) -> Value {
+          Value mapped = lookupMappedOrSelf(operand);
+
+          auto operandTy = dyn_cast<RankedTensorType>(operand.getType());
+          if (!operandTy || shardedLoopDim < 0)
+            return mapped;
+
+          for (auto [operandDim, expr] : llvm::enumerate(map.getResults())) {
+            auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+            if (!dimExpr || dimExpr.getPosition() != shardedLoopDim)
+              continue;
+
+            // This first implementation only shards the row dimension of the
+            // carried state. Operands that reference the same loop dimension in
+            // another tensor dimension are left unsupported instead of being
+            // silently sharded along the wrong physical axis.
+            if (static_cast<int64_t>(operandDim) != loopSplitAxis)
+              return Value();
+
+            RankedTensorType localTy = getLoopRowLocalType(operandTy);
+            if (!localTy)
+              return Value();
+
+            if (mapped.getType() == localTy)
+              return mapped;
+            return getOrCreateExternalLocal(operand, localTy);
+          }
+
+          return mapped;
+        };
+
+        auto cloneGeneric = [&](mlir::linalg::GenericOp generic,
+                                OpBuilder &bodyBuilder) -> LogicalResult {
+          const int64_t numInputs = generic.getNumDpsInputs();
+          const int64_t numOutputs = generic.getNumDpsInits();
+          auto maps = generic.getIndexingMapsArray();
+
+          SmallVector<Value> newOutputs;
+          newOutputs.reserve(numOutputs);
+          bool hasLocalizedOutput = false;
+          int64_t shardedLoopDim = -1;
+
+          for (int64_t outIdx = 0; outIdx < numOutputs; ++outIdx) {
+            Value oldInit = generic.getDpsInitOperand(outIdx)->get();
+            Value newInit = lookupMappedOrSelf(oldInit);
+
+            auto oldResultTy =
+                dyn_cast<RankedTensorType>(generic.getResult(outIdx).getType());
+            if (oldResultTy) {
+              RankedTensorType localTy = getLoopRowLocalType(oldResultTy);
+              if (localTy && newInit.getType() != localTy) {
+                newInit = getOrCreateExternalLocal(oldInit, localTy);
+                if (!newInit)
+                  return failure();
+              }
+            }
+
+            newOutputs.push_back(newInit);
+
+            auto newInitTy = dyn_cast<RankedTensorType>(newInit.getType());
+            if (!oldResultTy || !newInitTy || oldResultTy == newInitTy)
+              continue;
+
+            hasLocalizedOutput = true;
+
+            AffineMap outMap = maps[numInputs + outIdx];
+            if (!outMap || outMap.getNumResults() <= loopSplitAxis)
+              return failure();
+            auto d0 = dyn_cast<AffineDimExpr>(outMap.getResult(loopSplitAxis));
+            if (!d0)
+              return failure();
+
+            if (shardedLoopDim < 0)
+              shardedLoopDim = d0.getPosition();
+            else if (shardedLoopDim != d0.getPosition())
+              return failure();
+          }
+
+          if (!hasLocalizedOutput) {
+            Operation *cloned = bodyBuilder.clone(*generic, mapping);
+            for (auto [oldResult, newResult] :
+                 llvm::zip(generic->getResults(), cloned->getResults()))
+              mapping.map(oldResult, newResult);
+            return success();
+          }
+
+          SmallVector<Value> newInputs;
+          newInputs.reserve(numInputs);
+          for (int64_t inIdx = 0; inIdx < numInputs; ++inIdx) {
+            Value oldInput = generic.getDpsInputOperand(inIdx)->get();
+            Value newInput =
+                remapOperandForMap(oldInput, maps[inIdx], shardedLoopDim);
+            if (!newInput)
+              return failure();
+            newInputs.push_back(newInput);
+          }
+
+          SmallVector<Type> resultTypes;
+          resultTypes.reserve(newOutputs.size());
+          for (Value out : newOutputs)
+            resultTypes.push_back(out.getType());
+
+          auto newGeneric = mlir::linalg::GenericOp::create(
+              bodyBuilder, generic.getLoc(),
+              /*resultTensorTypes=*/TypeRange(resultTypes),
+              /*inputs=*/ValueRange(newInputs),
+              /*outputs=*/ValueRange(newOutputs),
+              /*indexingMaps=*/generic.getIndexingMapsArray(),
+              /*iteratorTypes=*/generic.getIteratorTypesArray(),
+              /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+          cloneRegionInto(generic.getRegion(), newGeneric.getRegion());
+
+          for (auto [oldResult, newResult] :
+               llvm::zip(generic->getResults(), newGeneric->getResults()))
+            mapping.map(oldResult, newResult);
+          return success();
+        };
+
+        auto cloneReduce = [&](mlir::linalg::ReduceOp reduce,
+                               OpBuilder &bodyBuilder) -> LogicalResult {
+          if (reduce.getInputs().size() != 1 || reduce.getInits().size() != 1)
+            return failure();
+
+          Value newInput = lookupMappedOrSelf(reduce.getInputs()[0]);
+          Value oldInit = reduce.getInits()[0];
+          Value newInit = lookupMappedOrSelf(oldInit);
+
+          auto oldResultTy =
+              dyn_cast<RankedTensorType>(reduce->getResult(0).getType());
+          if (oldResultTy) {
+            RankedTensorType localTy = getLoopRowLocalType(oldResultTy);
+            if (localTy && newInit.getType() != localTy) {
+              newInit = getOrCreateExternalLocal(oldInit, localTy);
+              if (!newInit)
+                return failure();
+            }
+          }
+
+          auto newInitTy = dyn_cast<RankedTensorType>(newInit.getType());
+          if (!oldResultTy || !newInitTy || oldResultTy == newInitTy) {
+            Operation *cloned = bodyBuilder.clone(*reduce, mapping);
+            mapping.map(reduce->getResult(0), cloned->getResult(0));
+            return success();
+          }
+
+          auto inputTy = dyn_cast<RankedTensorType>(newInput.getType());
+          if (!inputTy)
+            return failure();
+
+          llvm::SmallSet<int64_t, 4> reducedDims;
+          for (int64_t dim : reduce.getDimensions())
+            (void)reducedDims.insert(dim);
+
+          SmallVector<mlir::utils::IteratorType> iteratorTypes;
+          iteratorTypes.reserve(inputTy.getRank());
+          for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
+            iteratorTypes.push_back(reducedDims.contains(dim)
+                                        ? mlir::utils::IteratorType::reduction
+                                        : mlir::utils::IteratorType::parallel);
+          }
+
+          MLIRContext *ctx = bodyBuilder.getContext();
+          SmallVector<AffineExpr> inputExprs;
+          SmallVector<AffineExpr> outputExprs;
+          inputExprs.reserve(inputTy.getRank());
+          outputExprs.reserve(newInitTy.getRank());
+
+          for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
+            auto expr = getAffineDimExpr(dim, ctx);
+            inputExprs.push_back(expr);
+            if (!reducedDims.contains(dim))
+              outputExprs.push_back(expr);
+          }
+
+          AffineMap inputMap =
+              AffineMap::get(inputTy.getRank(), 0, inputExprs, ctx);
+          AffineMap outputMap =
+              AffineMap::get(inputTy.getRank(), 0, outputExprs, ctx);
+
+          auto newReduce = mlir::linalg::GenericOp::create(
+              bodyBuilder, reduce.getLoc(),
+              /*resultTensorTypes=*/TypeRange{newInitTy},
+              /*inputs=*/ValueRange{newInput},
+              /*outputs=*/ValueRange{newInit},
+              /*indexingMaps=*/ArrayRef<AffineMap>{inputMap, outputMap},
+              /*iteratorTypes=*/iteratorTypes,
+              /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+          cloneRegionInto(reduce.getRegion(), newReduce.getRegion());
+          mapping.map(reduce->getResult(0), newReduce.getResult(0));
+          return success();
+        };
+
+        auto cloneOp = [&](Operation &op,
+                           OpBuilder &bodyBuilder) -> LogicalResult {
+          if (auto empty = dyn_cast<tensor::EmptyOp>(op)) {
+            auto oldTy = dyn_cast<RankedTensorType>(empty.getType());
+            RankedTensorType localTy = getLoopRowLocalType(oldTy);
+            if (localTy) {
+              Value localEmpty = tensor::EmptyOp::create(
+                  bodyBuilder, empty.getLoc(), localTy.getShape(),
+                  localTy.getElementType());
+              mapping.map(empty.getResult(), localEmpty);
+              return success();
+            }
+          }
+
+          if (auto fill = dyn_cast<mlir::linalg::FillOp>(op)) {
+            if (fill.getOutputs().size() != 1)
+              return failure();
+            Value oldOutput = fill.getOutputs()[0];
+            Value newOutput = lookupMappedOrSelf(oldOutput);
+            if (auto resultTy =
+                    dyn_cast<RankedTensorType>(fill->getResult(0).getType())) {
+              RankedTensorType localTy = getLoopRowLocalType(resultTy);
+              if (localTy && newOutput.getType() != localTy) {
+                newOutput = getOrCreateExternalLocal(oldOutput, localTy);
+                if (!newOutput)
+                  return failure();
+              }
+            }
+            if (newOutput.getType() != oldOutput.getType()) {
+              auto newFill = mlir::linalg::FillOp::create(
+                  bodyBuilder, fill.getLoc(),
+                  /*inputs=*/
+                  ValueRange{lookupMappedOrSelf(fill.getInputs()[0])},
+                  /*outputs=*/ValueRange{newOutput});
+              mapping.map(fill->getResult(0), newFill->getResult(0));
+              return success();
+            }
+          }
+
+          if (auto transpose = dyn_cast<mlir::linalg::TransposeOp>(op)) {
+            Value newInput = lookupMappedOrSelf(transpose.getInput());
+            Value newInit = lookupMappedOrSelf(transpose.getInit());
+            if (newInput.getType() != transpose.getInput().getType() ||
+                newInit.getType() != transpose.getInit().getType()) {
+              auto newTranspose = mlir::linalg::TransposeOp::create(
+                  bodyBuilder, transpose.getLoc(),
+                  /*input=*/newInput,
+                  /*init=*/newInit,
+                  /*permutation=*/transpose.getPermutation());
+              mapping.map(transpose->getResult(0), newTranspose.getResult()[0]);
+              return success();
+            }
+          }
+
+          if (auto generic = dyn_cast<mlir::linalg::GenericOp>(op))
+            return cloneGeneric(generic, bodyBuilder);
+
+          if (auto reduce = dyn_cast<mlir::linalg::ReduceOp>(op))
+            return cloneReduce(reduce, bodyBuilder);
+
+          bool hasRowShardedTensorResult = false;
+          for (Type t : op.getResultTypes()) {
+            if (getLoopRowLocalType(dyn_cast<RankedTensorType>(t))) {
+              hasRowShardedTensorResult = true;
+              break;
+            }
+          }
+          if (hasRowShardedTensorResult)
+            return failure();
+
+          Operation *cloned = bodyBuilder.clone(op, mapping);
+          for (auto [oldResult, newResult] :
+               llvm::zip(op.getResults(), cloned->getResults()))
+            mapping.map(oldResult, newResult);
+          return success();
+        };
+
+        OpBuilder bodyBuilder(newFor.getContext());
+        for (Operation &op : oldBody->without_terminator()) {
+          bodyBuilder.setInsertionPointToEnd(newBody);
+          if (failed(cloneOp(op, bodyBuilder))) {
+            newFor.emitRemark()
+                << "NSPLocalize: failed to localize scf.for with tensor "
+                   "iter_args; keeping original loop";
+            newFor.erase();
+            localizedScfForCache.erase(forOp.getOperation());
+            return failure();
+          }
+        }
+
+        auto oldYield = cast<mlir::scf::YieldOp>(oldBody->getTerminator());
+        SmallVector<Value> newYieldOperands;
+        newYieldOperands.reserve(oldYield.getNumOperands());
+        for (auto [idx, yielded] : llvm::enumerate(oldYield.getOperands())) {
+          Value mappedYield = lookupMappedOrSelf(yielded);
+          if (localizeResult[idx] &&
+              mappedYield.getType() != localResultTypes[idx]) {
+            newFor.erase();
+            localizedScfForCache.erase(forOp.getOperation());
+            return failure();
+          }
+          newYieldOperands.push_back(mappedYield);
+        }
+        bodyBuilder.setInsertionPointToEnd(newBody);
+        mlir::scf::YieldOp::create(bodyBuilder, oldYield.getLoc(),
+                                   newYieldOperands);
+
+        for (auto [oldResult, newResult] :
+             llvm::zip(forOp.getResults(), newFor.getResults()))
+          cache[oldResult] = newResult;
+
+        return success();
+      };
+
       // Use a worklist since we'll rewrite in-place.
       SmallVector<mlir::linalg::GenericOp> worklist;
       func.walk([&](mlir::linalg::GenericOp g) { worklist.push_back(g); });
@@ -2191,7 +2697,8 @@ struct NSPLocalizePass
         // this pass, do not also apply tensor tile localization. The loop
         // schedule already partitions the destination writes, so emitting
         // nsp.materialize_tile here would double-partition the inner tensor.
-        if (!allowCollectives && hasNspDistributedLoopAncestor(g.getOperation()))
+        if (!allowCollectives &&
+            hasNspDistributedLoopAncestor(g.getOperation()))
           continue;
 
         // Initial structural filter.
@@ -2306,7 +2813,8 @@ struct NSPLocalizePass
         //   the surrounding scf.for schedule:
         //     lb'   = lb + procIdx * step
         //     step' = step * numShards
-        if (!allowCollectives && hasNspDistributedLoopAncestor(g.getOperation()))
+        if (!allowCollectives &&
+            hasNspDistributedLoopAncestor(g.getOperation()))
           continue;
 
         // Non-collective path must ONLY rewrite ops that directly materialize

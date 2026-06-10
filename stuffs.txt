@@ -1,3 +1,20 @@
+[Hexagon][NSP] Localize scf.for tensor iter_args on demand
+
+Teach `NSPLocalizePass` to materialize shard-local versions of
+`scf.for` results whose loop-carried state contains ranked tensors.
+
+This supports flash-attention-like online recurrence patterns where the loop
+iterates over K/V blocks, while the loop-carried tensor state is sharded along
+the query/output dimension. In non-collective mode, the loop induction range is
+kept unchanged on every NSP; only tensor init args and tensor-yielded values are
+localized to the current shard.
+
+The transformation is demand-driven from `materializeLocalValue`: when a
+localized consumer needs a shard-local value produced by an `scf.for`, the pass
+clones the loop with localized tensor iter_args, preserves scalar/index
+iter_args as-is, remaps supported tensor operations in the body, and caches the
+localized loop results.
+
 [NSP][Planner] Hoist shard descriptors in NSP shard planner
 
 Hoist `shard.sharding` descriptors to the function entry block when
