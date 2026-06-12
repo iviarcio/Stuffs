@@ -2295,6 +2295,7 @@ struct NSPLocalizePass
         OpBuilder preBuilder(forOp);
         Location loc = forOp.getLoc();
 
+        SmallVector<Operation *> speculativeOps;
         llvm::DenseMap<Value, Value> externalLocalCache;
         auto getOrCreateExternalLocal = [&](Value v,
                                             RankedTensorType localTy) -> Value {
@@ -2311,13 +2312,14 @@ struct NSPLocalizePass
           if (!globalTy)
             return Value();
 
-          Value local = mlir::shard::AllSliceOp::create(
-                            preBuilder, v.getLoc(), /*result_type=*/localTy,
-                            /*input=*/v,
-                            /*grid=*/"nsp",
-                            /*gridAxes=*/gridAxes,
-                            /*sliceAxis=*/loopSplitAxis)
-                            .getResult();
+         auto allSlice = mlir::shard::AllSliceOp::create(
+              preBuilder, v.getLoc(), /*result_type=*/localTy,
+              /*input=*/v,
+              /*grid=*/"nsp",
+              /*gridAxes=*/gridAxes,
+              /*sliceAxis=*/loopSplitAxis);
+          Value local = allSlice.getResult();
+          speculativeOps.push_back(allSlice.getOperation());
           externalLocalCache[v] = local;
           return local;
         };
@@ -2342,6 +2344,20 @@ struct NSPLocalizePass
             forOp.getStep(), newInitArgs);
         newFor->setAttr("nsp.localized_loop", preBuilder.getUnitAttr());
         localizedScfForCache[forOp.getOperation()] = newFor;
+
+        auto rollbackLocalizedLoop = [&]() {
+          newFor.erase();
+          localizedScfForCache.erase(forOp.getOperation());
+
+          // External all_slice values are speculative until the localized loop
+          // body has been fully cloned. If cloning fails, erase them as well so
+          // the pass does not leave dead slice anchors for canonicalization to
+          // clean up later.
+          for (Operation *op : llvm::reverse(speculativeOps)) {
+            if (op && op->use_empty())
+              op->erase();
+          }
+        };
 
         Block *oldBody = forOp.getBody();
         Block *newBody = newFor.getBody();
@@ -2574,6 +2590,74 @@ struct NSPLocalizePass
           return success();
         };
 
+        auto cloneMatmul = [&](mlir::linalg::MatmulOp matmul,
+                                OpBuilder &bodyBuilder) -> LogicalResult {
+          mlir::linalg::LinalgOp linalgOp(matmul.getOperation());
+          if (linalgOp.getNumDpsInputs() != 2 ||
+              linalgOp.getNumDpsInits() != 1 || matmul->getNumResults() != 1)
+            return failure();
+
+          auto maps = linalgOp.getIndexingMapsArray();
+          if (maps.size() != 3)
+            return failure();
+
+          Value oldOutput = linalgOp.getDpsInitOperand(0)->get();
+          Value newOutput = lookupMappedOrSelf(oldOutput);
+
+          auto oldResultTy =
+              dyn_cast<RankedTensorType>(matmul->getResult(0).getType());
+          if (oldResultTy) {
+            RankedTensorType localTy = getLoopRowLocalType(oldResultTy);
+            if (localTy && newOutput.getType() != localTy) {
+              newOutput = getOrCreateExternalLocal(oldOutput, localTy);
+              if (!newOutput)
+                return failure();
+            }
+          }
+
+          auto newOutputTy = dyn_cast<RankedTensorType>(newOutput.getType());
+          if (!oldResultTy || !newOutputTy || oldResultTy == newOutputTy) {
+            Operation *cloned = bodyBuilder.clone(*matmul, mapping);
+            mapping.map(matmul->getResult(0), cloned->getResult(0));
+            return success();
+          }
+
+          AffineMap outMap = maps.back();
+          if (!outMap || outMap.getNumResults() <= loopSplitAxis)
+            return failure();
+
+          auto d0 = dyn_cast<AffineDimExpr>(outMap.getResult(loopSplitAxis));
+          if (!d0)
+            return failure();
+          int64_t shardedLoopDim = d0.getPosition();
+
+          SmallVector<Value> newInputs;
+          newInputs.reserve(linalgOp.getNumDpsInputs());
+          for (int64_t inIdx = 0; inIdx < linalgOp.getNumDpsInputs();
+               ++inIdx) {
+            Value oldInput = linalgOp.getDpsInputOperand(inIdx)->get();
+            Value newInput =
+                remapOperandForMap(oldInput, maps[inIdx], shardedLoopDim);
+            if (!newInput)
+              return failure();
+            newInputs.push_back(newInput);
+          }
+
+          // Named linalg ops such as linalg.matmul do not have a generic
+          // region to clone. Rebuild the same operation name with remapped
+          // DPS operands and local tensor result type. Copying the original
+          // attributes preserves segment sizes and any named-op attributes.
+          OperationState state(matmul.getLoc(), matmul->getName());
+          state.addOperands(newInputs);
+          state.addOperands(ValueRange{newOutput});
+          state.addTypes(newOutput.getType());
+          state.addAttributes(matmul->getAttrs());
+
+          Operation *newOp = bodyBuilder.create(state);
+          mapping.map(matmul->getResult(0), newOp->getResult(0));
+          return success();
+        };
+
         auto cloneOp = [&](Operation &op,
                            OpBuilder &bodyBuilder) -> LogicalResult {
           if (auto empty = dyn_cast<tensor::EmptyOp>(op)) {
@@ -2628,6 +2712,9 @@ struct NSPLocalizePass
             }
           }
 
+          if (auto matmul = dyn_cast<mlir::linalg::MatmulOp>(op))
+            return cloneMatmul(matmul, bodyBuilder);
+
           if (auto generic = dyn_cast<mlir::linalg::GenericOp>(op))
             return cloneGeneric(generic, bodyBuilder);
 
@@ -2658,8 +2745,7 @@ struct NSPLocalizePass
             newFor.emitRemark()
                 << "NSPLocalize: failed to localize scf.for with tensor "
                    "iter_args; keeping original loop";
-            newFor.erase();
-            localizedScfForCache.erase(forOp.getOperation());
+            rollbackLocalizedLoop();
             return failure();
           }
         }
@@ -2671,8 +2757,7 @@ struct NSPLocalizePass
           Value mappedYield = lookupMappedOrSelf(yielded);
           if (localizeResult[idx] &&
               mappedYield.getType() != localResultTypes[idx]) {
-            newFor.erase();
-            localizedScfForCache.erase(forOp.getOperation());
+            rollbackLocalizedLoop();
             return failure();
           }
           newYieldOperands.push_back(mappedYield);
