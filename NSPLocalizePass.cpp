@@ -1590,6 +1590,7 @@ struct NSPLocalizePass
       };
 
       llvm::DenseMap<Operation *, mlir::scf::ForOp> localizedScfForCache;
+      llvm::SmallPtrSet<Operation *, 16> failedLocalizedScfForCache;
 
       std::function<LogicalResult(mlir::scf::ForOp,
                                   llvm::DenseMap<Value, Value> &)>
@@ -2228,6 +2229,9 @@ struct NSPLocalizePass
           return success();
         }
 
+        if (failedLocalizedScfForCache.contains(forOp.getOperation()))
+          return failure();
+
         constexpr int64_t loopSplitAxis = 0;
 
         auto getAxisLocalType = [&](RankedTensorType globalTy,
@@ -2312,7 +2316,7 @@ struct NSPLocalizePass
           if (!globalTy)
             return Value();
 
-         auto allSlice = mlir::shard::AllSliceOp::create(
+          auto allSlice = mlir::shard::AllSliceOp::create(
               preBuilder, v.getLoc(), /*result_type=*/localTy,
               /*input=*/v,
               /*grid=*/"nsp",
@@ -2348,6 +2352,7 @@ struct NSPLocalizePass
         auto rollbackLocalizedLoop = [&]() {
           newFor.erase();
           localizedScfForCache.erase(forOp.getOperation());
+          failedLocalizedScfForCache.insert(forOp.getOperation());
 
           // External all_slice values are speculative until the localized loop
           // body has been fully cloned. If cloning fails, erase them as well so
@@ -2408,12 +2413,15 @@ struct NSPLocalizePass
             if (!dimExpr || dimExpr.getPosition() != shardedLoopDim)
               continue;
 
-            // This first implementation only shards the row dimension of the
-            // carried state. Operands that reference the same loop dimension in
-            // another tensor dimension are left unsupported instead of being
-            // silently sharded along the wrong physical axis.
-            if (static_cast<int64_t>(operandDim) != loopSplitAxis)
+            // If this operand was already produced by an earlier localized op
+            // in the cloned loop, keep the mapped value. This covers cases
+            // where a transpose or other structured op moves the sharded loop
+            // dimension away from physical tensor dimension 0.
+            if (static_cast<int64_t>(operandDim) != loopSplitAxis) {
+              if (mapped.getType() != operand.getType())
+                return mapped;
               return Value();
+            }
 
             RankedTensorType localTy = getLoopRowLocalType(operandTy);
             if (!localTy)
@@ -2590,8 +2598,76 @@ struct NSPLocalizePass
           return success();
         };
 
+        auto cloneSingleResultNamedLinalg =
+            [&](mlir::linalg::LinalgOp linalgOp,
+                OpBuilder &bodyBuilder) -> LogicalResult {
+          Operation *oldOp = linalgOp.getOperation();
+          if (isa<mlir::linalg::GenericOp, mlir::linalg::ReduceOp,
+                  mlir::linalg::FillOp, mlir::linalg::TransposeOp>(oldOp))
+            return failure();
+
+          if (linalgOp.getNumDpsInits() != 1 || oldOp->getNumResults() != 1)
+            return failure();
+
+          auto maps = linalgOp.getIndexingMapsArray();
+          if (static_cast<int64_t>(maps.size()) !=
+              linalgOp.getNumDpsInputs() + linalgOp.getNumDpsInits())
+            return failure();
+
+          Value oldOutput = linalgOp.getDpsInitOperand(0)->get();
+          Value newOutput = lookupMappedOrSelf(oldOutput);
+
+          auto oldResultTy =
+              dyn_cast<RankedTensorType>(oldOp->getResult(0).getType());
+          if (oldResultTy) {
+            RankedTensorType localTy = getLoopRowLocalType(oldResultTy);
+            if (localTy && newOutput.getType() != localTy) {
+              newOutput = getOrCreateExternalLocal(oldOutput, localTy);
+              if (!newOutput)
+                return failure();
+            }
+          }
+
+          auto newOutputTy = dyn_cast<RankedTensorType>(newOutput.getType());
+          if (!oldResultTy || !newOutputTy || oldResultTy == newOutputTy) {
+            Operation *cloned = bodyBuilder.clone(*oldOp, mapping);
+            mapping.map(oldOp->getResult(0), cloned->getResult(0));
+            return success();
+          }
+
+          AffineMap outMap = maps[linalgOp.getNumDpsInputs()];
+          if (!outMap || outMap.getNumResults() <= loopSplitAxis)
+            return failure();
+
+          auto d0 = dyn_cast<AffineDimExpr>(outMap.getResult(loopSplitAxis));
+          if (!d0)
+            return failure();
+          int64_t shardedLoopDim = d0.getPosition();
+
+          SmallVector<Value> newInputs;
+          newInputs.reserve(linalgOp.getNumDpsInputs());
+          for (int64_t inIdx = 0; inIdx < linalgOp.getNumDpsInputs(); ++inIdx) {
+            Value oldInput = linalgOp.getDpsInputOperand(inIdx)->get();
+            Value newInput =
+                remapOperandForMap(oldInput, maps[inIdx], shardedLoopDim);
+            if (!newInput)
+              return failure();
+            newInputs.push_back(newInput);
+          }
+
+          OperationState state(oldOp->getLoc(), oldOp->getName());
+          state.addOperands(newInputs);
+          state.addOperands(ValueRange{newOutput});
+          state.addTypes(newOutput.getType());
+          state.addAttributes(oldOp->getAttrs());
+
+          Operation *newOp = bodyBuilder.create(state);
+          mapping.map(oldOp->getResult(0), newOp->getResult(0));
+          return success();
+        };
+
         auto cloneMatmul = [&](mlir::linalg::MatmulOp matmul,
-                                OpBuilder &bodyBuilder) -> LogicalResult {
+                               OpBuilder &bodyBuilder) -> LogicalResult {
           mlir::linalg::LinalgOp linalgOp(matmul.getOperation());
           if (linalgOp.getNumDpsInputs() != 2 ||
               linalgOp.getNumDpsInits() != 1 || matmul->getNumResults() != 1)
@@ -2633,8 +2709,7 @@ struct NSPLocalizePass
 
           SmallVector<Value> newInputs;
           newInputs.reserve(linalgOp.getNumDpsInputs());
-          for (int64_t inIdx = 0; inIdx < linalgOp.getNumDpsInputs();
-               ++inIdx) {
+          for (int64_t inIdx = 0; inIdx < linalgOp.getNumDpsInputs(); ++inIdx) {
             Value oldInput = linalgOp.getDpsInputOperand(inIdx)->get();
             Value newInput =
                 remapOperandForMap(oldInput, maps[inIdx], shardedLoopDim);
@@ -2721,6 +2796,9 @@ struct NSPLocalizePass
           if (auto reduce = dyn_cast<mlir::linalg::ReduceOp>(op))
             return cloneReduce(reduce, bodyBuilder);
 
+          if (auto linalgOp = dyn_cast<mlir::linalg::LinalgOp>(op))
+            return cloneSingleResultNamedLinalg(linalgOp, bodyBuilder);
+
           bool hasRowShardedTensorResult = false;
           for (Type t : op.getResultTypes()) {
             if (getLoopRowLocalType(dyn_cast<RankedTensorType>(t))) {
@@ -2742,6 +2820,10 @@ struct NSPLocalizePass
         for (Operation &op : oldBody->without_terminator()) {
           bodyBuilder.setInsertionPointToEnd(newBody);
           if (failed(cloneOp(op, bodyBuilder))) {
+            op.emitRemark()
+                << "NSPLocalize: failed to localize this op while cloning "
+                   "scf.for with tensor iter_args: "
+                << op.getName();
             newFor.emitRemark()
                 << "NSPLocalize: failed to localize scf.for with tensor "
                    "iter_args; keeping original loop";
