@@ -2773,18 +2773,59 @@ struct NSPLocalizePass
           }
 
           if (auto transpose = dyn_cast<mlir::linalg::TransposeOp>(op)) {
-            Value newInput = lookupMappedOrSelf(transpose.getInput());
-            Value newInit = lookupMappedOrSelf(transpose.getInit());
-            if (newInput.getType() != transpose.getInput().getType() ||
-                newInit.getType() != transpose.getInit().getType()) {
+            Value oldInput = transpose.getInput();
+            Value oldInit = transpose.getInit();
+            Value newInput = lookupMappedOrSelf(oldInput);
+            Value newInit = lookupMappedOrSelf(oldInit);
+
+            auto oldInputTy = dyn_cast<RankedTensorType>(oldInput.getType());
+            auto newInputTy = dyn_cast<RankedTensorType>(newInput.getType());
+            auto oldResultTy = dyn_cast<RankedTensorType>(
+                transpose->getResult(0).getType());
+
+            // If the input was localized by an earlier op in the cloned loop,
+            // rebuild the transpose result type by applying the original
+            // permutation to the localized input shape.
+            if (oldInputTy && newInputTy && oldResultTy &&
+                newInputTy != oldInputTy) {
+              auto permutation = transpose.getPermutation();
+              if ((int64_t)permutation.size() != newInputTy.getRank())
+                return failure();
+
+              SmallVector<int64_t> localResultShape;
+              localResultShape.reserve(newInputTy.getRank());
+              for (int64_t inputDim : permutation) {
+                if (inputDim < 0 || inputDim >= newInputTy.getRank())
+                  return failure();
+                int64_t extent = newInputTy.getDimSize(inputDim);
+                if (ShapedType::isDynamic(extent) || extent <= 0)
+                  return failure();
+                localResultShape.push_back(extent);
+              }
+
+              RankedTensorType localResultTy = RankedTensorType::get(
+                  localResultShape, oldResultTy.getElementType(),
+                  oldResultTy.getEncoding());
+
+              if (newInit.getType() != localResultTy) {
+                newInit = tensor::EmptyOp::create(
+                    bodyBuilder, transpose.getLoc(), localResultTy.getShape(),
+                    localResultTy.getElementType());
+              }
+
               auto newTranspose = mlir::linalg::TransposeOp::create(
                   bodyBuilder, transpose.getLoc(),
                   /*input=*/newInput,
                   /*init=*/newInit,
-                  /*permutation=*/transpose.getPermutation());
+                  /*permutation=*/permutation);
               mapping.map(transpose->getResult(0), newTranspose.getResult()[0]);
               return success();
             }
+
+            // Replicated transposes are still valid in a localized loop.
+            Operation *cloned = bodyBuilder.clone(op, mapping);
+            mapping.map(transpose->getResult(0), cloned->getResult(0));
+            return success();
           }
 
           if (auto matmul = dyn_cast<mlir::linalg::MatmulOp>(op))
