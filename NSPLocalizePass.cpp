@@ -2441,6 +2441,23 @@ struct NSPLocalizePass
           const int64_t numOutputs = generic.getNumDpsInits();
           auto maps = generic.getIndexingMapsArray();
 
+          auto isDpsInitBlockArgumentUsed =
+              [&](int64_t outIdx) -> std::optional<bool> {
+            if (outIdx < 0 || outIdx >= numOutputs)
+              return std::nullopt;
+
+            Region &region = generic.getRegion();
+            if (region.empty())
+              return std::nullopt;
+
+            Block &body = region.front();
+            int64_t argIdx = numInputs + outIdx;
+            if (argIdx < 0 || argIdx >= (int64_t)body.getNumArguments())
+              return std::nullopt;
+
+            return !body.getArgument(argIdx).use_empty();
+          };
+
           SmallVector<Value> newOutputs;
           newOutputs.reserve(numOutputs);
           bool hasLocalizedOutput = false;
@@ -2455,9 +2472,22 @@ struct NSPLocalizePass
             if (oldResultTy) {
               RankedTensorType localTy = getLoopRowLocalType(oldResultTy);
               if (localTy && newInit.getType() != localTy) {
-                newInit = getOrCreateExternalLocal(oldInit, localTy);
-                if (!newInit)
-                  return failure();
+                std::optional<bool> initArgUsed =
+                    isDpsInitBlockArgumentUsed(outIdx);
+                if (initArgUsed && !*initArgUsed) {
+                  // The DPS init is only used to provide the output tensor
+                  // shape/storage for this generic. In the localized loop,
+                  // creating a fresh local empty is both sufficient and safer
+                  // than slicing a global neutral tensor that does not carry
+                  // dataflow semantics for the body.
+                  newInit = tensor::EmptyOp::create(
+                      bodyBuilder, generic.getLoc(), localTy.getShape(),
+                      localTy.getElementType());
+                } else {
+                  newInit = getOrCreateExternalLocal(oldInit, localTy);
+                  if (!newInit)
+                    return failure();
+                }
               }
             }
 
