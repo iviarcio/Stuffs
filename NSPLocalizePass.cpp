@@ -2735,6 +2735,22 @@ struct NSPLocalizePass
 
         auto cloneOp = [&](Operation &op,
                            OpBuilder &bodyBuilder) -> LogicalResult {
+          // shard.shard is an annotation-only wrapper. When cloning a
+          // localized scf.for body, map its result directly to the
+          // already remapped source value.
+          // This is required when sharding propagation inserted wrappers
+          // around loop-carried tensors. Those wrappers still have the global
+          // tensor type in the original loop, while the localized loop carries
+          // the corresponding shard-local tensor type.
+          if (auto shardOp = dyn_cast<mlir::shard::ShardOp>(op)) {
+            if (shardOp->getNumOperands() < 1 || shardOp->getNumResults() != 1)
+              return failure();
+
+            Value mappedSrc = lookupMappedOrSelf(shardOp->getOperand(0));
+            mapping.map(shardOp->getResult(0), mappedSrc);
+            return success();
+          }
+
           if (auto empty = dyn_cast<tensor::EmptyOp>(op)) {
             auto oldTy = dyn_cast<RankedTensorType>(empty.getType());
             RankedTensorType localTy = getLoopRowLocalType(oldTy);
@@ -2780,8 +2796,8 @@ struct NSPLocalizePass
 
             auto oldInputTy = dyn_cast<RankedTensorType>(oldInput.getType());
             auto newInputTy = dyn_cast<RankedTensorType>(newInput.getType());
-            auto oldResultTy = dyn_cast<RankedTensorType>(
-                transpose->getResult(0).getType());
+            auto oldResultTy =
+                dyn_cast<RankedTensorType>(transpose->getResult(0).getType());
 
             // If the input was localized by an earlier op in the cloned loop,
             // rebuild the transpose result type by applying the original
