@@ -2299,6 +2299,8 @@ struct NSPLocalizePass
         OpBuilder preBuilder(forOp);
         Location loc = forOp.getLoc();
 
+        Operation *externalLocalInsertionAnchor = forOp.getOperation();
+
         SmallVector<Operation *> speculativeOps;
         llvm::DenseMap<Value, Value> externalLocalCache;
         auto getOrCreateExternalLocal = [&](Value v,
@@ -2316,6 +2318,9 @@ struct NSPLocalizePass
           if (!globalTy)
             return Value();
 
+          // External local values are used by the localized loop body, so
+          // insert them before the current localized loop anchor.
+          preBuilder.setInsertionPoint(externalLocalInsertionAnchor);
           auto allSlice = mlir::shard::AllSliceOp::create(
               preBuilder, v.getLoc(), /*result_type=*/localTy,
               /*input=*/v,
@@ -2348,6 +2353,10 @@ struct NSPLocalizePass
             forOp.getStep(), newInitArgs);
         newFor->setAttr("nsp.localized_loop", preBuilder.getUnitAttr());
         localizedScfForCache[forOp.getOperation()] = newFor;
+
+        // Late external locals may be discovered while cloning the loop
+        // body, so insert them before the localized clone.
+        externalLocalInsertionAnchor = newFor.getOperation();
 
         auto rollbackLocalizedLoop = [&]() {
           newFor.erase();
