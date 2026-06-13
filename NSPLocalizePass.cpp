@@ -2685,13 +2685,20 @@ struct NSPLocalizePass
             newInputs.push_back(newInput);
           }
 
-          OperationState state(oldOp->getLoc(), oldOp->getName());
-          state.addOperands(newInputs);
-          state.addOperands(ValueRange{newOutput});
-          state.addTypes(newOutput.getType());
-          state.addAttributes(oldOp->getAttrs());
+          // Clone the named linalg ops with a local operand mapping
+          // so the payload region is preserved, then retarget the single
+          // tensor result to the localized DPS output type.
+          IRMapping localMapping = mapping;
+          for (int64_t inIdx = 0; inIdx < linalgOp.getNumDpsInputs(); ++inIdx) {
+            Value oldInput = linalgOp.getDpsInputOperand(inIdx)->get();
+            localMapping.map(oldInput, newInputs[inIdx]);
+          }
+          localMapping.map(oldOutput, newOutput);
 
-          Operation *newOp = bodyBuilder.create(state);
+          Operation *newOp = bodyBuilder.clone(*oldOp, localMapping);
+          if (newOp->getNumResults() != 1)
+            return failure();
+          newOp->getResult(0).setType(newOutput.getType());
           mapping.map(oldOp->getResult(0), newOp->getResult(0));
           return success();
         };
@@ -2748,17 +2755,19 @@ struct NSPLocalizePass
             newInputs.push_back(newInput);
           }
 
-          // Named linalg ops such as linalg.matmul do not have a generic
-          // region to clone. Rebuild the same operation name with remapped
-          // DPS operands and local tensor result type. Copying the original
-          // attributes preserves segment sizes and any named-op attributes.
-          OperationState state(matmul.getLoc(), matmul->getName());
-          state.addOperands(newInputs);
-          state.addOperands(ValueRange{newOutput});
-          state.addTypes(newOutput.getType());
-          state.addAttributes(matmul->getAttrs());
+          // Clone the linalg.matmul op with remapped DPS operands, then
+          // update the single result type to the localized tensor type.
+          IRMapping localMapping = mapping;
+          for (int64_t inIdx = 0; inIdx < linalgOp.getNumDpsInputs(); ++inIdx) {
+            Value oldInput = linalgOp.getDpsInputOperand(inIdx)->get();
+            localMapping.map(oldInput, newInputs[inIdx]);
+          }
+          localMapping.map(oldOutput, newOutput);
 
-          Operation *newOp = bodyBuilder.create(state);
+          Operation *newOp = bodyBuilder.clone(*matmul, localMapping);
+          if (newOp->getNumResults() != 1)
+            return failure();
+          newOp->getResult(0).setType(newOutput.getType());
           mapping.map(matmul->getResult(0), newOp->getResult(0));
           return success();
         };
