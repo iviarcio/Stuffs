@@ -1,3 +1,59 @@
+No `flash_attention` o laço tem esta forma geral no dump:
+
+```mlir
+%7:5 = scf.for %arg10 = %c0_i32 to %c1024_i32 step %c16_i32
+    iter_args(%arg11 = %5, %arg12 = %2, %arg13 = %3,
+              %arg14 = %c0_i64, %arg15 = %c0_i64)
+    -> (tensor<32x64xf32>, tensor<32xf32>, tensor<32xf32>, i64, i64) {
+  ...
+  scf.yield %25, %20#1, %17, %27, %26
+}
+```
+
+A transformação para este padrão seria:
+
+```mlir
+// Antes:
+%7:5 = scf.for ... iter_args(
+  %arg11 = %5  : tensor<32x64xf32>, # acc
+  %arg12 = %2  : tensor<32xf32>,    # m
+  %arg13 = %3  : tensor<32xf32>,    # l
+  %arg14 = ... : i64,               # i0
+  %arg15 = ... : i64                # i1
+) -> (tensor<32x64xf32>, tensor<32xf32>, tensor<32xf32>, i64, i64)
+
+// Depois:
+%acc_local = shard.all_slice %5 ... : tensor<32x64xf32> -> tensor<1x64xf32>
+%m_local   = shard.all_slice %2 ... : tensor<32xf32>     -> tensor<1xf32>
+%l_local   = shard.all_slice %3 ... : tensor<32xf32>     -> tensor<1xf32>
+
+%7_local:5 = scf.for ... iter_args(
+  %arg11 = %acc_local : tensor<1x64xf32>,
+  %arg12 = %m_local   : tensor<1xf32>,
+  %arg13 = %l_local   : tensor<1xf32>,
+  %arg14 = i0         : i64,
+  %arg15 = i1         : i64
+) -> (tensor<1x64xf32>, tensor<1xf32>, tensor<1xf32>, i64, i64)
+```
+
+Dentro do loop, os intermediários também passam a ser locais:
+
+```text
+tensor<32x16xf32>  -> tensor<1x16xf32>
+tensor<32xf32>     -> tensor<1xf32>
+tensor<32x64xf32>  -> tensor<1x64xf32>
+```
+
+Estratégia pensada:
+
+1. Reconhecer `scf.for` com `iter_args` onde alguns resultados são ranked tensors com eixo 0 divisível por `numShards`.
+2. Criar versão local do tensor init args com `shard.all_slice`.
+3. Criar novo `scf.for` com os mesmos `lb`, `ub` e `step`.
+4. Trocar o tensor block args global por block args local.
+5. Recriar os ops dentro do corpo: `tensor.empty`, `linalg.fill`, `linalg.generic`, `linalg.reduce`, `linalg.transpose`, `arith`, `memref.reinterpret_cast`, `bufferization.to_tensor`.
+6. Fazer o `scf.yield` retornar tensores locais e escalares inalterados.
+7. Substituir os usos externos dos resultados antigos pelos resultados locais do novo loop.
+
 [Hexagon][NSP] Localize scf.for tensor iter_args on demand
 
 Teach `NSPLocalizePass` to materialize shard-local versions of
