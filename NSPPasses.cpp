@@ -50,12 +50,12 @@ namespace hexagon {
 
 std::unique_ptr<Pass> createNSPShardPlannerPass();
 std::unique_ptr<Pass> createNSPShardPlannerPass(int64_t nspCount,
-                                                bool allowCollectives);
+                                                bool shardingAllowCollectives);
 
 std::unique_ptr<Pass> createNSPShardingPropagationPass();
 
 std::unique_ptr<Pass> createNSPLocalizePass();
-std::unique_ptr<Pass> createNSPLocalizePass(bool allowCollectives);
+std::unique_ptr<Pass> createNSPLocalizePass(bool shardingAllowCollectives);
 
 std::unique_ptr<Pass> createNSPMaterializePass();
 
@@ -70,8 +70,12 @@ using namespace hexagon;
 
 namespace {
 
-// Pipeline options:
-//   -nsp-shard="nsp-count=16 allow-collectives"
+//===----------------------------------------------------------------------===//
+// Pipeline options (exposed as command-line flags).
+//
+// Usage:
+//   --pass-pipeline="nsp-shard(nsp-count=32 propagate=true allow-collectives)"
+//===----------------------------------------------------------------------===//
 struct NSPShardPipelineOptions
     : public PassPipelineOptions<NSPShardPipelineOptions> {
   Option<int64_t> nspCount{*this, "nsp-count",
@@ -95,23 +99,31 @@ struct NSPShardPipelineOptions
       llvm::cl::init(true)};
 };
 
-/// Build the canonical NSP shard pipeline. At high-level:
-///  1. Planner: attach shard annotations (device mesh + tensor layout).
-///  2. Propagation: infer missing shardings using ShardingInterface.
-///  3. Localization: rewrite supported shard-annotated compute into
-///     per-NSP local tensor compute while preserving pure tensor semantics.
-///  4. Materialization: connect localized results to destination buffers
-///     using explicit per-NSP subviews / store-by-tile rewrites.
-///  5. Cleanup: canonicalize/CSE.
-///
-/// Note:
-///   The split between localization and materialization is intentional:
-///   tiling/vectorization may run in between these two passes, while the IR
-///   still has pure tensor semantics after localization.
+//===--------------------------------------------------------------------===//
+// Pipeline construction.
+//
+// The pipeline transforms linalg-on-tensor IR into partitioned SPMD code:
+//
+//   Input:   linalg.generic (tensor semantics, single-core)
+//   Output:  per-participant local compute + memref.subview destination writes
+//
+// The split between localization (step 3) and materialization (step 4) is
+// intentional: downstream tiling/vectorization runs between them while the IR
+// still has pure tensor semantics.
+//
+//  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌───────────────┐
+//  │ 1. Planner   │-->│ 2. Propagate │-->│ 3. Localize  │-->│ 4.Materialize │
+//  └──────────────┘   └──────────────┘   └──────────────┘   └───────────────┘
+//         │                 │                  │                  │
+//  shard.grid/shard   infer missing      local tensor +     memref.subview
+//  annotations        shardings          nsp.materialize_   writes
+//                                        tile
+//===--------------------------------------------------------------------===//
 static void buildNSPShardPipeline(OpPassManager &pm,
                                   const NSPShardPipelineOptions &opts) {
 
-  // 1. Planner (NSPShardPlannerPass in NSPShardPlanner.cpp. Runs on func.func)
+  // Step 1: Planner - attach shard annotations to linalg.generic ops.
+  // Runs on func.func (analyzes per-function).
   pm.addNestedPass<func::FuncOp>(
       createNSPShardPlannerPass(opts.nspCount, opts.allowCollectives));
   if (opts.canonicalize) {
@@ -119,9 +131,10 @@ static void buildNSPShardPipeline(OpPassManager &pm,
     pm.addPass(createCSEPass());
   }
 
-  // 2. NSPSharding propagation (forked from Shard dialect. Runs on func.func)
-  // This pass relies on shard::ShardingInterface models for ops in the graph.
-  // NSPShardInterfaceModels.cpp attaches missing models.
+  // Step 2: Propagation - infer shardings for unannotated operands by
+  // traversing the dataflow graph (backward then forward). Relies on
+  // ShardingInterface external models registered by
+  // registerNSPShardInterfaceModels().
   if (opts.runPropagation) {
     pm.addNestedPass<func::FuncOp>(createNSPShardingPropagationPass());
   }
@@ -130,11 +143,12 @@ static void buildNSPShardPipeline(OpPassManager &pm,
     pm.addPass(createCSEPass());
   }
 
-  // 3. Localization
-  // - rewrite supported shard-annotated compute into per-NSP local tensor
-  //   compute
-  // - preserve pure tensor semantics so downstream tiling/vectorization can
-  //   still match linalg ops.
+  // Step 3: Localization - rewrite sharded compute into per-participant
+  // local tensor ops. Emits nsp.materialize_tile as a hand-off to step 4.
+  // In non-collective mode, also distributes scf.for loops cyclically.
+  //
+  // After this point the IR still has tensor semantics, so tiling and
+  // vectorization passes can be inserted here before materialization.
   pm.addPass(createNSPLocalizePass(opts.allowCollectives));
 
   // Optional cleanup boundary before downstream tiling/vectorization
@@ -143,14 +157,9 @@ static void buildNSPShardPipeline(OpPassManager &pm,
     pm.addPass(createCSEPass());
   }
 
-  // NOTE:
-  // Hexagon tiling/vectorization may be inserted here in a real pipeline
-  // stage, between NSP localization and NSP Materialization.
-
-  // 4. Materialization
-  // - reconnect localized results to destination buffers,
-  // - compute per-NSP offsets via shard.process_linear_index,
-  // - rewrite sinks into explicit subviews / store-by-tile forms.
+  // Step 4: Materialization - lower nsp.materialize_tile into explicit
+  // per-participant memref.subview stores. After this pass, the NSP
+  // dialect ops are fully consumed.
   pm.addPass(createNSPMaterializePass());
 
   // 5. Cleanup
@@ -158,7 +167,6 @@ static void buildNSPShardPipeline(OpPassManager &pm,
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
   }
-
 }
 
 } // namespace
@@ -170,17 +178,16 @@ static void buildNSPShardPipeline(OpPassManager &pm,
 namespace mlir {
 namespace hexagon {
 
-/// Register NSP passes (so tools can do: -nsp-shard-planner -nsp-spmdize ...).
-///
-/// In the future we'll using TableGen, i.e., auto-generate these via
-/// Passes.td and call registerNSPPasses() from that generated file.
-/// For now, we use an explicit style that works well for tests.
+/// Register individual NSP passes for standalone use (e.g. in lit tests):
+///    -nsp-shard-planner
+///    -nsp-sharding-propagation
+///    -nsp-localize
+///    -nsp-materialize
 void registerNSPPasses() {
   // The lambda form avoids needing the pass type visible here.
   registerPass(
       []() -> std::unique_ptr<Pass> { return createNSPShardPlannerPass(); });
-  registerPass(
-      []() -> std::unique_ptr<Pass> {
+  registerPass([]() -> std::unique_ptr<Pass> {
     return createNSPShardingPropagationPass();
   });
   registerPass(
@@ -193,7 +200,8 @@ void registerNSPPasses() {
 void registerNSPPipelines() {
   PassPipelineRegistration<NSPShardPipelineOptions>(
       "nsp-shard",
-      "NSP pipeline: shard planning -> Propagation -> Localization -> Materialization",
+      "NSP pipeline: shard planning -> Propagation -> Localization -> "
+      "Materialization",
       buildNSPShardPipeline);
 }
 
