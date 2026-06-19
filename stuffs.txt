@@ -1,3 +1,15 @@
+#include "mlir/Dialect/Shard/Interfaces/ShardingInterface.h"
+
+// Temporary debug probe. Remove after diagnosing the registration source.
+func.walk([&](bufferization::MaterializeInDestinationOp op) {
+  bool hasInterface =
+      llvm::isa<mlir::shard::ShardingInterface>(op.getOperation());
+
+  op.emitRemark()
+      << "bufferization.materialize_in_destination has ShardingInterface = "
+      << hasInterface;
+});
+
 [Hexagon][NSP] Localize scf.for tensor iter_args on demand
 
 Teach `NSPLocalizePass` to materialize shard-local versions of
