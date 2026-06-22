@@ -379,6 +379,266 @@ static void warnIfNoShardingDescriptors(ModuleOp module) {
 }
 
 //===----------------------------------------------------------------------===//
+// Loop distribution helpers.
+//===----------------------------------------------------------------------===//
+
+/// Strip shard tensor annotations inside loops that were explicitly
+/// distributed by this pass.
+///
+/// In non-collective mode, the SPMD partitioning is expressed by the loop
+/// schedule. Any shard.shard/shard.sharding inside such loops becomes stale
+/// metadata and may confuse later lowerings. Keep shard.grid and
+/// shard.process_linear_index, and do not touch annotations outside
+/// distributed loops.
+static void stripShardAnnotationsInDistributedLoops(mlir::func::FuncOp func) {
+  SmallVector<Operation *> eraseList;
+
+  func.walk([&](mlir::scf::ForOp forOp) {
+    if (!isNspDistributedLoop(forOp))
+      return;
+
+    Block *body = forOp.getBody();
+
+    body->walk([&](mlir::shard::ShardOp op) {
+      if (op->getNumOperands() < 1 || op->getNumResults() < 1)
+        return;
+      Value wrapped = op->getOperand(0);
+      Value res = op->getResult(0);
+      res.replaceAllUsesWith(wrapped);
+      eraseList.push_back(op);
+    });
+
+    body->walk([&](mlir::shard::ShardingOp op) {
+      if (op->getNumResults() != 1)
+        return;
+      if (op->getResult(0).use_empty())
+        eraseList.push_back(op);
+    });
+  });
+
+  for (Operation *op : eraseList)
+    op->erase();
+}
+
+/// Return true iff `v` is derived from `iv` through a restricted set of
+/// affine-like integer/index ops.
+///
+/// This conservative taint analysis is used to detect whether a loop induction
+/// variable participates in output addressing.
+static bool reachesFromIv(Value iv, Value v) {
+  if (v == iv)
+    return true;
+
+  SmallVector<Value, 16> worklist;
+  llvm::SmallPtrSet<Value, 32> visited;
+  worklist.push_back(v);
+
+  auto enqueue = [&](Value x) {
+    if (!x)
+      return;
+    if (visited.insert(x).second)
+      worklist.push_back(x);
+  };
+
+  while (!worklist.empty()) {
+    Value cur = worklist.pop_back_val();
+    if (cur == iv)
+      return true;
+
+    Operation *def = cur.getDefiningOp();
+    if (!def)
+      continue;
+
+    // Allow common integer/index plumbing ops. This intentionally ignores
+    // complex control/dataflow.
+    if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
+            arith::DivUIOp, arith::RemSIOp, arith::RemUIOp, arith::ShLIOp,
+            arith::ShRSIOp, arith::ShRUIOp, arith::AndIOp, arith::OrIOp,
+            arith::XOrIOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
+            arith::IndexCastOp, arith::IndexCastUIOp, arith::ConstantOp>(def)) {
+      for (Value opnd : def->getOperands())
+        enqueue(opnd);
+      continue;
+    }
+
+    // Allow memref.cast / view-like ops in the index path.
+    if (isa<memref::CastOp>(def)) {
+      for (Value opnd : def->getOperands())
+        enqueue(opnd);
+      continue;
+    }
+  }
+
+  return false;
+}
+
+static bool ofrReachesFromIv(Value iv, OpFoldResult ofr) {
+  if (auto v = dyn_cast<Value>(ofr))
+    return reachesFromIv(iv, v);
+  return false;
+}
+
+/// Return true iff the loop appears to perform per-iteration output writes
+/// whose address depends on the IV, i.e. a DOALL-style tiled store.
+static bool shouldDistributeLoop(mlir::scf::ForOp forOp) {
+  if (isNspDistributedLoop(forOp) ||
+      hasNspDistributedLoopAncestor(forOp.getOperation()))
+    return false;
+
+  Value iv = forOp.getInductionVar();
+  bool foundIvIndexedStore = false;
+
+  // Direct memref.store with IV-derived indices.
+  forOp.walk([&](memref::StoreOp st) {
+    for (Value idx : st.getIndices()) {
+      if (reachesFromIv(iv, idx)) {
+        foundIvIndexedStore = true;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (foundIvIndexedStore)
+    return true;
+
+  // Direct affine.store with IV-derived map operands. LayerNorm-like kernels
+  // commonly store per-row side results such as mean/rstd this way.
+  forOp.walk([&](affine::AffineStoreOp st) {
+    for (Value idx : st.getMapOperands()) {
+      if (reachesFromIv(iv, idx)) {
+        foundIvIndexedStore = true;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (foundIvIndexedStore)
+    return true;
+
+  // bufferization.materialize_in_destination where dest is a view into the
+  // output buffer whose dynamic offset is derived from the IV.
+  forOp.walk([&](bufferization::MaterializeInDestinationOp mat) {
+    Value dest = mat->getOperand(1);
+
+    while (auto c = dest.getDefiningOp<memref::CastOp>())
+      dest = c.getSource();
+
+    if (auto sub = dest.getDefiningOp<memref::SubViewOp>()) {
+      for (OpFoldResult ofr : sub.getMixedOffsets()) {
+        if (ofrReachesFromIv(iv, ofr)) {
+          foundIvIndexedStore = true;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    }
+
+    if (auto rc = dest.getDefiningOp<memref::ReinterpretCastOp>()) {
+      // Operands: source, offset, sizes..., strides... Conservatively check
+      // all dynamic operands except the source.
+      for (unsigned oi = 1, oe = rc->getNumOperands(); oi < oe; ++oi) {
+        if (reachesFromIv(iv, rc->getOperand(oi))) {
+          foundIvIndexedStore = true;
+          return WalkResult::interrupt();
+        }
+      }
+    }
+
+    return WalkResult::advance();
+  });
+
+  return foundIvIndexedStore;
+}
+
+/// Cyclically distribute DOALL scf.for loops in `func` across the NSP grid.
+///
+/// For kernels with DOALL loops, sharding the reduced dimension requires
+/// cross-shard reductions. In non-collective mode, the correct strategy is to
+/// distribute an outer loop across NSPs and keep inner vectors intact:
+///   original: for i = lb .. ub step s
+///   shard k : for i = lb + k*s .. ub step (s*numShards)
+static LogicalResult distributeScfForCyclic(mlir::func::FuncOp func,
+                                            mlir::shard::GridOp grid,
+                                            int64_t numShards) {
+  OpBuilder b(func.getContext());
+  SmallVector<mlir::scf::ForOp> loops;
+  func.walk([&](mlir::scf::ForOp forOp) { loops.push_back(forOp); });
+
+  for (mlir::scf::ForOp forOp : loops) {
+    // Bring-up constraints:
+    //  - no iter_args / no results
+    //  - induction var is index or an integer type with sufficient range
+    if (!forOp.getResults().empty() || !forOp.getInitArgs().empty())
+      continue;
+
+    if (!shouldDistributeLoop(forOp))
+      continue;
+
+    Type ivTy = forOp.getInductionVar().getType();
+    bool ivIsIndex = isa<IndexType>(ivTy);
+    auto ivIntTy = dyn_cast<IntegerType>(ivTy);
+
+    if (!ivIsIndex && !ivIntTy)
+      continue;
+
+    if (ivIntTy && ivIntTy.getWidth() < 32) {
+      forOp.emitRemark() << "NSPLocalize: skipping scf.for distribution for "
+                            "small integer IV type "
+                         << ivTy;
+      continue;
+    }
+
+    Value lb = forOp.getLowerBound();
+    Value ub = forOp.getUpperBound();
+    Value step = forOp.getStep();
+
+    // Require bounds/step to match the IV type to keep the transformation
+    // simple.
+    if (lb.getType() != ivTy || ub.getType() != ivTy || step.getType() != ivTy)
+      continue;
+
+    Location loc = forOp.getLoc();
+    b.setInsertionPoint(forOp);
+
+    Value procIdx = mlir::shard::ProcessLinearIndexOp::create(b, loc, grid);
+    Value procInIvTy = procIdx;
+    if (!ivIsIndex)
+      procInIvTy = arith::IndexCastOp::create(b, loc, ivTy, procIdx);
+
+    Value offset = arith::MulIOp::create(b, loc, procInIvTy, step);
+    Value newLb = arith::AddIOp::create(b, loc, lb, offset);
+
+    Value cNum = ivIsIndex ? static_cast<Value>(arith::ConstantIndexOp::create(
+                                 b, loc, numShards))
+                           : static_cast<Value>(arith::ConstantIntOp::create(
+                                 b, loc, numShards, ivIntTy.getWidth()));
+
+    Value newStep = arith::MulIOp::create(b, loc, step, cNum);
+
+    auto newFor = mlir::scf::ForOp::create(b, loc, newLb, ub, newStep);
+    newFor->setAttr("nsp.distribution", b.getStringAttr("cyclic"));
+
+    Block *oldBody = forOp.getBody();
+    Block *newBody = newFor.getBody();
+    newBody->getOperations().clear();
+
+    IRMapping mapping;
+    mapping.map(forOp.getInductionVar(), newFor.getInductionVar());
+
+    for (Operation &op : oldBody->without_terminator()) {
+      b.setInsertionPointToEnd(newBody);
+      b.clone(op, mapping);
+    }
+    b.setInsertionPointToEnd(newBody);
+    mlir::scf::YieldOp::create(b, loc);
+
+    forOp.erase();
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // NSP localization pass.
 //===----------------------------------------------------------------------===//
 struct NSPLocalizePass
@@ -428,322 +688,17 @@ struct NSPLocalizePass
     mlir::shard::GridOp grid = gridInfo->grid;
     const int64_t numShards = gridInfo->numShards;
 
-    // Helper for strip shard tensor annotations inside loops that were
-    // explicitly distributed by this pass.
-    //
-    // Rationale:
-    // In non-collective mode, the SPMD partitioning is expressed by the loop
-    // schedule (lb/step adjusted using shard.process_linear_index). Any
-    // shard.shard/shard.sharding inside such loops becomes stale metadata and
-    // may confuse later lowerings (e.g., ShardToLLVM).
-    //
-    // We keep shard.grid and shard.process_linear_index, and we do NOT touch
-    // shard annotations outside distributed loops.
-    auto stripShardAnnotationsInDistributedLoops =
-        [&](mlir::func::FuncOp func) {
-          SmallVector<Operation *> eraseList;
-
-          func.walk([&](mlir::scf::ForOp forOp) {
-            if (!isNspDistributedLoop(forOp))
-              return;
-
-            Block *body = forOp.getBody();
-
-            // Replace and erase shard.shard wrappers inside the loop body.
-            body->walk([&](mlir::shard::ShardOp op) {
-              // shard.shard is a value wrapper: replace result with input.
-              if (op->getNumOperands() < 1 || op->getNumResults() < 1)
-                return;
-              Value wrapped = op->getOperand(0);
-              Value res = op->getResult(0);
-              res.replaceAllUsesWith(wrapped);
-              eraseList.push_back(op);
-            });
-
-            // Erase shard.sharding descriptors inside the loop body if
-            // unused. These usually become dead after removing shard.shard
-            // wrappers.
-            body->walk([&](mlir::shard::ShardingOp op) {
-              if (op->getNumResults() != 1)
-                return;
-              if (op->getResult(0).use_empty())
-                eraseList.push_back(op);
-            });
-          });
-
-          for (Operation *op : eraseList)
-            op->erase();
-        };
-
-    // Helper for Loop distribution (no collectives).
-    //
-    // For kernels with DOALL loops, sharding the reduced dimension requires
-    // cross-shard reductions. In non-collective mode, the correct strategy is
-    // to distribute the OUTER loop (e.g. batch) across NSPs and keep inner
-    // vectors intact.
-    //
-    // We implement a simple cyclic distribution (block dist is a future work):
-    //   original: for i = lb .. ub step s
-    //   shard k : for i = lb + k*s .. ub step (s*numShards)
-    //
-    // This avoids any communication and preserves semantics for reductions
-    // within the loop body.
-
-    auto distributeScfForCyclic =
-        [&](mlir::func::FuncOp func) -> LogicalResult {
-      OpBuilder b(func.getContext());
-      SmallVector<mlir::scf::ForOp> loops;
-      func.walk([&](mlir::scf::ForOp forOp) { loops.push_back(forOp); });
-
-      // Returns true iff `v` is derived from `iv` via a restricted set of
-      // affine-like integer/index ops. This is a conservative "taint" analysis
-      // used to detect whether the loop IV participates in output indexing.
-      auto reachesFromIv = [&](Value iv, Value v) -> bool {
-        if (v == iv)
-          return true;
-
-        // BFS over the def-use chain backwards (operand -> defining op -> its
-        // operands).
-        llvm::SmallVector<Value, 16> worklist;
-        llvm::SmallPtrSet<Value, 32> visited;
-        worklist.push_back(v);
-
-        auto enqueue = [&](Value x) {
-          if (!x)
-            return;
-          if (visited.insert(x).second)
-            worklist.push_back(x);
-        };
-
-        while (!worklist.empty()) {
-          Value cur = worklist.pop_back_val();
-          if (cur == iv)
-            return true;
-
-          Operation *def = cur.getDefiningOp();
-          if (!def)
-            continue;
-
-          // Allow common integer/index plumbing ops.
-          // This intentionally ignores complex control/dataflow.
-          if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
-                  arith::DivUIOp, arith::RemSIOp, arith::RemUIOp, arith::ShLIOp,
-                  arith::ShRSIOp, arith::ShRUIOp, arith::AndIOp, arith::OrIOp,
-                  arith::XOrIOp, arith::ExtSIOp, arith::ExtUIOp,
-                  arith::TruncIOp, arith::IndexCastOp, arith::IndexCastUIOp,
-                  arith::ConstantOp>(def)) {
-            for (Value opnd : def->getOperands())
-              enqueue(opnd);
-            continue;
-          }
-
-          // Allow memref.cast / view-like ops in the index path.
-          if (isa<memref::CastOp>(def)) {
-            for (Value opnd : def->getOperands())
-              enqueue(opnd);
-            continue;
-          }
-        }
-
-        return false;
-      };
-
-      auto ofrReachesFromIv = [&](Value iv, OpFoldResult ofr) -> bool {
-        if (auto v = dyn_cast<Value>(ofr))
-          return reachesFromIv(iv, v);
-        return false;
-      };
-
-      // Returns true iff the loop appears to perform per-iteration output
-      // writes whose address depends on the IV, i.e. a DOALL-style tiled store.
-      auto shouldDistributeLoop = [&](mlir::scf::ForOp forOp) -> bool {
-        if (isNspDistributedLoop(forOp) ||
-            hasNspDistributedLoopAncestor(forOp.getOperation()))
-          return false;
-
-        Value iv = forOp.getInductionVar();
-
-        bool foundIvIndexedStore = false;
-
-        // Direct memref.store with IV-derived indices.
-        forOp.walk([&](memref::StoreOp st) {
-          for (Value idx : st.getIndices()) {
-            if (reachesFromIv(iv, idx)) {
-              foundIvIndexedStore = true;
-              return WalkResult::interrupt();
-            }
-          }
-          return WalkResult::advance();
-        });
-        if (foundIvIndexedStore)
-          return true;
-
-        // Direct affine.store with IV-derived map operands. LayerNorm-like
-        // kernels commonly store per-row side results such as mean/rstd this
-        // way. These stores are safe for outer-loop distribution when their
-        // address depends on the distributed IV.
-        forOp.walk([&](affine::AffineStoreOp st) {
-          for (Value idx : st.getMapOperands()) {
-            if (reachesFromIv(iv, idx)) {
-              foundIvIndexedStore = true;
-              return WalkResult::interrupt();
-            }
-          }
-          return WalkResult::advance();
-        });
-        if (foundIvIndexedStore)
-          return true;
-
-        // bufferization.materialize_in_destination where dest is a view into
-        // the output buffer whose dynamic offset is derived from the IV. This
-        // matches patterns like:
-        //   %sv = memref.subview %dst[%off] ...
-        //   bufferization.materialize_in_destination %t, %sv
-        // as well as:
-        //   %rc = memref.reinterpret_cast %dst to offset: [%off], sizes: [...]
-        //   bufferization.materialize_in_destination %t, %rc
-        forOp.walk([&](bufferization::MaterializeInDestinationOp mat) {
-          Value dest = mat->getOperand(1);
-
-          // Strip trivial casts.
-          while (auto c = dest.getDefiningOp<memref::CastOp>())
-            dest = c.getSource();
-
-          // Case 1: memref.subview with dynamic offsets.
-          if (auto sub = dest.getDefiningOp<memref::SubViewOp>()) {
-            for (OpFoldResult ofr : sub.getMixedOffsets()) {
-              if (ofrReachesFromIv(iv, ofr)) {
-                foundIvIndexedStore = true;
-                return WalkResult::interrupt();
-              }
-            }
-            return WalkResult::advance();
-          }
-
-          // Case 2: memref.reinterpret_cast with dynamic offset/sizes/strides.
-          if (auto rc = dest.getDefiningOp<memref::ReinterpretCastOp>()) {
-            // Operands: source, offset, sizes..., strides...
-            // Conservatively check all dynamic operands except the source.
-            for (unsigned oi = 1, oe = rc->getNumOperands(); oi < oe; ++oi) {
-              if (reachesFromIv(iv, rc->getOperand(oi))) {
-                foundIvIndexedStore = true;
-                return WalkResult::interrupt();
-              }
-            }
-          }
-
-          return WalkResult::advance();
-        });
-
-        return foundIvIndexedStore;
-      };
-
-      for (mlir::scf::ForOp forOp : loops) {
-        // Bring-up constraints:
-        //  - no iter_args / no results
-        //  - induction var is index or an integer type with sufficient range
-        if (!forOp.getResults().empty() || !forOp.getInitArgs().empty())
-          continue;
-
-        // Only distribute loops that look DOALL and "tile-store" safe:
-        // the IV must participate in the output addressing (store/subview
-        // offset).
-        if (!shouldDistributeLoop(forOp))
-          continue;
-
-        mlir::Type ivTy = forOp.getInductionVar().getType();
-        bool ivIsIndex = mlir::isa<mlir::IndexType>(ivTy);
-        auto ivIntTy = mlir::dyn_cast<mlir::IntegerType>(ivTy);
-
-        if (!ivIsIndex && !ivIntTy)
-          continue;
-
-        if (ivIntTy && ivIntTy.getWidth() < 32) {
-          // Avoid silent overflow for small index types (e.g., i16).
-          forOp.emitRemark()
-              << "NSPLocalize: skipping scf.for distribution for "
-                 "small integer IV type "
-              << ivTy;
-          continue;
-        }
-
-        Value lb = forOp.getLowerBound();
-        Value ub = forOp.getUpperBound();
-        Value step = forOp.getStep();
-
-        // Require bounds/step to match the IV type to keep the transformation
-        // simple.
-        if (lb.getType() != ivTy || ub.getType() != ivTy ||
-            step.getType() != ivTy)
-          continue;
-
-        Location loc = forOp.getLoc();
-        b.setInsertionPoint(forOp);
-
-        // procIdx: index in [0, numShards)
-        Value procIdx = mlir::shard::ProcessLinearIndexOp::create(b, loc, grid);
-        // Cast procIdx to the IV type (index stays index; integer gets
-        // index_cast).
-        Value procInIvTy = procIdx;
-        if (!ivIsIndex)
-          procInIvTy = arith::IndexCastOp::create(b, loc, ivTy, procIdx);
-
-        // newLb = lb + procI32 * step
-        Value offset = arith::MulIOp::create(b, loc, procInIvTy, step);
-        Value newLb = arith::AddIOp::create(b, loc, lb, offset);
-
-        // newStep = step * numShards
-        Value cNum =
-            ivIsIndex ? static_cast<Value>(
-                            arith::ConstantIndexOp::create(b, loc, numShards))
-                      : static_cast<Value>(arith::ConstantIntOp::create(
-                            b, loc, numShards, ivIntTy.getWidth()));
-
-        Value newStep = arith::MulIOp::create(b, loc, step, cNum);
-
-        // Create the distributed loop.
-        auto newFor = mlir::scf::ForOp::create(b, loc, newLb, ub, newStep);
-        // Mark this loop so we can precisely clean up stale shard annotations
-        // only within distributed loops (non-collective mode).
-        newFor->setAttr("nsp.distribution", b.getStringAttr("cyclic"));
-
-        // Clone the body operations, remapping the induction variable.
-        Block *oldBody = forOp.getBody();
-        Block *newBody = newFor.getBody();
-
-        // Remove the default terminator inserted by builder.
-        newBody->getOperations().clear();
-
-        IRMapping mapping;
-        mapping.map(forOp.getInductionVar(), newFor.getInductionVar());
-
-        for (Operation &op : oldBody->without_terminator()) {
-          b.setInsertionPointToEnd(newBody);
-          b.clone(op, mapping);
-        }
-        b.setInsertionPointToEnd(newBody);
-        mlir::scf::YieldOp::create(b, loc);
-
-        // Replace uses of the old loop results (none here) and erase old loop.
-        forOp.erase();
-      }
-      return success();
-    };
-
     if (!allowCollectives) {
-      // In non-collective mode, prioritize loop distribution. This is the
-      // required strategy for patterns with intra-tile reductions (e.g.
-      // softmax).
+      bool failedDistribution = false;
       module.walk([&](mlir::func::FuncOp func) {
-        if (failed(distributeScfForCyclic(func))) {
-          signalPassFailure();
-          return;
-        }
+        if (failed(distributeScfForCyclic(func, grid, numShards)))
+          failedDistribution = true;
       });
+      if (failedDistribution) {
+        signalPassFailure();
+        return;
+      }
 
-      // After distribution, strip shard tensor annotations only inside
-      // distributed loops. Outside those loops, sharding metadata (if any)
-      // is preserved.
       module.walk([&](mlir::func::FuncOp func) {
         stripShardAnnotationsInDistributedLoops(func);
       });
