@@ -294,6 +294,91 @@ static void stripShardAnnotationWrappers(ModuleOp module) {
 }
 
 //===----------------------------------------------------------------------===//
+// Pass setup helpers.
+//===----------------------------------------------------------------------===//
+
+struct NspGridInfo {
+  mlir::shard::GridOp grid;
+  int64_t numShards = 0;
+};
+
+static void loadRequiredDialects(MLIRContext &ctx) {
+  ctx.getOrLoadDialect<mlir::shard::ShardDialect>();
+  ctx.getOrLoadDialect<mlir::affine::AffineDialect>();
+  ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+  ctx.getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
+  ctx.getOrLoadDialect<mlir::func::FuncDialect>();
+  ctx.getOrLoadDialect<mlir::linalg::LinalgDialect>();
+  ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
+  ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+  ctx.getOrLoadDialect<mlir::tensor::TensorDialect>();
+  ctx.getOrLoadDialect<mlir::hexagon::nsp::NSPDialect>();
+}
+
+static FailureOr<NspGridInfo> lookupNspGridInfo(ModuleOp module) {
+  // Validate that the expected grid symbol exists. The planner currently
+  // creates shard.grid @nsp.
+  auto grid = module.lookupSymbol<mlir::shard::GridOp>("nsp");
+  if (!grid) {
+    module.emitError()
+        << "NSPLocalizePass expected a 'shard.grid' symbol named '@nsp' "
+           "in the module, but none was found. "
+           "Ensure NSP shard planning ran and created the grid.";
+    return failure();
+  }
+
+  // Read grid shape (assume 1D grid for now).
+  auto shape = grid.getShape();
+  if (shape.empty()) {
+    module.emitError() << "shard.grid '@nsp' has an empty shape";
+    return failure();
+  }
+
+  const int64_t numShards = shape.front();
+  if (numShards <= 0) {
+    module.emitError() << "invalid shard grid size (shape[0]) = " << numShards;
+    return failure();
+  }
+
+  return NspGridInfo{grid, numShards};
+}
+
+static bool isNspDistributedLoop(mlir::scf::ForOp forOp) {
+  return forOp && (forOp->hasAttr("nsp.distributed") ||
+                   forOp->hasAttr("nsp.distribution"));
+}
+
+static bool hasNspDistributedLoopAncestor(Operation *op) {
+  constexpr unsigned maxDepth = 100; // Reasonable nesting limit.
+  unsigned depth = 0;
+  for (Operation *parent = op ? op->getParentOp() : nullptr; parent;
+       parent = parent->getParentOp()) {
+    if (++depth > maxDepth) {
+      op->emitWarning() << "NSPLocalize: excessive nesting depth while "
+                           "checking for distributed loop ancestor";
+      return false;
+    }
+    if (auto parentFor = dyn_cast<mlir::scf::ForOp>(parent))
+      if (isNspDistributedLoop(parentFor))
+        return true;
+  }
+  return false;
+}
+
+static void warnIfNoShardingDescriptors(ModuleOp module) {
+  int64_t numShardingOps = 0;
+  module.walk([&](mlir::shard::ShardingOp op) { ++numShardingOps; });
+
+  if (numShardingOps == 0) {
+    module.emitWarning()
+        << "NSPLocalizePass found shard.grid '@nsp' but no 'shard.sharding' "
+           "ops in the module. This may be expected during early bring-up, "
+           "but if it is unexpected, ensure sharding propagation created "
+           "sharding descriptors.";
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // NSP localization pass.
 //===----------------------------------------------------------------------===//
 struct NSPLocalizePass
@@ -330,69 +415,18 @@ struct NSPLocalizePass
 
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
-
-    ctx->getOrLoadDialect<mlir::shard::ShardDialect>();
-    ctx->getOrLoadDialect<mlir::affine::AffineDialect>();
-    ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
-    ctx->getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
-    ctx->getOrLoadDialect<mlir::func::FuncDialect>();
-    ctx->getOrLoadDialect<mlir::linalg::LinalgDialect>();
-    ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
-    ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
-    ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
-    ctx->getOrLoadDialect<mlir::hexagon::nsp::NSPDialect>();
+    loadRequiredDialects(*ctx);
 
     ModuleOp module = getOperation();
 
-    // Validate that the expected grid symbol exists.
-    // The planner currently creates shard.grid @nsp.
-    auto grid = module.lookupSymbol<mlir::shard::GridOp>("nsp");
-    if (!grid) {
-      module.emitError()
-          << "NSPLocalizePass expected a 'shard.grid' symbol named '@nsp' "
-             "in the module, but none was found. "
-             "Ensure NSP shard planning ran and created the grid.";
+    FailureOr<NspGridInfo> gridInfo = lookupNspGridInfo(module);
+    if (failed(gridInfo)) {
       signalPassFailure();
       return;
     }
 
-    // Read grid shape (assume 1D grid for now).
-    auto shape = grid.getShape();
-    if (shape.empty()) {
-      module.emitError() << "shard.grid '@nsp' has an empty shape";
-      signalPassFailure();
-      return;
-    }
-
-    const int64_t numShards = shape.front();
-    if (numShards <= 0) {
-      module.emitError() << "invalid shard grid size (shape[0]) = "
-                         << numShards;
-      signalPassFailure();
-      return;
-    }
-
-    auto isNspDistributedLoop = [](mlir::scf::ForOp forOp) -> bool {
-      return forOp && (forOp->hasAttr("nsp.distributed") ||
-                       forOp->hasAttr("nsp.distribution"));
-    };
-
-    auto hasNspDistributedLoopAncestor = [&](Operation *op) -> bool {
-      constexpr unsigned maxDepth = 100; // Reasonable nesting limit
-      unsigned depth = 0;
-      for (Operation *parent = op ? op->getParentOp() : nullptr; parent;
-           parent = parent->getParentOp()) {
-        if (++depth > maxDepth) {
-          op->emitWarning() << "NSPLocalize: excessive nesting depth while "
-                               "checking for distributed loop ancestor";
-          return false;
-        }
-        if (auto parentFor = dyn_cast<mlir::scf::ForOp>(parent))
-          if (isNspDistributedLoop(parentFor))
-            return true;
-      }
-      return false;
-    };
+    mlir::shard::GridOp grid = gridInfo->grid;
+    const int64_t numShards = gridInfo->numShards;
 
     // Helper for strip shard tensor annotations inside loops that were
     // explicitly distributed by this pass.
@@ -718,16 +752,7 @@ struct NSPLocalizePass
     // Optionally sanity-check that we have some sharding descriptors.
     // This is a warning (not a hard error) because some pipelines may
     // legally run with no sharding yet (e.g. early bring-up).
-    int64_t numShardingOps = 0;
-    module.walk([&](mlir::shard::ShardingOp op) { ++numShardingOps; });
-
-    if (numShardingOps == 0) {
-      module.emitWarning()
-          << "NSPLocalizePass found shard.grid '@nsp' but no 'shard.sharding' "
-             "ops in the module. This may be expected during early bring-up, "
-             "but if it is unexpected, ensure sharding propagation created "
-             "sharding descriptors.";
-    }
+    warnIfNoShardingDescriptors(module);
 
     // Minimal bring-up localization.
     //

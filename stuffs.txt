@@ -1,3 +1,15 @@
+[Hexagon][NSP] Refactor NSPLocalize pass driver
+
+Split the monolithic NSPLocalizePass::runOnOperation implementation into
+focused helpers for pass setup, loop distribution, shard annotation cleanup,
+sink discovery, local type inference, producer localization, and materialize
+tile hand-off.
+
+This is intended to preserve behavior while making the localization flow easier
+to review and extend.
+
+NSPLocalizePass::runOnOperation has grown into a monolithic implementation with several independent responsibilities, including pass setup, loop distribution, shard annotation cleanup, sink discovery, producer localization, shape projection, and materialization hand-off. Refactoring it into focused helpers would make the pass easier to review, test, and extend without changing its current behavior.
+
 #include "mlir/Dialect/Shard/Interfaces/ShardingInterface.h"
 
 // Temporary debug probe. Remove after diagnosing the registration source.
