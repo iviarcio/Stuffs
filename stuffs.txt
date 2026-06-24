@@ -1,3 +1,99 @@
+// RUN: linalg-hexagon-opt %s -nsp-shard-planner -nsp-localize | FileCheck %s
+
+// This test validates the rank-2 identity-map elementwise localization path.
+//
+// Input:
+//   A global tensor-level elementwise add:
+//
+//     C[i, j] = A[i, j] + B[i, j]
+//
+//   with a final tensor-to-memref sink:
+//
+//     bufferization.materialize_in_destination %C in %out
+//
+// Expected NSP localization behavior:
+//   - the planner creates shard annotations for a 1-D @nsp grid;
+//   - NSPLocalize slices the rank-2 input tensors along dimension 0;
+//   - the global tensor<2048x512xf32> computation becomes a local
+//     tensor<128x512xf32> computation, because 2048 / 16 = 128;
+//   - the final destination write is represented by nsp.materialize_tile;
+//   - no collective is needed for this pure elementwise DOALL computation.
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+
+module {
+  func.func @vadd_rank2(%a: tensor<2048x512xf32>,
+                        %b: tensor<2048x512xf32>,
+                        %out: memref<2048x512xf32>) {
+    %init = tensor.empty() : tensor<2048x512xf32>
+
+    %0 = linalg.generic {
+      indexing_maps = [#map, #map, #map],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%a, %b : tensor<2048x512xf32>, tensor<2048x512xf32>)
+      outs(%init : tensor<2048x512xf32>) {
+    ^bb0(%x: f32, %y: f32, %unused: f32):
+      %sum = arith.addf %x, %y : f32
+      linalg.yield %sum : f32
+    } -> tensor<2048x512xf32>
+
+    bufferization.materialize_in_destination
+      %0 in restrict writable %out
+        : (tensor<2048x512xf32>, memref<2048x512xf32>) -> ()
+
+    return
+  }
+}
+
+// CHECK: shard.grid @nsp
+// CHECK-SAME: shape = 16
+
+// CHECK-LABEL: func.func @vadd_rank2
+
+// The two global rank-2 tensor inputs are converted into shard-local slices.
+// The exact syntax of shard.all_slice may evolve, so keep the checks focused
+// on the existence of two local slice producers and their use by the localized
+// linalg.generic.
+// CHECK-DAG: %[[A_TILE:.*]] = shard.all_slice %{{.*}}
+// CHECK-DAG: %[[B_TILE:.*]] = shard.all_slice %{{.*}}
+
+// The localized output init must be a rank-2 tile:
+//   tensor<2048x512xf32> -> tensor<128x512xf32>
+// CHECK: %[[LOCAL_INIT:.*]] = tensor.empty() : tensor<128x512xf32>
+
+// The global linalg.generic is replaced by a shard-local linalg.generic that
+// consumes the local slices.
+// CHECK: %[[LOCAL_RESULT:.*]] = linalg.generic
+// CHECK: ins(%[[A_TILE]], %[[B_TILE]]
+// CHECK: outs(%[[LOCAL_INIT]]
+// CHECK: arith.addf
+// CHECK: linalg.yield
+// CHECK: -> tensor<128x512xf32>
+
+// In non-collective mode, localization must hand the local tile to
+// NSPMaterializePass through nsp.materialize_tile instead of keeping the
+// original global materialize_in_destination sink.
+// CHECK: nsp.materialize_tile %[[LOCAL_RESULT]] : tensor<128x512xf32> into %{{.*}} : memref<2048x512xf32>
+// CHECK-SAME: grid @nsp
+// CHECK-SAME: split_axis = 0
+// CHECK-SAME: tile_shape = [128, 512]
+
+// This is a pure elementwise computation, so no collective is required.
+// CHECK-NOT: shard.all_gather
+// CHECK-NOT: shard.all_reduce
+// CHECK-NOT: bufferization.materialize_in_destination
+
+// CHECK: return
+
+Writing lit tests for NSPSharding.
+test/NSP/nsp-shard-planner-elementwise.mlir
+test/NSP/nsp-localize-elementwise-rank2.mlir
+test/NSP/nsp-localize-broadcast-row.mlir
+test/NSP/nsp-localize-broadcast-column.mlir
+test/NSP/nsp-materialize-rank2.mlir
+test/Conversion/ShardToLLVM/all-slice.mlir
+test/Conversion/ShardToLLVM/process-linear-index.mlir
+
 [Hexagon][NSP] Refactor NSPLocalize pass driver
 
 Split the monolithic NSPLocalizePass::runOnOperation implementation into
