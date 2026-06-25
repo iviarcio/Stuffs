@@ -1,112 +1,3 @@
-// RUN: linalg-hexagon-opt %s -nsp-materialize | FileCheck %s
-
-// This test validates the rank-2 identity-map elementwise materialization path.
-// The input IR models the hand-off produced by NSPLocalizePass:
-//   - source tensors are already local tiles: tensor<128x512xf32>
-//   - the local compute is represented by a tensor-semantic linalg.generic
-//     marked with `nsp.localized`
-//   - nsp.materialize_tile records that the local tile must be written into
-//     the global destination memref<2048x512xf32>
-//
-// Expected NSPMaterialize behavior:
-//   - compute the participant-local row offset from the Hexagon ABI:
-//       linearIdx = coreId * numThreadsPerCore + threadId
-//   - create a destination memref.subview:
-//       %out[linearIdx * 128, 0] [128, 512] [1, 1]
-//   - recover memref views for the two tensor tile inputs;
-//   - rebuild the elementwise linalg.generic with memref semantics;
-//   - erase the temporary nsp.materialize_tile op;
-//   - avoid the fallback bufferization.materialize_in_destination path.
-
-#map = affine_map<(d0, d1) -> (d0, d1)>
-module {
-  shard.grid @nsp(shape = 16)
-
-  func.func @materialize_rank2_elementwise(
-      %a: memref<2048x512xf32>,
-      %b: memref<2048x512xf32>,
-      %out: memref<2048x512xf32>,
-      %ntpc: i32,
-      %num_cores: i32,
-      %reserved0: i32,
-      %tid: i32,
-      %cid: i32,
-      %reserved1: i32) {
-    %c0 = arith.constant 0 : index
-
-    %a_tensor = bufferization.to_tensor %a
-      : memref<2048x512xf32>
-    %b_tensor = bufferization.to_tensor %b
-      : memref<2048x512xf32>
-
-    %a_tile = tensor.extract_slice %a_tensor[%c0, %c0] [128, 512] [1, 1]
-      : tensor<2048x512xf32> to tensor<128x512xf32>
-    %b_tile = tensor.extract_slice %b_tensor[%c0, %c0] [128, 512] [1, 1]
-      : tensor<2048x512xf32> to tensor<128x512xf32>
-
-    %init = tensor.empty() : tensor<128x512xf32>
-
-    %tile = linalg.generic {
-      indexing_maps = [#map, #map, #map],
-      iterator_types = ["parallel", "parallel"],
-      nsp.localized
-    } ins(%a_tile, %b_tile : tensor<128x512xf32>, tensor<128x512xf32>)
-      outs(%init : tensor<128x512xf32>) {
-    ^bb0(%x: f32, %y: f32, %unused: f32):
-      %sum = arith.addf %x, %y : f32
-      linalg.yield %sum : f32
-    } -> tensor<128x512xf32>
-
-    nsp.materialize_tile %tile : tensor<128x512xf32> into %out : memref<2048x512xf32>
-      grid @nsp
-      split_axis = 0
-      tile_shape = [128, 512]
-
-    return
-  }
-}
-
-// CHECK: shard.grid @nsp
-// CHECK-SAME: shape = 16
-
-// CHECK-LABEL: func.func @materialize_rank2_elementwise
-
-// The pass computes:
-//   linearIdx = cid * ntpc + tid
-//
-// CHECK-DAG: %[[CID:.*]] = arith.index_cast %{{.*}} : i32 to index
-// CHECK-DAG: %[[TID:.*]] = arith.index_cast %{{.*}} : i32 to index
-// CHECK-DAG: %[[NTPC:.*]] = arith.index_cast %{{.*}} : i32 to index
-// CHECK: %[[LINEAR_MUL:.*]] = arith.muli %[[CID]], %[[NTPC]] : index
-// CHECK: %[[LINEAR_IDX:.*]] = arith.addi %[[LINEAR_MUL]], %[[TID]] : index
-
-// The destination offset is linearIdx * tile_shape[0], i.e. linearIdx * 128.
-// CHECK: %[[C128:.*]] = arith.constant 128 : index
-// CHECK: %[[ROW_OFFSET:.*]] = arith.muli %[[LINEAR_IDX]], %[[C128]] : index
-
-// The final destination becomes a per-participant rank-2 subview.
-// CHECK: %[[DST_VIEW:.*]] = memref.subview %{{.*}}[%[[ROW_OFFSET]], 0] [128, 512] [1, 1]
-
-// The tensor tile inputs are recovered as memref subviews over the original
-// input buffers. These come from tensor.extract_slice over bufferization.to_tensor.
-// CHECK-DAG: %[[A_VIEW:.*]] = memref.subview %{{.*}}[0, 0] [128, 512] [1, 1]
-// CHECK-DAG: %[[B_VIEW:.*]] = memref.subview %{{.*}}[0, 0] [128, 512] [1, 1]
-
-// The localized tensor linalg.generic is rewritten as a memref linalg.generic
-// consuming the input subviews and writing directly into the destination subview.
-// CHECK: linalg.generic
-// CHECK: ins(%[[A_VIEW]], %[[B_VIEW]]
-// CHECK: outs(%[[DST_VIEW]]
-// CHECK: arith.addf
-// CHECK: linalg.yield
-
-// The direct memref rewrite should succeed, so the fallback path must not be
-// used and the temporary hand-off op must disappear.
-// CHECK-NOT: bufferization.materialize_in_destination
-// CHECK-NOT: nsp.materialize_tile
-
-// CHECK: return
-
 [Hexagon][NSP] Refactor NSPLocalize pass driver
 
 Split the monolithic NSPLocalizePass::runOnOperation implementation into
@@ -117,7 +8,11 @@ tile hand-off.
 This is intended to preserve behavior while making the localization flow easier
 to review and extend.
 
-NSPLocalizePass::runOnOperation has grown into a monolithic implementation with several independent responsibilities, including pass setup, loop distribution, shard annotation cleanup, sink discovery, producer localization, shape projection, and materialization hand-off. Refactoring it into focused helpers would make the pass easier to review, test, and extend without changing its current behavior.
+NSPLocalizePass::runOnOperation has grown into a monolithic implementation
+with several independent responsibilities, including pass setup, loop distribution,
+shard annotation cleanup, sink discovery, producer localization, shape projection,
+and materialization hand-off. Refactoring it into focused helpers would make the
+pass easier to review, test, and extend without changing its current behavior.
 
 #include "mlir/Dialect/Shard/Interfaces/ShardingInterface.h"
 
