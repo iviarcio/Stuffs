@@ -828,6 +828,1062 @@ isSupportedElementwiseGenericShape(mlir::linalg::GenericOp g,
   return true;
 }
 
+static bool hasCompatibleRegionArgumentTypes(Block &block, ValueRange inputs,
+                                             ValueRange outputs) {
+  if (block.getNumArguments() != inputs.size() + outputs.size())
+    return false;
+
+  auto getElementType = [](Type t) -> Type {
+    if (auto shaped = dyn_cast<ShapedType>(t))
+      return shaped.getElementType();
+    return t;
+  };
+
+  unsigned argIdx = 0;
+  for (Value input : inputs) {
+    if (block.getArgument(argIdx++).getType() !=
+        getElementType(input.getType()))
+      return false;
+  }
+
+  for (Value output : outputs) {
+    if (block.getArgument(argIdx++).getType() !=
+        getElementType(output.getType()))
+      return false;
+  }
+
+  return true;
+}
+
+static void cloneLinalgRegion(Region &srcRegion, Region &dstRegion) {
+  dstRegion.getBlocks().clear();
+
+  Block &srcBlock = srcRegion.front();
+  Block *dstBlock = new Block();
+  dstRegion.push_back(dstBlock);
+
+  for (BlockArgument arg : srcBlock.getArguments())
+    dstBlock->addArgument(arg.getType(), arg.getLoc());
+
+  IRMapping map;
+  for (auto [srcArg, dstArg] :
+       llvm::zip(srcBlock.getArguments(), dstBlock->getArguments()))
+    map.map(srcArg, dstArg);
+
+  OpBuilder nb = OpBuilder::atBlockEnd(dstBlock);
+  for (Operation &op : srcBlock.getOperations())
+    nb.clone(op, map);
+}
+
+static bool
+isShapePreservingElementwiseGeneric(mlir::linalg::GenericOp prod,
+                                    RankedTensorType expectedLocalTy) {
+  if (!expectedLocalTy)
+    return false;
+
+  const int64_t rank = expectedLocalTy.getRank();
+  if (!isSupportedIdentityElementwiseRank(rank))
+    return false;
+
+  const int64_t nIn = prod.getNumDpsInputs();
+  if (nIn < 1 || nIn > 3 || prod.getNumDpsInits() != 1)
+    return false;
+
+  if (prod.getNumLoops() != rank)
+    return false;
+
+  auto iters = prod.getIteratorTypesArray();
+  if ((int64_t)iters.size() != rank)
+    return false;
+  if (!llvm::all_of(iters, [](mlir::utils::IteratorType it) {
+        return it == mlir::utils::IteratorType::parallel;
+      }))
+    return false;
+
+  auto maps = prod.getIndexingMapsArray();
+  if ((int64_t)maps.size() != nIn + 1)
+    return false;
+  if (!llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }))
+    return false;
+
+  auto resTy = dyn_cast<RankedTensorType>(prod.getResult(0).getType());
+  if (!resTy || resTy.getRank() != rank)
+    return false;
+
+  for (OpOperand *in : prod.getDpsInputOperands()) {
+    auto inTy = dyn_cast<RankedTensorType>(in->get().getType());
+    if (!inTy || inTy.getRank() != rank)
+      return false;
+  }
+
+  return true;
+}
+
+static RankedTensorType
+getTransposeInputLocalType(linalg::TransposeOp transpose,
+                           RankedTensorType expectedResultLocalTy) {
+  auto inputTy = dyn_cast<RankedTensorType>(transpose.getInput().getType());
+  if (!inputTy || !expectedResultLocalTy)
+    return RankedTensorType();
+
+  auto perm = transpose.getPermutation();
+  if ((int64_t)perm.size() != inputTy.getRank() ||
+      inputTy.getRank() != expectedResultLocalTy.getRank())
+    return RankedTensorType();
+
+  SmallVector<int64_t> inputLocalShape(inputTy.getRank(), ShapedType::kDynamic);
+  ArrayRef<int64_t> resultShape = expectedResultLocalTy.getShape();
+
+  // linalg.transpose uses:
+  //   result_dim[i] = input_dim[permutation[i]]
+  // Therefore, if the localized result shape is known, the localized input
+  // shape is obtained by applying the inverse mapping.
+  for (auto [resultDim, inputDim] : llvm::enumerate(perm)) {
+    if (inputDim < 0 || inputDim >= inputTy.getRank())
+      return RankedTensorType();
+    inputLocalShape[inputDim] = resultShape[resultDim];
+  }
+
+  for (int64_t dim : inputLocalShape)
+    if (ShapedType::isDynamic(dim) || dim <= 0)
+      return RankedTensorType();
+
+  return RankedTensorType::get(inputLocalShape, inputTy.getElementType(),
+                               inputTy.getEncoding());
+}
+
+static RankedTensorType
+getReduceInputLocalType(linalg::ReduceOp reduce,
+                        RankedTensorType expectedResultLocalTy) {
+  if (!expectedResultLocalTy || reduce.getInputs().size() != 1 ||
+      reduce.getInits().size() != 1)
+    return RankedTensorType();
+
+  auto inputTy = dyn_cast<RankedTensorType>(reduce.getInputs()[0].getType());
+  if (!inputTy)
+    return RankedTensorType();
+
+  llvm::SmallDenseSet<int64_t> reducedDims;
+  for (int64_t dim : reduce.getDimensions())
+    reducedDims.insert(dim);
+
+  if ((int64_t)reducedDims.size() !=
+      inputTy.getRank() - expectedResultLocalTy.getRank())
+    return RankedTensorType();
+
+  SmallVector<int64_t> inputLocalShape;
+  inputLocalShape.reserve(inputTy.getRank());
+
+  int64_t outDim = 0;
+  for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
+    if (reducedDims.contains(dim)) {
+      int64_t extent = inputTy.getDimSize(dim);
+      if (ShapedType::isDynamic(extent) || extent <= 0)
+        return RankedTensorType();
+      inputLocalShape.push_back(extent);
+      continue;
+    }
+
+    if (outDim >= expectedResultLocalTy.getRank())
+      return RankedTensorType();
+    inputLocalShape.push_back(expectedResultLocalTy.getDimSize(outDim++));
+  }
+
+  return RankedTensorType::get(inputLocalShape, inputTy.getElementType(),
+                               inputTy.getEncoding());
+}
+
+// Return, for each source dimension of tensor.expand_shape, the result
+// dimension that should carry the source sharding/local extent.
+//
+// This only supports the unit-expansion case: tensor<M> -> tensor<M x 1>.
+static std::optional<SmallVector<int64_t>>
+getUnitExpandRepresentativeDims(tensor::ExpandShapeOp expand) {
+  auto srcTy = dyn_cast<RankedTensorType>(expand->getOperand(0).getType());
+  auto resultTy = dyn_cast<RankedTensorType>(expand->getResult(0).getType());
+  if (!srcTy || !resultTy)
+    return std::nullopt;
+
+  SmallVector<ReassociationIndices> reassociation =
+      expand.getReassociationIndices();
+
+  if ((int64_t)reassociation.size() != srcTy.getRank())
+    return std::nullopt;
+
+  SmallVector<int64_t> representatives;
+  representatives.reserve(srcTy.getRank());
+
+  for (ArrayRef<int64_t> group : reassociation) {
+    if (group.empty())
+      return std::nullopt;
+
+    int64_t representative = -1;
+    int64_t nonUnitDims = 0;
+
+    for (int64_t resultDim : group) {
+      if (resultDim < 0 || resultDim >= resultTy.getRank())
+        return std::nullopt;
+
+      int64_t dimSize = resultTy.getDimSize(resultDim);
+
+      // Dynamic dimensions inside a multi-dim group cannot be proven to be
+      // unit-expansion. Keep this path conservative.
+      if (ShapedType::isDynamic(dimSize)) {
+        if (group.size() != 1)
+          return std::nullopt;
+        representative = resultDim;
+        ++nonUnitDims;
+        continue;
+      }
+
+      if (dimSize != 1) {
+        representative = resultDim;
+        ++nonUnitDims;
+      }
+    }
+
+    if (nonUnitDims > 1)
+      return std::nullopt;
+
+    // Degenerate case: all expanded dims are unit dims.
+    if (representative < 0)
+      representative = group.front();
+
+    representatives.push_back(representative);
+  }
+
+  return representatives;
+}
+
+static RankedTensorType
+getExpandShapeInputLocalType(tensor::ExpandShapeOp expand,
+                             RankedTensorType expectedResultLocalTy) {
+  auto inputTy = dyn_cast<RankedTensorType>(expand->getOperand(0).getType());
+  auto resultTy = dyn_cast<RankedTensorType>(expand->getResult(0).getType());
+  if (!inputTy || !resultTy || !expectedResultLocalTy)
+    return RankedTensorType();
+
+  if (expectedResultLocalTy.getRank() != resultTy.getRank())
+    return RankedTensorType();
+
+  auto representatives = getUnitExpandRepresentativeDims(expand);
+  if (!representatives || (int64_t)representatives->size() != inputTy.getRank())
+    return RankedTensorType();
+
+  SmallVector<int64_t> inputLocalShape;
+  inputLocalShape.reserve(inputTy.getRank());
+
+  for (int64_t resultDim : *representatives) {
+    int64_t localDim = expectedResultLocalTy.getDimSize(resultDim);
+    if (ShapedType::isDynamic(localDim) || localDim <= 0)
+      return RankedTensorType();
+    inputLocalShape.push_back(localDim);
+  }
+
+  return RankedTensorType::get(inputLocalShape, inputTy.getElementType(),
+                               inputTy.getEncoding());
+}
+
+static RankedTensorType
+getExpandShapeLocalResultType(tensor::ExpandShapeOp expand,
+                              RankedTensorType localInputTy) {
+  auto resultTy = dyn_cast<RankedTensorType>(expand->getResult(0).getType());
+  if (!resultTy || !localInputTy)
+    return RankedTensorType();
+
+  auto representatives = getUnitExpandRepresentativeDims(expand);
+  if (!representatives ||
+      (int64_t)representatives->size() != localInputTy.getRank())
+    return RankedTensorType();
+
+  SmallVector<int64_t> localResultShape(resultTy.getShape().begin(),
+                                        resultTy.getShape().end());
+
+  for (auto [srcDim, resultDim] : llvm::enumerate(*representatives)) {
+    int64_t localDim = localInputTy.getDimSize(srcDim);
+    if (ShapedType::isDynamic(localDim) || localDim <= 0)
+      return RankedTensorType();
+    localResultShape[resultDim] = localDim;
+  }
+
+  return RankedTensorType::get(localResultShape, resultTy.getElementType(),
+                               resultTy.getEncoding());
+}
+
+static Value stripTrivialWrappers(Value v) {
+  Value cur = v;
+  while (Operation *def = cur.getDefiningOp()) {
+    if (auto shardOp = dyn_cast<mlir::shard::ShardOp>(def)) {
+      if (shardOp->getNumOperands() < 1)
+        break;
+      cur = shardOp->getOperand(0);
+      continue;
+    }
+    if (auto castOp = dyn_cast<tensor::CastOp>(def)) {
+      cur = castOp.getSource();
+      continue;
+    }
+    break;
+  }
+  return cur;
+}
+
+struct TransposeReduceChainMatch {
+  mlir::linalg::TransposeOp transpose;
+  mlir::linalg::GenericOp unaryGeneric;
+};
+
+static bool isUnaryRank2IdentityGeneric(mlir::linalg::GenericOp generic) {
+  if (!generic)
+    return false;
+
+  if (generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1)
+    return false;
+
+  if (generic.getNumLoops() != 2)
+    return false;
+
+  auto iters = generic.getIteratorTypesArray();
+  if (iters.size() != 2)
+    return false;
+  if (!llvm::all_of(iters, [](mlir::utils::IteratorType it) {
+        return it == mlir::utils::IteratorType::parallel;
+      }))
+    return false;
+
+  auto maps = generic.getIndexingMapsArray();
+  if (maps.size() != 2)
+    return false;
+  if (!isIdentity2DMap(maps[0]) || !isIdentity2DMap(maps[1]))
+    return false;
+
+  auto inputTy = dyn_cast<RankedTensorType>(
+      generic.getDpsInputOperand(0)->get().getType());
+  auto resultTy = dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+  if (!inputTy || !resultTy)
+    return false;
+
+  if (inputTy.getRank() != 2 || resultTy.getRank() != 2)
+    return false;
+
+  if (inputTy.getShape() != resultTy.getShape())
+    return false;
+
+  return true;
+}
+
+static bool matchTransposeReduceChain(mlir::linalg::ReduceOp reduce,
+                                      TransposeReduceChainMatch &match) {
+  if (!reduce || reduce.getInputs().size() != 1 ||
+      reduce.getInits().size() != 1)
+    return false;
+
+  auto reduceResultTy =
+      dyn_cast<RankedTensorType>(reduce->getResult(0).getType());
+  if (!reduceResultTy || reduceResultTy.getRank() != 1)
+    return false;
+
+  auto dims = reduce.getDimensions();
+  if (dims.size() != 1 || dims[0] != 0)
+    return false;
+
+  Value reduceInput = stripTrivialWrappers(reduce.getInputs()[0]);
+
+  // Common blocked-softmax form:
+  //   transpose -> unary identity generic, usually extf -> reduce(dim 0)
+  if (auto generic = reduceInput.getDefiningOp<mlir::linalg::GenericOp>()) {
+    if (!isUnaryRank2IdentityGeneric(generic))
+      return false;
+
+    Value genericInput =
+        stripTrivialWrappers(generic.getDpsInputOperand(0)->get());
+    auto transpose = genericInput.getDefiningOp<mlir::linalg::TransposeOp>();
+    if (!transpose)
+      return false;
+
+    match.transpose = transpose;
+    match.unaryGeneric = generic;
+  } else {
+    // Simpler form:
+    //   transpose -> reduce(dim 0)
+    auto transpose = reduceInput.getDefiningOp<mlir::linalg::TransposeOp>();
+    if (!transpose)
+      return false;
+
+    match.transpose = transpose;
+    match.unaryGeneric = mlir::linalg::GenericOp();
+  }
+
+  auto inputTy =
+      dyn_cast<RankedTensorType>(match.transpose.getInput().getType());
+  auto transposeResultTy =
+      dyn_cast<RankedTensorType>(match.transpose->getResult(0).getType());
+  if (!inputTy || !transposeResultTy)
+    return false;
+
+  if (inputTy.getRank() != 2 || transposeResultTy.getRank() != 2)
+    return false;
+
+  auto perm = match.transpose.getPermutation();
+  if (perm.size() != 2 || perm[0] != 1 || perm[1] != 0)
+    return false;
+
+  return true;
+}
+
+struct LocalValueMaterializer {
+  using LocalizeScfForFn = std::function<LogicalResult(
+      mlir::scf::ForOp, llvm::DenseMap<Value, Value> &)>;
+
+  LocalValueMaterializer(OpBuilder &b, const LocalShapeInfo &shapeInfo,
+                         ArrayRef<mlir::shard::GridAxis> gridAxes,
+                         LocalizeScfForFn &localizeScfForWithTensorIterArgs)
+      : b(b), shapeInfo(shapeInfo), gridAxes(gridAxes),
+        localizeScfForWithTensorIterArgs(localizeScfForWithTensorIterArgs) {}
+
+  Value materialize(Value v, RankedTensorType expectedLocalTy,
+                    llvm::DenseMap<Value, Value> &cache) {
+    Value base = stripTrivialWrappers(v);
+    auto it = cache.find(base);
+    if (it != cache.end())
+      return it->second;
+
+    // Replicated values do not need slicing. This is required for
+    // column-wise broadcast operands such as layer-norm gamma/beta:
+    //   tensor<N>, map (d0, d1) -> (d1)
+    // where N is the full column extent and must remain available on every
+    // NSP participant.
+    auto baseTy = dyn_cast<RankedTensorType>(base.getType());
+    if (baseTy && baseTy == expectedLocalTy) {
+      cache[base] = base;
+      return base;
+    }
+
+    // linalg.fill: produce a local constant tile.
+    if (auto fill =
+            dyn_cast_or_null<mlir::linalg::FillOp>(base.getDefiningOp())) {
+      auto fillResTy = dyn_cast<RankedTensorType>(base.getType());
+      if (!fillResTy)
+        return Value();
+
+      RankedTensorType fillLocalTy = shapeInfo.getLocalTypeWithShape(
+          fillResTy, expectedLocalTy.getShape());
+      if (!fillLocalTy)
+        return Value();
+
+      Value outLocalInit = mlir::tensor::EmptyOp::create(
+          b, fill.getLoc(), fillLocalTy.getShape(),
+          fillLocalTy.getElementType());
+      auto localFill = mlir::linalg::FillOp::create(
+          b, fill.getLoc(), /*inputs=*/fill.getInputs(),
+          /*outputs=*/ValueRange{outLocalInit});
+      Value localRes = localFill.getResult(0);
+      cache[base] = localRes;
+      return localRes;
+    }
+
+    // linalg.transpose: localize the source and rebuild the transpose on
+    // the local tile. This is important for row-wise softmax patterns:
+    //
+    //   input[MxN] -> transpose[NxM] -> reduce(dim 0) -> tensor<M>
+    //
+    // If the outer/original M dimension is sharded, the transpose-local
+    // shape becomes [N x localM], not [localN x M]. Rebuilding the
+    // transpose locally avoids slicing the transposed global tensor along
+    // the wrong physical dimension.
+    if (auto transpose =
+            dyn_cast_or_null<mlir::linalg::TransposeOp>(base.getDefiningOp())) {
+      RankedTensorType inputLocalTy =
+          getTransposeInputLocalType(transpose, expectedLocalTy);
+      if (inputLocalTy) {
+        Value localInput =
+            materialize(transpose.getInput(), inputLocalTy, cache);
+        if (localInput) {
+          Value outLocalInit =
+              buildTensorEmptyLike(transpose.getLoc(), expectedLocalTy);
+          auto localTranspose = mlir::linalg::TransposeOp::create(
+              b, transpose.getLoc(),
+              /*input=*/localInput,
+              /*init=*/outLocalInit,
+              /*permutation=*/transpose.getPermutation());
+
+          Value localRes = localTranspose.getResult()[0];
+          cache[base] = localRes;
+          return localRes;
+        }
+      }
+    }
+
+    // linalg.reduce: localize reductions when the sharded dimension is a
+    // non-reduced dimension. This is the non-collective softmax case:
+    // each NSP owns complete rows, while the column reduction remains
+    // fully local to that row.
+    if (auto reduce =
+            dyn_cast_or_null<mlir::linalg::ReduceOp>(base.getDefiningOp())) {
+
+      // Optimize the canonicalized row-wise softmax reduction form.
+      //
+      // Some softmax variants reach NSPSharding as:
+      //   input<M x N>
+      //     -> transpose [1, 0]
+      //     -> optional unary identity generic, usually f16 -> f32
+      //     -> reduce(dim 0)
+      //     -> tensor<M>
+      //
+      // The localized fallback would rebuild:
+      //   input<localM x N>
+      //     -> transpose<N x localM>
+      //     -> optional unary generic
+      //     -> reduce(dim 0)
+      //
+      // Rebuild this directly as:
+      //   input<localM x N>
+      //     -> optional unary generic
+      //     -> reduce(dim 1)
+      //
+      // This preserves the row-wise reduction semantics and avoids the
+      // local transpose tensor and transpose operation.
+      TransposeReduceChainMatch chain;
+      if (matchTransposeReduceChain(reduce, chain)) {
+        RankedTensorType oldReduceInputLocalTy =
+            getReduceInputLocalType(reduce, expectedLocalTy);
+        RankedTensorType sourceLocalTy =
+            getTransposeInputLocalType(chain.transpose, oldReduceInputLocalTy);
+
+        if (sourceLocalTy) {
+          Value localSource =
+              materialize(chain.transpose.getInput(), sourceLocalTy, cache);
+
+          if (localSource) {
+            Value localReduceInput = localSource;
+
+            if (chain.unaryGeneric) {
+              localReduceInput = cloneUnaryGenericOnLocalInput(
+                  chain.unaryGeneric, localSource);
+            }
+
+            Value localInit =
+                materialize(reduce.getInits()[0], expectedLocalTy, cache);
+
+            if (localReduceInput && localInit) {
+              auto inputTy =
+                  dyn_cast<RankedTensorType>(localReduceInput.getType());
+              if (!inputTy)
+                return Value();
+
+              // The matched transpose is [1, 0], and the original reduce
+              // dimension is 0 in the transposed tensor. Therefore the
+              // equivalent reduction dimension in the pre-transpose local
+              // tensor is 1.
+              constexpr int64_t sourceReductionDim = 1;
+
+              if (inputTy.getRank() != 2)
+                return Value();
+
+              SmallVector<mlir::utils::IteratorType> iteratorTypes;
+              iteratorTypes.reserve(inputTy.getRank());
+              for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
+                iteratorTypes.push_back(
+                    dim == sourceReductionDim
+                        ? mlir::utils::IteratorType::reduction
+                        : mlir::utils::IteratorType::parallel);
+              }
+
+              MLIRContext *ctx = b.getContext();
+              SmallVector<AffineExpr> inputExprs;
+              SmallVector<AffineExpr> outputExprs;
+              inputExprs.reserve(inputTy.getRank());
+              outputExprs.reserve(expectedLocalTy.getRank());
+
+              for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
+                auto expr = getAffineDimExpr(dim, ctx);
+                inputExprs.push_back(expr);
+                if (dim != sourceReductionDim)
+                  outputExprs.push_back(expr);
+              }
+
+              AffineMap inputMap =
+                  AffineMap::get(inputTy.getRank(), 0, inputExprs, ctx);
+              AffineMap outputMap =
+                  AffineMap::get(inputTy.getRank(), 0, outputExprs, ctx);
+
+              auto localReduce = mlir::linalg::GenericOp::create(
+                  b, reduce.getLoc(),
+                  /*resultTensorTypes=*/TypeRange{expectedLocalTy},
+                  /*inputs=*/ValueRange{localReduceInput},
+                  /*outputs=*/ValueRange{localInit},
+                  /*indexingMaps=*/
+                  ArrayRef<AffineMap>{inputMap, outputMap},
+                  /*iteratorTypes=*/iteratorTypes,
+                  /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+              if (!hasCompatibleRegionArgumentTypes(
+                      reduce.getRegion().front(), ValueRange{localReduceInput},
+                      ValueRange{localInit}))
+                return Value();
+
+              cloneLinalgRegion(reduce.getRegion(), localReduce.getRegion());
+
+              Value localRes = localReduce.getResult(0);
+              cache[base] = localRes;
+              return localRes;
+            }
+          }
+        }
+      }
+
+      RankedTensorType inputLocalTy =
+          getReduceInputLocalType(reduce, expectedLocalTy);
+      if (inputLocalTy) {
+        Value localInput =
+            materialize(reduce.getInputs()[0], inputLocalTy, cache);
+        Value localInit =
+            materialize(reduce.getInits()[0], expectedLocalTy, cache);
+        if (localInput && localInit) {
+          auto inputTy = dyn_cast<RankedTensorType>(localInput.getType());
+          if (!inputTy)
+            return Value();
+
+          llvm::SmallSet<int64_t, 4> reducedDims;
+          for (int64_t dim : reduce.getDimensions())
+            (void)reducedDims.insert(dim);
+
+          SmallVector<mlir::utils::IteratorType> iteratorTypes;
+          iteratorTypes.reserve(inputTy.getRank());
+          for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
+            iteratorTypes.push_back(reducedDims.contains(dim)
+                                        ? mlir::utils::IteratorType::reduction
+                                        : mlir::utils::IteratorType::parallel);
+          }
+
+          MLIRContext *ctx = b.getContext();
+          SmallVector<AffineExpr> inputExprs;
+          SmallVector<AffineExpr> outputExprs;
+          inputExprs.reserve(inputTy.getRank());
+          outputExprs.reserve(expectedLocalTy.getRank());
+
+          for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
+            auto expr = getAffineDimExpr(dim, ctx);
+            inputExprs.push_back(expr);
+            if (!reducedDims.contains(dim))
+              outputExprs.push_back(expr);
+          }
+
+          AffineMap inputMap =
+              AffineMap::get(inputTy.getRank(), 0, inputExprs, ctx);
+          AffineMap outputMap =
+              AffineMap::get(inputTy.getRank(), 0, outputExprs, ctx);
+
+          auto localReduce = mlir::linalg::GenericOp::create(
+              b, reduce.getLoc(),
+              /*resultTensorTypes=*/TypeRange{expectedLocalTy},
+              /*inputs=*/ValueRange{localInput},
+              /*outputs=*/ValueRange{localInit},
+              /*indexingMaps=*/ArrayRef<AffineMap>{inputMap, outputMap},
+              /*iteratorTypes=*/iteratorTypes,
+              /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+          if (!hasCompatibleRegionArgumentTypes(reduce.getRegion().front(),
+                                                ValueRange{localInput},
+                                                ValueRange{localInit}))
+            return Value();
+
+          cloneLinalgRegion(reduce.getRegion(), localReduce.getRegion());
+
+          Value localRes = localReduce.getResult(0);
+          cache[base] = localRes;
+          return localRes;
+        }
+      }
+    }
+
+    // tensor.expand_shape: localize the source and rebuild the same
+    // unit-expansion over the local tile.
+    if (auto expand =
+            dyn_cast_or_null<tensor::ExpandShapeOp>(base.getDefiningOp())) {
+      RankedTensorType inputLocalTy =
+          getExpandShapeInputLocalType(expand, expectedLocalTy);
+      if (inputLocalTy) {
+        Value localInput =
+            materialize(expand->getOperand(0), inputLocalTy, cache);
+        if (localInput) {
+          SmallVector<ReassociationIndices> reassociation =
+              expand.getReassociationIndices();
+
+          SmallVector<OpFoldResult> localOutputShape;
+          localOutputShape.reserve(expectedLocalTy.getRank());
+          for (int64_t dim : expectedLocalTy.getShape()) {
+            if (ShapedType::isDynamic(dim) || dim <= 0)
+              return Value();
+            localOutputShape.push_back(b.getIndexAttr(dim));
+          }
+
+          auto localExpand = tensor::ExpandShapeOp::create(
+              b, expand.getLoc(), expectedLocalTy, localInput, reassociation,
+              localOutputShape);
+
+          Value localRes = localExpand->getResult(0);
+          cache[base] = localRes;
+          return localRes;
+        }
+      }
+    }
+
+    // linalg.generic: clone producer locally if compatible.
+    if (auto prod =
+            dyn_cast_or_null<mlir::linalg::GenericOp>(base.getDefiningOp())) {
+
+      // Multi-result broadcast-aware producer.
+      //
+      // This covers patterns such as:
+      //   %centered, %square = linalg.generic
+      //     ins(%x, %mean : tensor<MxN>, tensor<M>)
+      //     outs(%empty0, %empty1 : tensor<MxN>, tensor<MxN>)
+      //
+      // E.g., the final layer-norm generic may consume both
+      // %centered and %square through different result numbers.
+      // The multi-result producer once over localized operands,
+      // then cache all local results:
+      //   cache[%producer#0] = %local_producer#0
+      //   cache[%producer#1] = %local_producer#1
+      auto tryLocalizeMultiResultGeneric = [&]() -> Value {
+        if (prod->getNumResults() <= 1)
+          return Value();
+
+        auto requestedResult = dyn_cast<OpResult>(base);
+        if (!requestedResult ||
+            requestedResult.getOwner() != prod.getOperation())
+          return Value();
+
+        const unsigned requestedResultNumber =
+            requestedResult.getResultNumber();
+
+        const int64_t numInputs = prod.getNumDpsInputs();
+        const int64_t numOutputs = prod.getNumDpsInits();
+
+        if (numInputs < 1 || numOutputs < 2)
+          return Value();
+
+        if (numOutputs != static_cast<int64_t>(prod->getNumResults()))
+          return Value();
+
+        if (requestedResultNumber >= static_cast<unsigned>(numOutputs))
+          return Value();
+
+        if (!expectedLocalTy ||
+            !isSupportedIdentityElementwiseRank(expectedLocalTy.getRank()))
+          return Value();
+
+        if (prod.getNumLoops() != expectedLocalTy.getRank())
+          return Value();
+
+        auto iteratorTypes = prod.getIteratorTypesArray();
+        if (static_cast<int64_t>(iteratorTypes.size()) !=
+            expectedLocalTy.getRank())
+          return Value();
+
+        if (!llvm::all_of(iteratorTypes, [](mlir::utils::IteratorType it) {
+              return it == mlir::utils::IteratorType::parallel;
+            }))
+          return Value();
+
+        auto maps = prod.getIndexingMapsArray();
+        if (static_cast<int64_t>(maps.size()) != numInputs + numOutputs)
+          return Value();
+
+        // All tensor outputs must be identity maps for the requested rank.
+        // This covers rank-2 producer chains and higher-rank elementwise
+        // kernels that return multiple tensors.
+        for (int64_t i = 0; i < numOutputs; ++i) {
+          if (!maps[numInputs + i].isIdentity())
+            return Value();
+        }
+
+        SmallVector<RankedTensorType> localResultTypes;
+        localResultTypes.reserve(numOutputs);
+
+        SmallVector<Type> resultTensorTypes;
+        resultTensorTypes.reserve(numOutputs);
+
+        for (Value result : prod->getResults()) {
+          auto resultTy = dyn_cast<RankedTensorType>(result.getType());
+          if (!resultTy || resultTy.getRank() != expectedLocalTy.getRank())
+            return Value();
+
+          RankedTensorType localResultTy = shapeInfo.getLocalTypeWithShape(
+              resultTy, expectedLocalTy.getShape());
+          if (!localResultTy)
+            return Value();
+
+          localResultTypes.push_back(localResultTy);
+          resultTensorTypes.push_back(localResultTy);
+        }
+
+        // The caller requested a specific result. We Make sure the
+        // requested local type is exactly the one the caller expects.
+        if (localResultTypes[requestedResultNumber] != expectedLocalTy)
+          return Value();
+
+        SmallVector<Value> localInputs;
+        localInputs.reserve(numInputs);
+
+        for (int64_t i = 0; i < numInputs; ++i) {
+          OpOperand *in = prod.getDpsInputOperand(i);
+          auto inTy = dyn_cast<RankedTensorType>(in->get().getType());
+          if (!inTy)
+            return Value();
+
+          AffineMap inputMap = maps[i];
+          RankedTensorType inputLocalTy;
+
+          // Identity inputs shard like the results, preserving the input
+          // element type.
+          if (inTy.getRank() == expectedLocalTy.getRank() &&
+              inputMap.isIdentity()) {
+            inputLocalTy = shapeInfo.getLocalTypeWithShape(
+                inTy, expectedLocalTy.getShape());
+          }
+
+          // Rank-1 broadcast inputs use the same rule as the final
+          // broadcast-aware rank-2 consumer:
+          //   row broadcast    (d0, d1) -> (d0): tensor<M> -> tensor<tileM>
+          //   column broadcast (d0, d1) -> (d1): tensor<N> -> tensor<N>
+          if (!inputLocalTy && expectedLocalTy.getRank() == 2 &&
+              inTy.getRank() == 1 &&
+              (isRowBroadcastMap(inputMap) || isColumnBroadcastMap(inputMap))) {
+            inputLocalTy = shapeInfo.getExpectedLocalTypeForOperand(
+                inTy, inputMap, expectedLocalTy);
+          }
+
+          if (!inputLocalTy)
+            return Value();
+
+          Value localInput = materialize(in->get(), inputLocalTy, cache);
+          if (!localInput)
+            return Value();
+
+          localInputs.push_back(localInput);
+        }
+
+        SmallVector<Value> localOutputs;
+        localOutputs.reserve(numOutputs);
+        for (RankedTensorType localResultTy : localResultTypes)
+          localOutputs.push_back(
+              buildTensorEmptyLike(prod.getLoc(), localResultTy));
+
+        auto localProd = mlir::linalg::GenericOp::create(
+            b, prod.getLoc(),
+            /*resultTensorTypes=*/TypeRange(resultTensorTypes),
+            /*inputs=*/ValueRange(localInputs),
+            /*outputs=*/ValueRange(localOutputs),
+            /*indexingMaps=*/prod.getIndexingMapsArray(),
+            /*iteratorTypes=*/prod.getIteratorTypesArray(),
+            /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+        if (!hasCompatibleRegionArgumentTypes(prod.getRegion().front(),
+                                              localInputs, localOutputs))
+          return Value();
+
+        cloneLinalgRegion(prod.getRegion(), localProd.getRegion());
+
+        for (auto [oldResult, newResult] :
+             llvm::zip(prod->getResults(), localProd->getResults()))
+          cache[oldResult] = newResult;
+
+        return localProd->getResult(requestedResultNumber);
+      };
+
+      if (Value localMultiResult = tryLocalizeMultiResultGeneric())
+        return localMultiResult;
+
+      if (isShapePreservingElementwiseGeneric(prod, expectedLocalTy)) {
+        SmallVector<Value> prodInputs;
+        const int64_t nIn = prod.getNumDpsInputs();
+        prodInputs.reserve(nIn);
+        for (int64_t i = 0; i < nIn; ++i) {
+          Value inV = prod.getDpsInputOperand(i)->get();
+          auto inTy = dyn_cast<RankedTensorType>(inV.getType());
+          if (!inTy)
+            return Value();
+
+          // Preserve the input element type.  Some producer chains
+          // contain type-changing generics, for example f16 -> f32.
+          // The local result type is driven by expectedLocalTy, but each
+          // localized input must keep the element type of the original
+          // input tensor.  Reusing expectedLocalTy for inputs would
+          // incorrectly turn tensor<...xf16> inputs into tensor<...xf32>
+          // and may make the cloned region yield a value whose type no
+          // longer matches the enclosing linalg.generic output.
+          RankedTensorType inputLocalTy =
+              shapeInfo.getLocalTypeWithShape(inTy, expectedLocalTy.getShape());
+          if (!inputLocalTy)
+            return Value();
+
+          prodInputs.push_back(materialize(inV, inputLocalTy, cache));
+        }
+
+        Value outLocalInit = mlir::tensor::EmptyOp::create(
+            b, prod.getLoc(), expectedLocalTy.getShape(),
+            expectedLocalTy.getElementType());
+
+        auto newProd = mlir::linalg::GenericOp::create(
+            b, prod.getLoc(),
+            /*resultTensorTypes=*/TypeRange{expectedLocalTy},
+            /*inputs=*/ValueRange{prodInputs},
+            /*outputs=*/ValueRange{outLocalInit},
+            /*indexingMaps=*/prod.getIndexingMapsArray(),
+            /*iteratorTypes=*/prod.getIteratorTypesArray(),
+            /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+        if (!hasCompatibleRegionArgumentTypes(
+                prod.getRegion().front(), prodInputs, ValueRange{outLocalInit}))
+          return Value();
+
+        cloneLinalgRegion(prod.getRegion(), newProd.getRegion());
+
+        Value localRes = newProd.getResult(0);
+        cache[base] = localRes;
+        return localRes;
+      }
+
+      // Broadcast-aware rank-2 elementwise producer:
+      //   tensor<MxN>, tensor<M>, tensor<N> -> tensor<MxN>
+      //
+      // When expectedLocalTy is tensor<localM x N>, rank-2 identity inputs
+      // are localized to tensor<localM x N>, row-broadcast inputs are
+      // localized to tensor<localM>, and column-broadcast inputs remain
+      // tensor<N> replicated on every participant. This covers the final
+      // blocked-layer-norm generic:
+      //   x[row, col], rstd[row], gamma[col], beta[col]
+      auto prodResTy = dyn_cast<RankedTensorType>(prod.getResult(0).getType());
+      auto prodMaps = prod.getIndexingMapsArray();
+      if (isSupportedBroadcast2DGeneric(
+              prod, prodResTy,
+              [&]() {
+                SmallVector<RankedTensorType> tys;
+                tys.reserve(prod.getNumDpsInputs());
+                for (OpOperand *in : prod.getDpsInputOperands())
+                  tys.push_back(
+                      dyn_cast<RankedTensorType>(in->get().getType()));
+                return tys;
+              }()) &&
+          expectedLocalTy.getRank() == 2) {
+        SmallVector<Value> prodInputs;
+        prodInputs.reserve(prod.getNumDpsInputs());
+
+        for (OpOperand *in : prod.getDpsInputOperands()) {
+          auto inTy = dyn_cast<RankedTensorType>(in->get().getType());
+          if (!inTy)
+            return Value();
+
+          RankedTensorType inputLocalTy =
+              shapeInfo.getExpectedLocalTypeForOperand(
+                  inTy, prodMaps[in->getOperandNumber()], expectedLocalTy);
+          if (!inputLocalTy)
+            return Value();
+
+          prodInputs.push_back(materialize(in->get(), inputLocalTy, cache));
+        }
+
+        Value outLocalInit =
+            buildTensorEmptyLike(prod.getLoc(), expectedLocalTy);
+        auto newProd = mlir::linalg::GenericOp::create(
+            b, prod.getLoc(),
+            /*resultTensorTypes=*/TypeRange{expectedLocalTy},
+            /*inputs=*/ValueRange{prodInputs},
+            /*outputs=*/ValueRange{outLocalInit},
+            /*indexingMaps=*/prod.getIndexingMapsArray(),
+            /*iteratorTypes=*/prod.getIteratorTypesArray(),
+            /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+        if (!hasCompatibleRegionArgumentTypes(
+                prod.getRegion().front(), prodInputs, ValueRange{outLocalInit}))
+          return Value();
+
+        cloneLinalgRegion(prod.getRegion(), newProd.getRegion());
+
+        Value localRes = newProd.getResult(0);
+        cache[base] = localRes;
+        return localRes;
+      }
+    }
+
+    // scf.for with tensor iter_args: build a shard-local clone of the
+    // loop on demand and return the corresponding local loop result.
+    //
+    // This path does not distribute the IV. It keeps the recurrence loop
+    // intact on every NSP thread, but carries only shard-local tensor
+    // state through the loop. This is the non-collective strategy for
+    // online recurrences over K/V blocks.
+    if (auto forOp = dyn_cast_or_null<mlir::scf::ForOp>(base.getDefiningOp())) {
+      if (succeeded(localizeScfForWithTensorIterArgs(forOp, cache))) {
+        auto localIt = cache.find(base);
+        if (localIt != cache.end() &&
+            localIt->second.getType() == expectedLocalTy)
+          return localIt->second;
+      }
+    }
+
+    // Fallback: slice the global value.
+    Value local = mlir::shard::AllSliceOp::create(
+                      b, base.getLoc(), /*result_type=*/expectedLocalTy,
+                      /*input=*/base,
+                      /*grid=*/"nsp",
+                      /*gridAxes=*/gridAxes,
+                      /*sliceAxis=*/shapeInfo.splitAxis)
+                      .getResult();
+    cache[base] = local;
+    return local;
+  }
+
+private:
+  Value buildTensorEmptyLike(Location loc, RankedTensorType ty) {
+    return tensor::EmptyOp::create(b, loc, ty.getShape(), ty.getElementType());
+  }
+
+  Value cloneUnaryGenericOnLocalInput(mlir::linalg::GenericOp generic,
+                                      Value localInput) {
+    if (!generic || !localInput)
+      return Value();
+
+    auto inputTy = dyn_cast<RankedTensorType>(localInput.getType());
+    auto oldResultTy =
+        dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+    if (!inputTy || !oldResultTy)
+      return Value();
+
+    RankedTensorType localResultTy =
+        RankedTensorType::get(inputTy.getShape(), oldResultTy.getElementType(),
+                              oldResultTy.getEncoding());
+
+    Value localInit =
+        tensor::EmptyOp::create(b, generic.getLoc(), localResultTy.getShape(),
+                                localResultTy.getElementType());
+
+    auto localGeneric = mlir::linalg::GenericOp::create(
+        b, generic.getLoc(),
+        /*resultTensorTypes=*/TypeRange{localResultTy},
+        /*inputs=*/ValueRange{localInput},
+        /*outputs=*/ValueRange{localInit},
+        /*indexingMaps=*/generic.getIndexingMapsArray(),
+        /*iteratorTypes=*/generic.getIteratorTypesArray(),
+        /*doc=*/StringRef(), /*libraryCall=*/StringRef());
+
+    if (!hasCompatibleRegionArgumentTypes(generic.getRegion().front(),
+                                          ValueRange{localInput},
+                                          ValueRange{localInit}))
+      return Value();
+
+    cloneLinalgRegion(generic.getRegion(), localGeneric.getRegion());
+    return localGeneric.getResult(0);
+  }
+
+  OpBuilder &b;
+  const LocalShapeInfo &shapeInfo;
+  ArrayRef<mlir::shard::GridAxis> gridAxes;
+  LocalizeScfForFn &localizeScfForWithTensorIterArgs;
+};
+
 //===----------------------------------------------------------------------===//
 // NSP localization pass.
 //===----------------------------------------------------------------------===//
@@ -910,325 +1966,8 @@ struct NSPLocalizePass
 
     LocalShapeInfo shapeInfo(numShards);
 
-    auto hasCompatibleRegionArgumentTypes = [](Block &block, ValueRange inputs,
-                                               ValueRange outputs) -> bool {
-      if (block.getNumArguments() != inputs.size() + outputs.size())
-        return false;
-
-      auto getElementType = [](Type t) -> Type {
-        if (auto shaped = dyn_cast<ShapedType>(t))
-          return shaped.getElementType();
-        return t;
-      };
-
-      unsigned argIdx = 0;
-      for (Value input : inputs) {
-        if (block.getArgument(argIdx++).getType() !=
-            getElementType(input.getType()))
-          return false;
-      }
-
-      for (Value output : outputs) {
-        if (block.getArgument(argIdx++).getType() !=
-            getElementType(output.getType()))
-          return false;
-      }
-
-      return true;
-    };
-
-    auto cloneLinalgRegion = [&](Region &srcRegion, Region &dstRegion) {
-      dstRegion.getBlocks().clear();
-
-      Block &srcBlock = srcRegion.front();
-      Block *dstBlock = new Block();
-      dstRegion.push_back(dstBlock);
-
-      for (BlockArgument arg : srcBlock.getArguments())
-        dstBlock->addArgument(arg.getType(), arg.getLoc());
-
-      IRMapping map;
-      for (auto [srcArg, dstArg] :
-           llvm::zip(srcBlock.getArguments(), dstBlock->getArguments()))
-        map.map(srcArg, dstArg);
-
-      OpBuilder nb = OpBuilder::atBlockEnd(dstBlock);
-      for (Operation &op : srcBlock.getOperations())
-        nb.clone(op, map);
-    };
-
-    auto getLocalTypeWithShape =
-        [&](RankedTensorType globalTy,
-            ArrayRef<int64_t> localShape) -> RankedTensorType {
-      if (!globalTy || (int64_t)localShape.size() != globalTy.getRank())
-        return RankedTensorType();
-      for (int64_t dim : localShape)
-        if (ShapedType::isDynamic(dim) || dim <= 0)
-          return RankedTensorType();
-      return RankedTensorType::get(localShape, globalTy.getElementType(),
-                                   globalTy.getEncoding());
-    };
-
-    auto isShapePreservingElementwiseGeneric =
-        [&](mlir::linalg::GenericOp prod,
-            RankedTensorType expectedLocalTy) -> bool {
-      if (!expectedLocalTy)
-        return false;
-
-      const int64_t rank = expectedLocalTy.getRank();
-      if (!isSupportedIdentityElementwiseRank(rank))
-        return false;
-
-      const int64_t nIn = prod.getNumDpsInputs();
-      if (nIn < 1 || nIn > 3 || prod.getNumDpsInits() != 1)
-        return false;
-
-      if (prod.getNumLoops() != rank)
-        return false;
-
-      auto iters = prod.getIteratorTypesArray();
-      if ((int64_t)iters.size() != rank)
-        return false;
-      if (!llvm::all_of(iters, [](mlir::utils::IteratorType it) {
-            return it == mlir::utils::IteratorType::parallel;
-          }))
-        return false;
-
-      auto maps = prod.getIndexingMapsArray();
-      if ((int64_t)maps.size() != nIn + 1)
-        return false;
-      if (!llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }))
-        return false;
-
-      auto resTy = dyn_cast<RankedTensorType>(prod.getResult(0).getType());
-      if (!resTy || resTy.getRank() != rank)
-        return false;
-
-      for (OpOperand *in : prod.getDpsInputOperands()) {
-        auto inTy = dyn_cast<RankedTensorType>(in->get().getType());
-        if (!inTy || inTy.getRank() != rank)
-          return false;
-      }
-
-      return true;
-    };
-
-    auto getTransposeInputLocalType =
-        [&](linalg::TransposeOp transpose,
-            RankedTensorType expectedResultLocalTy) -> RankedTensorType {
-      auto inputTy = dyn_cast<RankedTensorType>(transpose.getInput().getType());
-      if (!inputTy || !expectedResultLocalTy)
-        return RankedTensorType();
-
-      auto perm = transpose.getPermutation();
-      if ((int64_t)perm.size() != inputTy.getRank() ||
-          inputTy.getRank() != expectedResultLocalTy.getRank())
-        return RankedTensorType();
-
-      SmallVector<int64_t> inputLocalShape(inputTy.getRank(),
-                                           ShapedType::kDynamic);
-      ArrayRef<int64_t> resultShape = expectedResultLocalTy.getShape();
-
-      // linalg.transpose uses:
-      //   result_dim[i] = input_dim[permutation[i]]
-      // Therefore, if the localized result shape is known, the localized input
-      // shape is obtained by applying the inverse mapping.
-      for (auto [resultDim, inputDim] : llvm::enumerate(perm)) {
-        if (inputDim < 0 || inputDim >= inputTy.getRank())
-          return RankedTensorType();
-        inputLocalShape[inputDim] = resultShape[resultDim];
-      }
-
-      for (int64_t dim : inputLocalShape)
-        if (ShapedType::isDynamic(dim) || dim <= 0)
-          return RankedTensorType();
-
-      return RankedTensorType::get(inputLocalShape, inputTy.getElementType(),
-                                   inputTy.getEncoding());
-    };
-
-    auto getReduceInputLocalType =
-        [&](linalg::ReduceOp reduce,
-            RankedTensorType expectedResultLocalTy) -> RankedTensorType {
-      if (!expectedResultLocalTy || reduce.getInputs().size() != 1 ||
-          reduce.getInits().size() != 1)
-        return RankedTensorType();
-
-      auto inputTy =
-          dyn_cast<RankedTensorType>(reduce.getInputs()[0].getType());
-      if (!inputTy)
-        return RankedTensorType();
-
-      llvm::SmallDenseSet<int64_t> reducedDims;
-      for (int64_t dim : reduce.getDimensions())
-        reducedDims.insert(dim);
-
-      if ((int64_t)reducedDims.size() !=
-          inputTy.getRank() - expectedResultLocalTy.getRank())
-        return RankedTensorType();
-
-      SmallVector<int64_t> inputLocalShape;
-      inputLocalShape.reserve(inputTy.getRank());
-
-      int64_t outDim = 0;
-      for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
-        if (reducedDims.contains(dim)) {
-          int64_t extent = inputTy.getDimSize(dim);
-          if (ShapedType::isDynamic(extent) || extent <= 0)
-            return RankedTensorType();
-          inputLocalShape.push_back(extent);
-          continue;
-        }
-
-        if (outDim >= expectedResultLocalTy.getRank())
-          return RankedTensorType();
-        inputLocalShape.push_back(expectedResultLocalTy.getDimSize(outDim++));
-      }
-
-      return RankedTensorType::get(inputLocalShape, inputTy.getElementType(),
-                                   inputTy.getEncoding());
-    };
-
-    //===------------------------------------------------------------------===//
-    // tensor.expand_shape localization helpers
-    //===------------------------------------------------------------------===//
-
-    // Return, for each source dimension of tensor.expand_shape, the result
-    // dimension that should carry the source sharding/local extent.
-    //
-    // This only supports the unit-expansion case: tensor<M> -> tensor<M x 1>
-    //
-    // The original dimension maps to the only non-unit dimension in the
-    // reassociation group. Newly inserted unit dimensions remain replicated.
-    //
-    // General reshapes are not supported here, because they are not simple
-    // view-like sharding projections.
-    auto getUnitExpandRepresentativeDims = [&](tensor::ExpandShapeOp expand)
-        -> std::optional<SmallVector<int64_t>> {
-      auto srcTy = dyn_cast<RankedTensorType>(expand->getOperand(0).getType());
-      auto resultTy =
-          dyn_cast<RankedTensorType>(expand->getResult(0).getType());
-      if (!srcTy || !resultTy)
-        return std::nullopt;
-
-      SmallVector<ReassociationIndices> reassociation =
-          expand.getReassociationIndices();
-
-      if ((int64_t)reassociation.size() != srcTy.getRank())
-        return std::nullopt;
-
-      SmallVector<int64_t> representatives;
-      representatives.reserve(srcTy.getRank());
-
-      for (ArrayRef<int64_t> group : reassociation) {
-        if (group.empty())
-          return std::nullopt;
-
-        int64_t representative = -1;
-        int64_t nonUnitDims = 0;
-
-        for (int64_t resultDim : group) {
-          if (resultDim < 0 || resultDim >= resultTy.getRank())
-            return std::nullopt;
-
-          int64_t dimSize = resultTy.getDimSize(resultDim);
-
-          // Dynamic dimensions inside a multi-dim group cannot be proven to be
-          // unit-expansion. Keep this path conservative.
-          if (ShapedType::isDynamic(dimSize)) {
-            if (group.size() != 1)
-              return std::nullopt;
-            representative = resultDim;
-            ++nonUnitDims;
-            continue;
-          }
-
-          if (dimSize != 1) {
-            representative = resultDim;
-            ++nonUnitDims;
-          }
-        }
-
-        if (nonUnitDims > 1)
-          return std::nullopt;
-
-        // Degenerate case: all expanded dims are unit dims.
-        if (representative < 0)
-          representative = group.front();
-
-        representatives.push_back(representative);
-      }
-
-      return representatives;
-    };
-
-    auto getExpandShapeInputLocalType =
-        [&](tensor::ExpandShapeOp expand,
-            RankedTensorType expectedResultLocalTy) -> RankedTensorType {
-      auto inputTy =
-          dyn_cast<RankedTensorType>(expand->getOperand(0).getType());
-      auto resultTy =
-          dyn_cast<RankedTensorType>(expand->getResult(0).getType());
-      if (!inputTy || !resultTy || !expectedResultLocalTy)
-        return RankedTensorType();
-
-      if (expectedResultLocalTy.getRank() != resultTy.getRank())
-        return RankedTensorType();
-
-      auto representatives = getUnitExpandRepresentativeDims(expand);
-      if (!representatives ||
-          (int64_t)representatives->size() != inputTy.getRank())
-        return RankedTensorType();
-
-      SmallVector<int64_t> inputLocalShape;
-      inputLocalShape.reserve(inputTy.getRank());
-
-      for (int64_t resultDim : *representatives) {
-        int64_t localDim = expectedResultLocalTy.getDimSize(resultDim);
-        if (ShapedType::isDynamic(localDim) || localDim <= 0)
-          return RankedTensorType();
-        inputLocalShape.push_back(localDim);
-      }
-
-      return RankedTensorType::get(inputLocalShape, inputTy.getElementType(),
-                                   inputTy.getEncoding());
-    };
-
-    auto getExpandShapeLocalResultType =
-        [&](tensor::ExpandShapeOp expand,
-            RankedTensorType localInputTy) -> RankedTensorType {
-      auto resultTy =
-          dyn_cast<RankedTensorType>(expand->getResult(0).getType());
-      if (!resultTy || !localInputTy)
-        return RankedTensorType();
-
-      auto representatives = getUnitExpandRepresentativeDims(expand);
-      if (!representatives ||
-          (int64_t)representatives->size() != localInputTy.getRank())
-        return RankedTensorType();
-
-      SmallVector<int64_t> localResultShape(resultTy.getShape().begin(),
-                                            resultTy.getShape().end());
-
-      for (auto [srcDim, resultDim] : llvm::enumerate(*representatives)) {
-        int64_t localDim = localInputTy.getDimSize(srcDim);
-        if (ShapedType::isDynamic(localDim) || localDim <= 0)
-          return RankedTensorType();
-        localResultShape[resultDim] = localDim;
-      }
-
-      return RankedTensorType::get(localResultShape, resultTy.getElementType(),
-                                   resultTy.getEncoding());
-    };
-
     module.walk([&](mlir::func::FuncOp func) {
       OpBuilder b(func.getContext());
-
-      auto buildTensorEmptyLike = [&](Location loc,
-                                      RankedTensorType ty) -> Value {
-        return tensor::EmptyOp::create(b, loc, ty.getShape(),
-                                       ty.getElementType());
-      };
 
       using MaterializeSink =
           std::pair<bufferization::MaterializeInDestinationOp,
@@ -1342,239 +2081,15 @@ struct NSPLocalizePass
         return search(v, /*depth=*/0);
       };
 
-      // Strip trivial wrapper ops (shard.shard, tensor.cast) to expose a real
-      // defining op, that is, wrappers that may sit between a tensor value
-      // and its backing buffer.
-      auto stripTrivialWrappers = [&](Value v) -> Value {
-        Value cur = v;
-        while (Operation *def = cur.getDefiningOp()) {
-          if (auto shardOp = dyn_cast<mlir::shard::ShardOp>(def)) {
-            if (shardOp->getNumOperands() < 1)
-              break;
-            cur = shardOp->getOperand(0);
-            continue;
-          }
-          if (auto castOp = dyn_cast<tensor::CastOp>(def)) {
-            cur = castOp.getSource();
-            continue;
-          }
-          break;
-        }
-        return cur;
-      };
-
-      struct TransposeReduceChainMatch {
-        mlir::linalg::TransposeOp transpose;
-        mlir::linalg::GenericOp unaryGeneric;
-      };
-
-      auto isUnaryRank2IdentityGeneric =
-          [&](mlir::linalg::GenericOp generic) -> bool {
-        if (!generic)
-          return false;
-
-        if (generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1)
-          return false;
-
-        if (generic.getNumLoops() != 2)
-          return false;
-
-        auto iters = generic.getIteratorTypesArray();
-        if (iters.size() != 2)
-          return false;
-        if (!llvm::all_of(iters, [](mlir::utils::IteratorType it) {
-              return it == mlir::utils::IteratorType::parallel;
-            }))
-          return false;
-
-        auto maps = generic.getIndexingMapsArray();
-        if (maps.size() != 2)
-          return false;
-        if (!isIdentity2DMap(maps[0]) || !isIdentity2DMap(maps[1]))
-          return false;
-
-        auto inputTy = dyn_cast<RankedTensorType>(
-            generic.getDpsInputOperand(0)->get().getType());
-        auto resultTy =
-            dyn_cast<RankedTensorType>(generic.getResult(0).getType());
-        if (!inputTy || !resultTy)
-          return false;
-
-        if (inputTy.getRank() != 2 || resultTy.getRank() != 2)
-          return false;
-
-        if (inputTy.getShape() != resultTy.getShape())
-          return false;
-
-        return true;
-      };
-
-      auto matchTransposeReduceChain =
-          [&](mlir::linalg::ReduceOp reduce,
-              TransposeReduceChainMatch &match) -> bool {
-        if (!reduce || reduce.getInputs().size() != 1 ||
-            reduce.getInits().size() != 1)
-          return false;
-
-        auto reduceResultTy =
-            dyn_cast<RankedTensorType>(reduce->getResult(0).getType());
-        if (!reduceResultTy || reduceResultTy.getRank() != 1)
-          return false;
-
-        auto dims = reduce.getDimensions();
-        if (dims.size() != 1 || dims[0] != 0)
-          return false;
-
-        Value reduceInput = stripTrivialWrappers(reduce.getInputs()[0]);
-
-        // Common blocked-softmax form:
-        //   transpose -> unary identity generic, usually extf -> reduce(dim 0)
-        if (auto generic =
-                reduceInput.getDefiningOp<mlir::linalg::GenericOp>()) {
-          if (!isUnaryRank2IdentityGeneric(generic))
-            return false;
-
-          Value genericInput =
-              stripTrivialWrappers(generic.getDpsInputOperand(0)->get());
-          auto transpose =
-              genericInput.getDefiningOp<mlir::linalg::TransposeOp>();
-          if (!transpose)
-            return false;
-
-          match.transpose = transpose;
-          match.unaryGeneric = generic;
-        } else {
-          // Simpler form:
-          //   transpose -> reduce(dim 0)
-          auto transpose =
-              reduceInput.getDefiningOp<mlir::linalg::TransposeOp>();
-          if (!transpose)
-            return false;
-
-          match.transpose = transpose;
-          match.unaryGeneric = mlir::linalg::GenericOp();
-        }
-
-        auto inputTy =
-            dyn_cast<RankedTensorType>(match.transpose.getInput().getType());
-        auto transposeResultTy =
-            dyn_cast<RankedTensorType>(match.transpose->getResult(0).getType());
-        if (!inputTy || !transposeResultTy)
-          return false;
-
-        if (inputTy.getRank() != 2 || transposeResultTy.getRank() != 2)
-          return false;
-
-        auto perm = match.transpose.getPermutation();
-        if (perm.size() != 2 || perm[0] != 1 || perm[1] != 0)
-          return false;
-
-        return true;
-      };
-
-      auto cloneUnaryGenericOnLocalInput = [&](mlir::linalg::GenericOp generic,
-                                               Value localInput) -> Value {
-        if (!generic || !localInput)
-          return Value();
-
-        auto inputTy = dyn_cast<RankedTensorType>(localInput.getType());
-        auto oldResultTy =
-            dyn_cast<RankedTensorType>(generic.getResult(0).getType());
-        if (!inputTy || !oldResultTy)
-          return Value();
-
-        RankedTensorType localResultTy = RankedTensorType::get(
-            inputTy.getShape(), oldResultTy.getElementType(),
-            oldResultTy.getEncoding());
-
-        Value localInit = tensor::EmptyOp::create(
-            b, generic.getLoc(), localResultTy.getShape(),
-            localResultTy.getElementType());
-
-        auto localGeneric = mlir::linalg::GenericOp::create(
-            b, generic.getLoc(),
-            /*resultTensorTypes=*/TypeRange{localResultTy},
-            /*inputs=*/ValueRange{localInput},
-            /*outputs=*/ValueRange{localInit},
-            /*indexingMaps=*/generic.getIndexingMapsArray(),
-            /*iteratorTypes=*/generic.getIteratorTypesArray(),
-            /*doc=*/StringRef(), /*libraryCall=*/StringRef());
-
-        if (!hasCompatibleRegionArgumentTypes(generic.getRegion().front(),
-                                              ValueRange{localInput},
-                                              ValueRange{localInit}))
-          return Value();
-
-        cloneLinalgRegion(generic.getRegion(), localGeneric.getRegion());
-        return localGeneric.getResult(0);
-      };
-
-      auto isCompatibleElementwiseGeneric =
-          [&](mlir::linalg::GenericOp prod,
-              RankedTensorType expectedLocalTy) -> bool {
-        if (!expectedLocalTy)
-          return false;
-
-        const int64_t expectedRank = expectedLocalTy.getRank();
-        if (!isSupportedIdentityElementwiseRank(expectedRank))
-          return false;
-
-        const int64_t nIn = prod.getNumDpsInputs();
-        if ((nIn != 1 && nIn != 2) || prod.getNumDpsInits() != 1)
-          return false;
-
-        if (prod.getNumLoops() != expectedRank)
-          return false;
-
-        auto iters = prod.getIteratorTypesArray();
-        if ((int64_t)iters.size() != expectedRank)
-          return false;
-        if (!llvm::all_of(iters, [](mlir::utils::IteratorType it) {
-              return it == mlir::utils::IteratorType::parallel;
-            }))
-          return false;
-
-        auto maps = prod.getIndexingMapsArray();
-        if ((int64_t)maps.size() != nIn + 1)
-          return false;
-        for (AffineMap m : maps)
-          if (!m.isIdentity())
-            return false;
-
-        auto resTy = dyn_cast<RankedTensorType>(prod.getResult(0).getType());
-        if (!resTy || resTy.getRank() != expectedRank)
-          return false;
-
-        auto prodLocalTy = shapeInfo.getLocalType(resTy);
-        if (!prodLocalTy)
-          return false;
-
-        if (prodLocalTy.getShape() != expectedLocalTy.getShape())
-          return false;
-
-        for (int64_t i = 0; i < nIn; ++i) {
-          auto inTy = dyn_cast<RankedTensorType>(
-              prod.getDpsInputOperand(i)->get().getType());
-          if (!inTy || inTy.getRank() != expectedRank)
-            return false;
-
-          auto inLocalTy = shapeInfo.getLocalType(inTy);
-          if (!inLocalTy)
-            return false;
-
-          if (inLocalTy.getShape() != expectedLocalTy.getShape())
-            return false;
-        }
-
-        return true;
-      };
-
       llvm::DenseMap<Operation *, mlir::scf::ForOp> localizedScfForCache;
       llvm::SmallPtrSet<Operation *, 16> failedLocalizedScfForCache;
 
       std::function<LogicalResult(mlir::scf::ForOp,
                                   llvm::DenseMap<Value, Value> &)>
           localizeScfForWithTensorIterArgs;
+
+      LocalValueMaterializer valueMaterializer(
+          b, shapeInfo, gridAxes, localizeScfForWithTensorIterArgs);
 
       // Build a local-tile version of a global value by cloning a chain of
       // compatible producers. This avoids materializing full global
@@ -1584,607 +2099,7 @@ struct NSPLocalizePass
           materializeLocalValue =
               [&](Value v, RankedTensorType expectedLocalTy,
                   llvm::DenseMap<Value, Value> &cache) -> Value {
-        Value base = stripTrivialWrappers(v);
-        auto it = cache.find(base);
-        if (it != cache.end())
-          return it->second;
-
-        // Replicated values do not need slicing. This is required for
-        // column-wise broadcast operands such as layer-norm gamma/beta:
-        //   tensor<N>, map (d0, d1) -> (d1)
-        // where N is the full column extent and must remain available on every
-        // NSP participant.
-        auto baseTy = dyn_cast<RankedTensorType>(base.getType());
-        if (baseTy && baseTy == expectedLocalTy) {
-          cache[base] = base;
-          return base;
-        }
-
-        // linalg.fill: produce a local constant tile.
-        if (auto fill =
-                dyn_cast_or_null<mlir::linalg::FillOp>(base.getDefiningOp())) {
-          auto fillResTy = dyn_cast<RankedTensorType>(base.getType());
-          if (!fillResTy)
-            return Value();
-
-          RankedTensorType fillLocalTy = shapeInfo.getLocalTypeWithShape(
-              fillResTy, expectedLocalTy.getShape());
-          if (!fillLocalTy)
-            return Value();
-
-          Value outLocalInit = mlir::tensor::EmptyOp::create(
-              b, fill.getLoc(), fillLocalTy.getShape(),
-              fillLocalTy.getElementType());
-          auto localFill = mlir::linalg::FillOp::create(
-              b, fill.getLoc(), /*inputs=*/fill.getInputs(),
-              /*outputs=*/ValueRange{outLocalInit});
-          Value localRes = localFill.getResult(0);
-          cache[base] = localRes;
-          return localRes;
-        }
-
-        // linalg.transpose: localize the source and rebuild the transpose on
-        // the local tile. This is important for row-wise softmax patterns:
-        //
-        //   input[MxN] -> transpose[NxM] -> reduce(dim 0) -> tensor<M>
-        //
-        // If the outer/original M dimension is sharded, the transpose-local
-        // shape becomes [N x localM], not [localN x M]. Rebuilding the
-        // transpose locally avoids slicing the transposed global tensor along
-        // the wrong physical dimension.
-        if (auto transpose = dyn_cast_or_null<mlir::linalg::TransposeOp>(
-                base.getDefiningOp())) {
-          RankedTensorType inputLocalTy =
-              getTransposeInputLocalType(transpose, expectedLocalTy);
-          if (inputLocalTy) {
-            Value localInput = materializeLocalValue(transpose.getInput(),
-                                                     inputLocalTy, cache);
-            if (localInput) {
-              Value outLocalInit =
-                  buildTensorEmptyLike(transpose.getLoc(), expectedLocalTy);
-              auto localTranspose = mlir::linalg::TransposeOp::create(
-                  b, transpose.getLoc(),
-                  /*input=*/localInput,
-                  /*init=*/outLocalInit,
-                  /*permutation=*/transpose.getPermutation());
-
-              Value localRes = localTranspose.getResult()[0];
-              cache[base] = localRes;
-              return localRes;
-            }
-          }
-        }
-
-        // linalg.reduce: localize reductions when the sharded dimension is a
-        // non-reduced dimension. This is the non-collective softmax case:
-        // each NSP owns complete rows, while the column reduction remains
-        // fully local to that row.
-        if (auto reduce = dyn_cast_or_null<mlir::linalg::ReduceOp>(
-                base.getDefiningOp())) {
-
-          // Optimize the canonicalized row-wise softmax reduction form.
-          //
-          // Some softmax variants reach NSPSharding as:
-          //   input<M x N>
-          //     -> transpose [1, 0]
-          //     -> optional unary identity generic, usually f16 -> f32
-          //     -> reduce(dim 0)
-          //     -> tensor<M>
-          //
-          // The localized fallback would rebuild:
-          //   input<localM x N>
-          //     -> transpose<N x localM>
-          //     -> optional unary generic
-          //     -> reduce(dim 0)
-          //
-          // Rebuild this directly as:
-          //   input<localM x N>
-          //     -> optional unary generic
-          //     -> reduce(dim 1)
-          //
-          // This preserves the row-wise reduction semantics and avoids the
-          // local transpose tensor and transpose operation.
-          TransposeReduceChainMatch chain;
-          if (matchTransposeReduceChain(reduce, chain)) {
-            RankedTensorType oldReduceInputLocalTy =
-                getReduceInputLocalType(reduce, expectedLocalTy);
-            RankedTensorType sourceLocalTy = getTransposeInputLocalType(
-                chain.transpose, oldReduceInputLocalTy);
-
-            if (sourceLocalTy) {
-              Value localSource = materializeLocalValue(
-                  chain.transpose.getInput(), sourceLocalTy, cache);
-
-              if (localSource) {
-                Value localReduceInput = localSource;
-
-                if (chain.unaryGeneric) {
-                  localReduceInput = cloneUnaryGenericOnLocalInput(
-                      chain.unaryGeneric, localSource);
-                }
-
-                Value localInit = materializeLocalValue(reduce.getInits()[0],
-                                                        expectedLocalTy, cache);
-
-                if (localReduceInput && localInit) {
-                  auto inputTy =
-                      dyn_cast<RankedTensorType>(localReduceInput.getType());
-                  if (!inputTy)
-                    return Value();
-
-                  // The matched transpose is [1, 0], and the original reduce
-                  // dimension is 0 in the transposed tensor. Therefore the
-                  // equivalent reduction dimension in the pre-transpose local
-                  // tensor is 1.
-                  constexpr int64_t sourceReductionDim = 1;
-
-                  if (inputTy.getRank() != 2)
-                    return Value();
-
-                  SmallVector<mlir::utils::IteratorType> iteratorTypes;
-                  iteratorTypes.reserve(inputTy.getRank());
-                  for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
-                    iteratorTypes.push_back(
-                        dim == sourceReductionDim
-                            ? mlir::utils::IteratorType::reduction
-                            : mlir::utils::IteratorType::parallel);
-                  }
-
-                  MLIRContext *ctx = b.getContext();
-                  SmallVector<AffineExpr> inputExprs;
-                  SmallVector<AffineExpr> outputExprs;
-                  inputExprs.reserve(inputTy.getRank());
-                  outputExprs.reserve(expectedLocalTy.getRank());
-
-                  for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
-                    auto expr = getAffineDimExpr(dim, ctx);
-                    inputExprs.push_back(expr);
-                    if (dim != sourceReductionDim)
-                      outputExprs.push_back(expr);
-                  }
-
-                  AffineMap inputMap =
-                      AffineMap::get(inputTy.getRank(), 0, inputExprs, ctx);
-                  AffineMap outputMap =
-                      AffineMap::get(inputTy.getRank(), 0, outputExprs, ctx);
-
-                  auto localReduce = mlir::linalg::GenericOp::create(
-                      b, reduce.getLoc(),
-                      /*resultTensorTypes=*/TypeRange{expectedLocalTy},
-                      /*inputs=*/ValueRange{localReduceInput},
-                      /*outputs=*/ValueRange{localInit},
-                      /*indexingMaps=*/
-                      ArrayRef<AffineMap>{inputMap, outputMap},
-                      /*iteratorTypes=*/iteratorTypes,
-                      /*doc=*/StringRef(), /*libraryCall=*/StringRef());
-
-                  if (!hasCompatibleRegionArgumentTypes(
-                          reduce.getRegion().front(),
-                          ValueRange{localReduceInput}, ValueRange{localInit}))
-                    return Value();
-
-                  cloneLinalgRegion(reduce.getRegion(),
-                                    localReduce.getRegion());
-
-                  Value localRes = localReduce.getResult(0);
-                  cache[base] = localRes;
-                  return localRes;
-                }
-              }
-            }
-          }
-
-          RankedTensorType inputLocalTy =
-              getReduceInputLocalType(reduce, expectedLocalTy);
-          if (inputLocalTy) {
-            Value localInput = materializeLocalValue(reduce.getInputs()[0],
-                                                     inputLocalTy, cache);
-            Value localInit = materializeLocalValue(reduce.getInits()[0],
-                                                    expectedLocalTy, cache);
-            if (localInput && localInit) {
-              auto inputTy = dyn_cast<RankedTensorType>(localInput.getType());
-              if (!inputTy)
-                return Value();
-
-              llvm::SmallSet<int64_t, 4> reducedDims;
-              for (int64_t dim : reduce.getDimensions())
-                (void)reducedDims.insert(dim);
-
-              SmallVector<mlir::utils::IteratorType> iteratorTypes;
-              iteratorTypes.reserve(inputTy.getRank());
-              for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
-                iteratorTypes.push_back(
-                    reducedDims.contains(dim)
-                        ? mlir::utils::IteratorType::reduction
-                        : mlir::utils::IteratorType::parallel);
-              }
-
-              MLIRContext *ctx = b.getContext();
-              SmallVector<AffineExpr> inputExprs;
-              SmallVector<AffineExpr> outputExprs;
-              inputExprs.reserve(inputTy.getRank());
-              outputExprs.reserve(expectedLocalTy.getRank());
-
-              for (int64_t dim = 0; dim < inputTy.getRank(); ++dim) {
-                auto expr = getAffineDimExpr(dim, ctx);
-                inputExprs.push_back(expr);
-                if (!reducedDims.contains(dim))
-                  outputExprs.push_back(expr);
-              }
-
-              AffineMap inputMap =
-                  AffineMap::get(inputTy.getRank(), 0, inputExprs, ctx);
-              AffineMap outputMap =
-                  AffineMap::get(inputTy.getRank(), 0, outputExprs, ctx);
-
-              auto localReduce = mlir::linalg::GenericOp::create(
-                  b, reduce.getLoc(),
-                  /*resultTensorTypes=*/TypeRange{expectedLocalTy},
-                  /*inputs=*/ValueRange{localInput},
-                  /*outputs=*/ValueRange{localInit},
-                  /*indexingMaps=*/ArrayRef<AffineMap>{inputMap, outputMap},
-                  /*iteratorTypes=*/iteratorTypes,
-                  /*doc=*/StringRef(), /*libraryCall=*/StringRef());
-
-              if (!hasCompatibleRegionArgumentTypes(reduce.getRegion().front(),
-                                                    ValueRange{localInput},
-                                                    ValueRange{localInit}))
-                return Value();
-
-              cloneLinalgRegion(reduce.getRegion(), localReduce.getRegion());
-
-              Value localRes = localReduce.getResult(0);
-              cache[base] = localRes;
-              return localRes;
-            }
-          }
-        }
-
-        // tensor.expand_shape: localize the source and rebuild the same
-        // unit-expansion over the local tile.
-        if (auto expand =
-                dyn_cast_or_null<tensor::ExpandShapeOp>(base.getDefiningOp())) {
-          RankedTensorType inputLocalTy =
-              getExpandShapeInputLocalType(expand, expectedLocalTy);
-          if (inputLocalTy) {
-            Value localInput = materializeLocalValue(expand->getOperand(0),
-                                                     inputLocalTy, cache);
-            if (localInput) {
-              SmallVector<ReassociationIndices> reassociation =
-                  expand.getReassociationIndices();
-
-              SmallVector<OpFoldResult> localOutputShape;
-              localOutputShape.reserve(expectedLocalTy.getRank());
-              for (int64_t dim : expectedLocalTy.getShape()) {
-                if (ShapedType::isDynamic(dim) || dim <= 0)
-                  return Value();
-                localOutputShape.push_back(b.getIndexAttr(dim));
-              }
-
-              auto localExpand = tensor::ExpandShapeOp::create(
-                  b, expand.getLoc(), expectedLocalTy, localInput,
-                  reassociation, localOutputShape);
-
-              Value localRes = localExpand->getResult(0);
-              cache[base] = localRes;
-              return localRes;
-            }
-          }
-        }
-
-        // linalg.generic: clone producer locally if compatible.
-        if (auto prod = dyn_cast_or_null<mlir::linalg::GenericOp>(
-                base.getDefiningOp())) {
-
-          // Multi-result broadcast-aware producer.
-          //
-          // This covers patterns such as:
-          //   %centered, %square = linalg.generic
-          //     ins(%x, %mean : tensor<MxN>, tensor<M>)
-          //     outs(%empty0, %empty1 : tensor<MxN>, tensor<MxN>)
-          //
-          // E.g., the final layer-norm generic may consume both
-          // %centered and %square through different result numbers.
-          // The multi-result producer once over localized operands,
-          // then cache all local results:
-          //   cache[%producer#0] = %local_producer#0
-          //   cache[%producer#1] = %local_producer#1
-          auto tryLocalizeMultiResultGeneric = [&]() -> Value {
-            if (prod->getNumResults() <= 1)
-              return Value();
-
-            auto requestedResult = dyn_cast<OpResult>(base);
-            if (!requestedResult ||
-                requestedResult.getOwner() != prod.getOperation())
-              return Value();
-
-            const unsigned requestedResultNumber =
-                requestedResult.getResultNumber();
-
-            const int64_t numInputs = prod.getNumDpsInputs();
-            const int64_t numOutputs = prod.getNumDpsInits();
-
-            if (numInputs < 1 || numOutputs < 2)
-              return Value();
-
-            if (numOutputs != static_cast<int64_t>(prod->getNumResults()))
-              return Value();
-
-            if (requestedResultNumber >= static_cast<unsigned>(numOutputs))
-              return Value();
-
-            if (!expectedLocalTy ||
-                !isSupportedIdentityElementwiseRank(expectedLocalTy.getRank()))
-              return Value();
-
-            if (prod.getNumLoops() != expectedLocalTy.getRank())
-              return Value();
-
-            auto iteratorTypes = prod.getIteratorTypesArray();
-            if (static_cast<int64_t>(iteratorTypes.size()) !=
-                expectedLocalTy.getRank())
-              return Value();
-
-            if (!llvm::all_of(iteratorTypes, [](mlir::utils::IteratorType it) {
-                  return it == mlir::utils::IteratorType::parallel;
-                }))
-              return Value();
-
-            auto maps = prod.getIndexingMapsArray();
-            if (static_cast<int64_t>(maps.size()) != numInputs + numOutputs)
-              return Value();
-
-            // All tensor outputs must be identity maps for the requested rank.
-            // This covers rank-2 producer chains and higher-rank elementwise
-            // kernels that return multiple tensors.
-            for (int64_t i = 0; i < numOutputs; ++i) {
-              if (!maps[numInputs + i].isIdentity())
-                return Value();
-            }
-
-            SmallVector<RankedTensorType> localResultTypes;
-            localResultTypes.reserve(numOutputs);
-
-            SmallVector<Type> resultTensorTypes;
-            resultTensorTypes.reserve(numOutputs);
-
-            for (Value result : prod->getResults()) {
-              auto resultTy = dyn_cast<RankedTensorType>(result.getType());
-              if (!resultTy || resultTy.getRank() != expectedLocalTy.getRank())
-                return Value();
-
-              RankedTensorType localResultTy = shapeInfo.getLocalTypeWithShape(
-                  resultTy, expectedLocalTy.getShape());
-              if (!localResultTy)
-                return Value();
-
-              localResultTypes.push_back(localResultTy);
-              resultTensorTypes.push_back(localResultTy);
-            }
-
-            // The caller requested a specific result. We Make sure the
-            // requested local type is exactly the one the caller expects.
-            if (localResultTypes[requestedResultNumber] != expectedLocalTy)
-              return Value();
-
-            SmallVector<Value> localInputs;
-            localInputs.reserve(numInputs);
-
-            for (int64_t i = 0; i < numInputs; ++i) {
-              OpOperand *in = prod.getDpsInputOperand(i);
-              auto inTy = dyn_cast<RankedTensorType>(in->get().getType());
-              if (!inTy)
-                return Value();
-
-              AffineMap inputMap = maps[i];
-              RankedTensorType inputLocalTy;
-
-              // Identity inputs shard like the results, preserving the input
-              // element type.
-              if (inTy.getRank() == expectedLocalTy.getRank() &&
-                  inputMap.isIdentity()) {
-                inputLocalTy = shapeInfo.getLocalTypeWithShape(
-                    inTy, expectedLocalTy.getShape());
-              }
-
-              // Rank-1 broadcast inputs use the same rule as the final
-              // broadcast-aware rank-2 consumer:
-              //   row broadcast    (d0, d1) -> (d0): tensor<M> -> tensor<tileM>
-              //   column broadcast (d0, d1) -> (d1): tensor<N> -> tensor<N>
-              if (!inputLocalTy && expectedLocalTy.getRank() == 2 &&
-                  inTy.getRank() == 1 &&
-                  (isRowBroadcastMap(inputMap) ||
-                   isColumnBroadcastMap(inputMap))) {
-                inputLocalTy = shapeInfo.getExpectedLocalTypeForOperand(
-                    inTy, inputMap, expectedLocalTy);
-              }
-
-              if (!inputLocalTy)
-                return Value();
-
-              Value localInput =
-                  materializeLocalValue(in->get(), inputLocalTy, cache);
-              if (!localInput)
-                return Value();
-
-              localInputs.push_back(localInput);
-            }
-
-            SmallVector<Value> localOutputs;
-            localOutputs.reserve(numOutputs);
-            for (RankedTensorType localResultTy : localResultTypes)
-              localOutputs.push_back(
-                  buildTensorEmptyLike(prod.getLoc(), localResultTy));
-
-            auto localProd = mlir::linalg::GenericOp::create(
-                b, prod.getLoc(),
-                /*resultTensorTypes=*/TypeRange(resultTensorTypes),
-                /*inputs=*/ValueRange(localInputs),
-                /*outputs=*/ValueRange(localOutputs),
-                /*indexingMaps=*/prod.getIndexingMapsArray(),
-                /*iteratorTypes=*/prod.getIteratorTypesArray(),
-                /*doc=*/StringRef(), /*libraryCall=*/StringRef());
-
-            if (!hasCompatibleRegionArgumentTypes(prod.getRegion().front(),
-                                                  localInputs, localOutputs))
-              return Value();
-
-            cloneLinalgRegion(prod.getRegion(), localProd.getRegion());
-
-            for (auto [oldResult, newResult] :
-                 llvm::zip(prod->getResults(), localProd->getResults()))
-              cache[oldResult] = newResult;
-
-            return localProd->getResult(requestedResultNumber);
-          };
-
-          if (Value localMultiResult = tryLocalizeMultiResultGeneric())
-            return localMultiResult;
-
-          if (isShapePreservingElementwiseGeneric(prod, expectedLocalTy)) {
-            SmallVector<Value> prodInputs;
-            const int64_t nIn = prod.getNumDpsInputs();
-            prodInputs.reserve(nIn);
-            for (int64_t i = 0; i < nIn; ++i) {
-              Value inV = prod.getDpsInputOperand(i)->get();
-              auto inTy = dyn_cast<RankedTensorType>(inV.getType());
-              if (!inTy)
-                return Value();
-
-              // Preserve the input element type.  Some producer chains
-              // contain type-changing generics, for example f16 -> f32.
-              // The local result type is driven by expectedLocalTy, but each
-              // localized input must keep the element type of the original
-              // input tensor.  Reusing expectedLocalTy for inputs would
-              // incorrectly turn tensor<...xf16> inputs into tensor<...xf32>
-              // and may make the cloned region yield a value whose type no
-              // longer matches the enclosing linalg.generic output.
-              RankedTensorType inputLocalTy = shapeInfo.getLocalTypeWithShape(
-                  inTy, expectedLocalTy.getShape());
-              if (!inputLocalTy)
-                return Value();
-
-              prodInputs.push_back(
-                  materializeLocalValue(inV, inputLocalTy, cache));
-            }
-
-            Value outLocalInit = mlir::tensor::EmptyOp::create(
-                b, prod.getLoc(), expectedLocalTy.getShape(),
-                expectedLocalTy.getElementType());
-
-            auto newProd = mlir::linalg::GenericOp::create(
-                b, prod.getLoc(),
-                /*resultTensorTypes=*/TypeRange{expectedLocalTy},
-                /*inputs=*/ValueRange{prodInputs},
-                /*outputs=*/ValueRange{outLocalInit},
-                /*indexingMaps=*/prod.getIndexingMapsArray(),
-                /*iteratorTypes=*/prod.getIteratorTypesArray(),
-                /*doc=*/StringRef(), /*libraryCall=*/StringRef());
-
-            if (!hasCompatibleRegionArgumentTypes(prod.getRegion().front(),
-                                                  prodInputs,
-                                                  ValueRange{outLocalInit}))
-              return Value();
-
-            cloneLinalgRegion(prod.getRegion(), newProd.getRegion());
-
-            Value localRes = newProd.getResult(0);
-            cache[base] = localRes;
-            return localRes;
-          }
-
-          // Broadcast-aware rank-2 elementwise producer:
-          //   tensor<MxN>, tensor<M>, tensor<N> -> tensor<MxN>
-          //
-          // When expectedLocalTy is tensor<localM x N>, rank-2 identity inputs
-          // are localized to tensor<localM x N>, row-broadcast inputs are
-          // localized to tensor<localM>, and column-broadcast inputs remain
-          // tensor<N> replicated on every participant. This covers the final
-          // blocked-layer-norm generic:
-          //   x[row, col], rstd[row], gamma[col], beta[col]
-          auto prodResTy =
-              dyn_cast<RankedTensorType>(prod.getResult(0).getType());
-          auto prodMaps = prod.getIndexingMapsArray();
-          if (isSupportedBroadcast2DGeneric(
-                  prod, prodResTy,
-                  [&]() {
-                    SmallVector<RankedTensorType> tys;
-                    tys.reserve(prod.getNumDpsInputs());
-                    for (OpOperand *in : prod.getDpsInputOperands())
-                      tys.push_back(
-                          dyn_cast<RankedTensorType>(in->get().getType()));
-                    return tys;
-                  }()) &&
-              expectedLocalTy.getRank() == 2) {
-            SmallVector<Value> prodInputs;
-            prodInputs.reserve(prod.getNumDpsInputs());
-
-            for (OpOperand *in : prod.getDpsInputOperands()) {
-              auto inTy = dyn_cast<RankedTensorType>(in->get().getType());
-              if (!inTy)
-                return Value();
-
-              +RankedTensorType inputLocalTy =
-                  shapeInfo.getExpectedLocalTypeForOperand(
-                      inTy, prodMaps[in->getOperandNumber()], expectedLocalTy);
-              if (!inputLocalTy)
-                return Value();
-
-              prodInputs.push_back(
-                  materializeLocalValue(in->get(), inputLocalTy, cache));
-            }
-
-            Value outLocalInit =
-                buildTensorEmptyLike(prod.getLoc(), expectedLocalTy);
-            auto newProd = mlir::linalg::GenericOp::create(
-                b, prod.getLoc(),
-                /*resultTensorTypes=*/TypeRange{expectedLocalTy},
-                /*inputs=*/ValueRange{prodInputs},
-                /*outputs=*/ValueRange{outLocalInit},
-                /*indexingMaps=*/prod.getIndexingMapsArray(),
-                /*iteratorTypes=*/prod.getIteratorTypesArray(),
-                /*doc=*/StringRef(), /*libraryCall=*/StringRef());
-
-            if (!hasCompatibleRegionArgumentTypes(prod.getRegion().front(),
-                                                  prodInputs,
-                                                  ValueRange{outLocalInit}))
-              return Value();
-
-            cloneLinalgRegion(prod.getRegion(), newProd.getRegion());
-
-            Value localRes = newProd.getResult(0);
-            cache[base] = localRes;
-            return localRes;
-          }
-        }
-
-        // scf.for with tensor iter_args: build a shard-local clone of the
-        // loop on demand and return the corresponding local loop result.
-        //
-        // This path does not distribute the IV. It keeps the recurrence loop
-        // intact on every NSP thread, but carries only shard-local tensor
-        // state through the loop. This is the non-collective strategy for
-        // online recurrences over K/V blocks.
-        if (auto forOp =
-                dyn_cast_or_null<mlir::scf::ForOp>(base.getDefiningOp())) {
-          if (succeeded(localizeScfForWithTensorIterArgs(forOp, cache))) {
-            auto localIt = cache.find(base);
-            if (localIt != cache.end() &&
-                localIt->second.getType() == expectedLocalTy)
-              return localIt->second;
-          }
-        }
-
-        // Fallback: slice the global value.
-        Value local = mlir::shard::AllSliceOp::create(
-                          b, base.getLoc(), /*result_type=*/expectedLocalTy,
-                          /*input=*/base,
-                          /*grid=*/"nsp",
-                          /*gridAxes=*/gridAxes,
-                          /*sliceAxis=*/shapeInfo.splitAxis)
-                          .getResult();
-        cache[base] = local;
-        return local;
+        return valueMaterializer.materialize(v, expectedLocalTy, cache);
       };
 
       // Build a shard-local clone of an scf.for with tensor iter_args.
