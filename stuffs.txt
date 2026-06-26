@@ -1,3 +1,9 @@
+Thanks for the contribution. I reviewed the test set and I think it provides good initial coverage for the pipeline-level behavior, especially around the planner, propagation, end-to-end flow, and shard-to-LLVM lowering.
+
+There is some overlap with a set of more focused lit tests I have been preparing, mainly around `shard_planner` and `shard_to_llvm`. My preference is to land this as the initial coverage and then follow up with a separate PR adding more targeted regression tests for individual contracts, such as elementwise localization, broadcast row/column localization, materialization, and loop distribution.
+
+From my side, assuming CI is green, I am happy to approve this and build on top of it in a follow-up.
+
 [Hexagon][NSP] Refactor NSPLocalize pass driver
 
 Split the monolithic NSPLocalizePass::runOnOperation implementation into
