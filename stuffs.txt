@@ -4,15 +4,25 @@ There is some overlap with a set of more focused lit tests I have been preparing
 
 From my side, assuming CI is green, I am happy to approve this and build on top of it in a follow-up.
 
-[Hexagon][NSP] Refactor NSPLocalize pass driver
+[NSP] Add lit coverage for sharding pipeline stages
+
+The tests document the expected IR contracts between the individual passes and
+provide regression coverage for the tensor-local SPMD path, broadcast handling,
+scf.for localization patterns, and shard dialect cleanup/lowering behavior.
+
+This improves coverage for both standalone pass behavior and pipeline-level
+composition without changing the implementation.
+
+[NSPSharding] Refactor NSPLocalize pass driver. Add lit coverage for sharding pipeline stages
 
 Split the monolithic NSPLocalizePass::runOnOperation implementation into
 focused helpers for pass setup, loop distribution, shard annotation cleanup,
 sink discovery, local type inference, producer localization, and materialize
 tile hand-off.
 
-This is intended to preserve behavior while making the localization flow easier
-to review and extend.
+Add lit tests covering the main NSP sharding bring-up paths, including shard
+planning, localization, materialization, loop distribution, sharding propagation,
+and shard-to-LLVM lowering.
 
 NSPLocalizePass::runOnOperation has grown into a monolithic implementation
 with several independent responsibilities, including pass setup, loop distribution,
