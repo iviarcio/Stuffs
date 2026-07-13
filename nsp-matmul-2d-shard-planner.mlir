@@ -13,27 +13,22 @@ module {
       %a: tensor<128x32xf32>,
       %b: tensor<32x64xf32>,
       %init: tensor<128x64xf32>) -> tensor<128x64xf32> {
+    // CHECK: shard.grid @nsp(shape = 16x4)
     // CHECK-LABEL: func.func @matmul_2d_grid_plan
 
-    // A(i, k): the row dimension is mapped to grid axis 0, while the
-    // reduction dimension remains replicated.
-    // CHECK-DAG: %[[SH_A:.*]] = shard.sharding @nsp split_axes = {{\[\[0\], *\[\]\]}} : !shard.sharding
+    // Match all descriptors by their split_axes first, then check which operand uses each one.
+    // CHECK-DAG: %[[SH_C:[A-Za-z0-9_]+]] = shard.sharding @nsp split_axes = {{\[\[0\], \[1\]\]}} : !shard.sharding
+    // CHECK-DAG: %[[SH_B:[A-Za-z0-9_]+]] = shard.sharding @nsp split_axes = {{\[\[\], \[1\]\]}} : !shard.sharding
+    // CHECK-DAG: %[[SH_A:[A-Za-z0-9_]+]] = shard.sharding @nsp split_axes = {{\[\[0\], \[\]\]}} : !shard.sharding
 
-    // B(k, j): the reduction dimension remains replicated, while the column
-    // dimension is mapped to grid axis 1.
-    // CHECK-DAG: %[[SH_B:.*]] = shard.sharding @nsp split_axes = {{\[\[\], *\[1\]\]}} : !shard.sharding
-
-    // C(i, j): the output tile is split on both logical tensor dimensions:
-    // rows on grid axis 0 and columns on grid axis 1.
-    // CHECK-DAG: %[[SH_C:.*]] = shard.sharding @nsp split_axes = {{\[\[0\], *\[1\]\]}} : !shard.sharding
-
-    // CHECK-DAG: %[[A_SHARDED:.*]] = shard.shard %{{.*}} to %[[SH_A]] annotate_for_users : tensor<128x32xf32>
-    // CHECK-DAG: %[[B_SHARDED:.*]] = shard.shard %{{.*}} to %[[SH_B]] annotate_for_users : tensor<32x64xf32>
-    // CHECK-DAG: %[[C_SHARDED:.*]] = shard.shard %{{.*}} to %[[SH_C]] annotate_for_users : tensor<128x64xf32>
+    // CHECK: %[[A_SHARDED:[A-Za-z0-9_]+]] = shard.shard %arg0 to %[[SH_A]] annotate_for_users : tensor<128x32xf32>
+    // CHECK: %[[B_SHARDED:[A-Za-z0-9_]+]] = shard.shard %arg1 to %[[SH_B]] annotate_for_users : tensor<32x64xf32>
+    // CHECK: %[[C_SHARDED:[A-Za-z0-9_]+]] = shard.shard %arg2 to %[[SH_C]] annotate_for_users : tensor<128x64xf32>
 
     // CHECK: linalg.generic
-    // CHECK-SAME: ins(%[[A_SHARDED]], %[[B_SHARDED]] : tensor<128x32xf32>, tensor<32x64xf32>)
-    // CHECK-SAME: outs(%[[C_SHARDED]] : tensor<128x64xf32>)
+    // CHECK-SAME: ins(%[[A_SHARDED]], %[[B_SHARDED]]
+    // CHECK-SAME: outs(%[[C_SHARDED]]
+
     %0 = linalg.generic {
         indexing_maps = [#map_a, #map_b, #map_c],
         iterator_types = ["parallel", "parallel", "reduction"]}
