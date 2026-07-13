@@ -1,3 +1,32 @@
+[NSPSharding] Enable 2-D matmul localization and materialization
+
+Consume the planner's 2-D matmul sharding annotations by slicing A, B, and C
+according to independent core/thread grid axes. Materialize 2-D output tiles
+with separate row and column offsets derived from core id and thread id, and
+teach ShardToLLVM to lower shard.all_slice according to grid_axes.
+
+The legacy flattened sharding path remains unchanged for existing elementwise
+and unsupported cases.
+
+[NSPSharding] Materialize 2-D matmul sharding across cores and threads
+
+Extend the NSP sharding pipeline to consume the 2-D matmul sharding plan
+introduced by the planner.
+
+This change teaches localization to recognize matmul-like linalg.generic
+operations annotated with independent grid axes, slicing A along the row/core
+axis, B along the column/thread axis, and C along both axes. It also updates
+materialization to compute independent destination offsets for 2-D output tiles,
+using the Hexagon core and thread IDs directly when the tile shape indicates a
+per-axis partition.
+
+ShardToLLVM is updated so shard.all_slice respects its grid_axes attribute:
+axis 0 maps to core id, axis 1 maps to thread id, and the flattened {0, 1}
+case preserves the legacy linear participant index behavior.
+
+This enables the first end-to-end 2-D matmul path in NSPSharding while keeping
+the existing flattened elementwise sharding behavior unchanged.
+
 [NSPSharding] Add experimental 2-D matmul sharding plan
 
 This patch adds per-loop grid-axis mappings to ShardPlan.
