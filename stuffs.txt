@@ -1,10 +1,14 @@
-Thanks for the contribution. I reviewed the test set and I think it provides good initial coverage for the pipeline-level behavior, especially around the planner, propagation, end-to-end flow, and shard-to-LLVM lowering.
+[NSPSharding] Add experimental 2-D matmul sharding plan
 
-There is some overlap with a set of more focused lit tests I have been preparing, mainly around `shard_planner` and `shard_to_llvm`. My preference is to land this as the initial coverage and then follow up with a separate PR adding more targeted regression tests for individual contracts, such as elementwise localization, broadcast row/column localization, materialization, and loop distribution.
+This patch adds per-loop grid-axis mappings to ShardPlan.
+Keeps the legacy flattened path for elementwise and unsupported cases.
+Recognizes matmul-like linalg.generic contractions.
+Maps i -> grid axis 0 and j -> grid axis 1.
+Keeps the reduction iterator k replicated/local.
+Falls back to the flattened plan when the matmul pattern or divisibility
+constraints are not satisfied.
 
-From my side, assuming CI is green, I am happy to approve this and build on top of it in a follow-up.
-
-[NSP] Add lit coverage for sharding pipeline stages
+[NSPSharding] Add lit coverage for sharding pipeline stages
 
 The tests document the expected IR contracts between the individual passes and
 provide regression coverage for the tensor-local SPMD path, broadcast handling,

@@ -71,6 +71,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <utility>
 
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
@@ -106,21 +107,51 @@ struct ShardPolicy {
 /// Normalized information read from the actual shard.grid symbol.
 struct GridShapeInfo {
   int64_t numShards = 0;
+  SmallVector<int64_t, 2> axisExtents;
   SmallVector<int16_t, 2> flattenedGridAxes;
+
+  bool is2DGrid() const { return axisExtents.size() == 2; }
+
+  int64_t getAxisExtent(int16_t axis) const {
+    if (axis < 0 || axis >= static_cast<int16_t>(axisExtents.size()))
+      return 0;
+    return axisExtents[axis];
+  }
+};
+
+/// Map one linalg loop iterator to one or more grid axes.
+struct LoopGridAxisMapping {
+  int64_t loopIter = -1;
+  SmallVector<int16_t, 2> gridAxes;
 };
 
 /// A structured description of the sharding decision for a single op.
 struct ShardPlan {
-  // The chosen loop iterator index to shard (e.g. i or j in matmul).
+  // Primary loop iterator.  The legacy path maps only this iterator to the
+  // flattened grid.  Multi-axis plans may map additional iterators below.
   int64_t shardIter = -1;
 
   // Whether this plan requires a cross-NSP all-reduce to be correct.
   bool requiresAllReduce = false;
 
-  // Grid axes used to shard the selected tensor dimension.  In this first
-  // 2-D-grid step, the axes are intentionally flattened to preserve the old
-  // one-dimensional behavior.
-  SmallVector<int16_t, 2> gridAxes;
+  // Per-loop grid-axis mapping.  Legacy elementwise plans contain one entry
+  // mapping `shardIter` to all flattened grid axes.  Matmul plans may contain
+  // multiple entries, e.g. i -> axis 0 and j -> axis 1.
+  SmallVector<LoopGridAxisMapping, 2> loopGridAxes;
+
+  void addLoopGridAxes(int64_t loopIter, ArrayRef<int16_t> axes) {
+    LoopGridAxisMapping mapping;
+    mapping.loopIter = loopIter;
+    mapping.gridAxes.assign(axes.begin(), axes.end());
+    loopGridAxes.push_back(std::move(mapping));
+  }
+
+  ArrayRef<int16_t> getGridAxesForLoopIter(int64_t loopIter) const {
+    for (const LoopGridAxisMapping &mapping : loopGridAxes)
+      if (mapping.loopIter == loopIter)
+        return mapping.gridAxes;
+    return {};
+  }
 };
 
 /// Planner pass that attaches explicit shard annotations to linalg.generic ops.
@@ -138,8 +169,10 @@ struct ShardPlan {
 ///  - A tensor dimension is sharded only if it is indexed directly by a
 ///    selected loop iterator.
 ///  - All other dimensions are treated as replicated.
-///  - The current implementation may use a 2-D shard grid, but flattens all
+///  - The default implementation may use a 2-D shard grid, but flattens all
 ///    grid axes onto the selected tensor dimension to preserve legacy behavior.
+///  - Matmul-like contractions may map output parallel iterators to distinct
+///    grid axes, allowing cores and threads to model independent tensor axes.
 ///
 /// This separation of concerns keeps planning, propagation, and lowering
 /// orthogonal, enabling multiple SPMDization strategies to consume the same
@@ -261,6 +294,7 @@ private:
 
     GridShapeInfo info;
     info.numShards = 1;
+    info.axisExtents.reserve(shape.size());
     info.flattenedGridAxes.reserve(shape.size());
 
     for (auto [axis, extent] : llvm::enumerate(shape)) {
@@ -270,6 +304,7 @@ private:
         return failure();
       }
       info.numShards *= extent;
+      info.axisExtents.push_back(extent);
       info.flattenedGridAxes.push_back(static_cast<int16_t>(axis));
     }
 
@@ -366,9 +401,9 @@ private:
   ///
   /// This is intentionally simple and sufficient for current bring-up
   /// elementwise/broadcast patterns such as online softmax.
-  static bool isOperandMapCompatibleWithShardIter(AffineMap map,
-                                                  int64_t shardIter) {
-    (void)shardIter;
+  static bool isOperandMapCompatibleWithShardPlan(AffineMap map,
+                                                   const ShardPlan &plan) {
+    (void)plan;
 
     if (!map.isProjectedPermutation())
       return false;
@@ -512,6 +547,57 @@ private:
     return std::nullopt;
   }
 
+  /// Return the tensor result dimension indexed directly by `loopIter`.
+  static std::optional<int64_t> getTensorDimForLoopIter(AffineMap map,
+                                                        int64_t loopIter) {
+    for (auto [tensorDim, expr] : llvm::enumerate(map.getResults())) {
+      auto dim = dyn_cast<AffineDimExpr>(expr);
+      if (dim && static_cast<int64_t>(dim.getPosition()) == loopIter)
+        return static_cast<int64_t>(tensorDim);
+    }
+    return std::nullopt;
+  }
+
+  /// Build an experimental 2-D matmul plan that maps:
+  ///   i -> grid axis 0 (cores)
+  ///   j -> grid axis 1 (threads)
+  /// while keeping the reduction dimension local/replicated.
+  static FailureOr<ShardPlan>
+  buildMatmul2DPlan(linalg::GenericOp op, const GridShapeInfo &gridInfo,
+                    RankedTensorType outputTy, int64_t iIter, int64_t jIter) {
+    if (!gridInfo.is2DGrid())
+      return failure();
+
+    if (!outputTy || !outputTy.hasStaticShape())
+      return failure();
+
+    linalg::LinalgOp linalgOp(op);
+    AffineMap outMap = op.getIndexingMapsArray()[linalgOp.getNumDpsInputs()];
+
+    std::optional<int64_t> iDim = getTensorDimForLoopIter(outMap, iIter);
+    std::optional<int64_t> jDim = getTensorDimForLoopIter(outMap, jIter);
+    if (!iDim || !jDim || *iDim == *jDim)
+      return failure();
+
+    int64_t iExtent = outputTy.getDimSize(*iDim);
+    int64_t jExtent = outputTy.getDimSize(*jDim);
+    int64_t coreExtent = gridInfo.getAxisExtent(/*axis=*/0);
+    int64_t threadExtent = gridInfo.getAxisExtent(/*axis=*/1);
+
+    if (iExtent <= 0 || jExtent <= 0 || coreExtent <= 0 ||
+        threadExtent <= 0)
+      return failure();
+    if (iExtent % coreExtent != 0 || jExtent % threadExtent != 0)
+      return failure();
+
+    ShardPlan plan;
+    plan.shardIter = iIter;
+    plan.requiresAllReduce = false;
+    plan.addLoopGridAxes(iIter, ArrayRef<int16_t>{0});
+    plan.addLoopGridAxes(jIter, ArrayRef<int16_t>{1});
+    return plan;
+  }
+
   /// Build a sharding plan for a linalg.generic op.
   ///
   /// The key inputs are:
@@ -525,17 +611,13 @@ private:
   ///     mark requiresAllReduce=true.
   static FailureOr<ShardPlan> buildPlanForGeneric(linalg::GenericOp op,
                                                   const GridShapeInfo &gridInfo) {
-    ShardPlan plan;
-    plan.gridAxes.assign(gridInfo.flattenedGridAxes.begin(),
-                         gridInfo.flattenedGridAxes.end());
-
-    // Extract iterator types
+    // Extract iterator types.
     SmallVector<mlir::utils::IteratorType> iters;
     iters.reserve(op.getNumLoops());
     for (mlir::utils::IteratorType it : op.getIteratorTypesArray())
       iters.push_back(it);
 
-    // Identify output indexing map
+    // Identify output indexing map.
     // We assume single output for simplicity (generalize as needed).
     linalg::LinalgOp linalgOp(op);
     if (linalgOp.getNumDpsInits() != 1)
@@ -543,7 +625,23 @@ private:
     AffineMap outMap = op.getIndexingMapsArray().back();
     auto outTy = dyn_cast<RankedTensorType>(op.getResult(0).getType());
 
-    // Pick a sharding iterator.
+    // Experimental matmul-specific path: use the two independent 2-D grid axes
+    // instead of flattening them onto one tensor dimension.
+    int64_t iIter = -1, jIter = -1, kIter = -1;
+    if (matchMatmulLike(op, iIter, jIter, kIter)) {
+      FailureOr<ShardPlan> matmulPlan =
+          buildMatmul2DPlan(op, gridInfo, outTy, iIter, jIter);
+      if (succeeded(matmulPlan)) {
+        for (AffineMap map : op.getIndexingMapsArray())
+          if (!isOperandMapCompatibleWithShardPlan(map, *matmulPlan))
+            return failure();
+        return matmulPlan;
+      }
+    }
+
+    ShardPlan plan;
+
+    // Pick a sharding iterator for the legacy flattened path.
     if (auto transposeChoice = pickShardIteratorFromTransposeInput(op))
       plan.shardIter = *transposeChoice;
     else
@@ -552,16 +650,18 @@ private:
     if (plan.shardIter < 0)
       return failure();
 
+    plan.addLoopGridAxes(plan.shardIter, gridInfo.flattenedGridAxes);
+
     // Validate that every operand/result map is compatible with deriving
-    // operand-local split_axes from the single chosen shard iterator.
+    // operand-local split_axes from the chosen shard iterator(s).
     //
     // This intentionally allows heterogenous operand shardings, including
     // different ranks, as long as they are all consistent with the same
-    // loop iterator decision. This is required for broadcast-style patterns
+    // loop-iterator decision. This is required for broadcast-style patterns
     // such as:
     //   ins(tensor<MxN>, tensor<M>) -> outs(tensor<MxN>)
     for (AffineMap map : op.getIndexingMapsArray()) {
-      if (!isOperandMapCompatibleWithShardIter(map, plan.shardIter))
+      if (!isOperandMapCompatibleWithShardPlan(map, plan))
         return failure();
     }
 
@@ -864,7 +964,7 @@ private:
   ///
   /// This function is invoked once per linalg::GenericOp selected by the
   /// NSP shard planner, after a sharding plan has been computed (i.e. a loop
-  /// iterator to shard has already been chosen).
+  /// iterator(s) to shard have already been chosen).
   ///
   /// The original linalg::GenericOp is replaced by a new one that consumes
   /// the sharded operands; the region body is moved without cloning.
@@ -907,10 +1007,11 @@ private:
     ///
     /// For each tensor dimension `d`, the dimension is marked as sharded if:
     ///   - The indexing map result for `d` is an AffineDimExpr, and
-    ///   - That dimension expression refers exactly to `plan.shardIter`.
+    ///   - That dimension expression refers to a loop iterator mapped by the
+    ///     plan to one or more grid axes.
     ///
     /// In other words, a tensor dimension is sharded iff it is indexed
-    /// directly by the loop iterator selected for sharding.
+    /// directly by a loop iterator selected for sharding.
     ///
     /// This is operand-local by design. Therefore, different operands of the
     /// same generic may end up with different split_axes arrays, including
@@ -918,8 +1019,8 @@ private:
     ///
     /// The result is an array of length equal to the tensor rank, where:
     ///   - An empty GridAxesAttr (`[]`) denotes replication.
-    ///   - A GridAxesAttr containing the plan grid axes denotes sharding along
-    ///     the flattened NSP grid, preserving the old logical 1-D behavior.
+    ///   - A GridAxesAttr containing the mapped plan grid axes denotes sharding
+    ///     along those NSP grid axes.
     ///
     /// Even if all dimensions are replicated, an explicit rank-sized array
     /// is returned.
@@ -931,20 +1032,20 @@ private:
 
       // map: (loops...) -> (tensor_dims...)
       for (int64_t d = 0; d < rtt.getRank(); ++d) {
-        bool splitThisDim = false;
+        ArrayRef<int16_t> mappedGridAxes;
 
         // Only consider direct dim expressions for now.
         if (d < (int64_t)map.getNumResults()) {
           if (auto dimExpr = dyn_cast<AffineDimExpr>(map.getResult(d))) {
-            if ((int64_t)dimExpr.getPosition() == plan.shardIter)
-              splitThisDim = true;
+            mappedGridAxes =
+                plan.getGridAxesForLoopIter(dimExpr.getPosition());
           }
         }
 
-        if (splitThisDim) {
-          // Shard this tensor dimension on the flattened NSP grid axes.
-          perDimAxes.push_back(shard::GridAxesAttr::get(
-              ctx, llvm::ArrayRef<int16_t>(plan.gridAxes)));
+        if (!mappedGridAxes.empty()) {
+          // Shard this tensor dimension on the mapped NSP grid axes.
+          perDimAxes.push_back(
+              shard::GridAxesAttr::get(ctx, mappedGridAxes));
         } else {
           // Replicated tensor dimension.
           perDimAxes.push_back(
@@ -986,7 +1087,7 @@ private:
       // This keeps the planner explicit for current bring-up and avoids
       // constructing misleading sharding descriptors for affine expressions
       // with arithmetic/symbols/repetitions.
-      if (!isOperandMapCompatibleWithShardIter(map, plan.shardIter))
+      if (!isOperandMapCompatibleWithShardPlan(map, plan))
         return Value();
 
       // Build split_axes = [ GridAxesAttr, GridAxesAttr, ... ] (rank entries).
