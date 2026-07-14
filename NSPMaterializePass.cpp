@@ -92,86 +92,57 @@ static Value castToIndexIfNeeded(Value v, OpBuilder &b, Location loc) {
   return Value();
 }
 
-struct LinearIdxABI {
-  Value cid;
-  Value tid;
-  Value ntpc;
-  Value numCores;
-};
-
-static FailureOr<LinearIdxABI> resolveLinearIdxABIFromTail(func::FuncOp func) {
-  auto args = func.getArguments();
-  int64_t n = static_cast<int64_t>(args.size());
-  if (n < 6)
-    return failure();
-
-  LinearIdxABI abi;
-  abi.cid = args[n - 2];
-  abi.tid = args[n - 3];
-  abi.numCores = args[n - 5];
-  abi.ntpc = args[n - 6];
-  return abi;
-}
-
-/// Compute the participant linear index from the Hexagon entry-point ABI:
-///   linearIdx = coreId * numThreadsPerCore + threadId
 static FailureOr<Value>
-computeLinearIdxFromFuncArgs(func::FuncOp func, OpBuilder &b, Location loc) {
-  auto abiOrFail = resolveLinearIdxABIFromTail(func);
-  if (failed(abiOrFail))
+computeProcessIndexForGridAxes(mlir::shard::GridOp grid, OpBuilder &b,
+                               Location loc, ArrayRef<int16_t> gridAxes) {
+  if (!grid || gridAxes.empty())
     return failure();
 
-  LinearIdxABI abi = *abiOrFail;
-  Value cid = castToIndexIfNeeded(abi.cid, b, loc);
-  Value tid = castToIndexIfNeeded(abi.tid, b, loc);
-  Value ntpc = castToIndexIfNeeded(abi.ntpc, b, loc);
-  if (!cid || !tid || !ntpc)
+  ArrayRef<int64_t> gridShape = grid.getShape();
+  if (gridShape.empty() || gridShape.size() > 2)
     return failure();
 
-  Value mul = arith::MulIOp::create(b, loc, cid, ntpc);
-  return arith::AddIOp::create(b, loc, mul, tid).getResult();
-}
+  for (int64_t extent : gridShape)
+    if (extent <= 0)
+      return failure();
 
-static FailureOr<Value>
-computeProcessIndexForGridAxes(func::FuncOp func, OpBuilder &b, Location loc,
-                               ArrayRef<int16_t> gridAxes) {
-  if (gridAxes.empty())
+  Value linearIdx = mlir::shard::ProcessLinearIndexOp::create(b, loc, grid);
+
+  auto getAxisIndex = [&](int16_t axis) -> FailureOr<Value> {
+    if (axis < 0 || axis >= static_cast<int16_t>(gridShape.size()))
+      return failure();
+
+    if (gridShape.size() == 1)
+      return linearIdx;
+
+    Value minorExtent =
+        arith::ConstantIndexOp::create(b, loc, gridShape[1]);
+    if (axis == 0)
+      return arith::DivUIOp::create(b, loc, linearIdx, minorExtent)
+          .getResult();
+    if (axis == 1)
+      return arith::RemUIOp::create(b, loc, linearIdx, minorExtent)
+          .getResult();
+
+    return failure();
+  };
+
+  if (gridAxes.size() == 1)
+    return getAxisIndex(gridAxes[0]);
+
+  if (gridAxes.size() != 2)
     return failure();
 
-  auto abiOrFail = resolveLinearIdxABIFromTail(func);
-  if (failed(abiOrFail))
+  auto outerOr = getAxisIndex(gridAxes[0]);
+  auto innerOr = getAxisIndex(gridAxes[1]);
+  if (failed(outerOr) || failed(innerOr))
     return failure();
 
-  LinearIdxABI abi = *abiOrFail;
-  Value cid = castToIndexIfNeeded(abi.cid, b, loc);
-  Value tid = castToIndexIfNeeded(abi.tid, b, loc);
-  Value ntpc = castToIndexIfNeeded(abi.ntpc, b, loc);
-  Value numCores = castToIndexIfNeeded(abi.numCores, b, loc);
-  if (!cid || !tid || !ntpc)
-    return failure();
-
-  if (gridAxes.size() == 1) {
-    if (gridAxes[0] == 0)
-      return cid;
-    if (gridAxes[0] == 1)
-      return tid;
-    return failure();
-  }
-
-  if (gridAxes.size() == 2) {
-    if (gridAxes[0] == 0 && gridAxes[1] == 1) {
-      Value mul = arith::MulIOp::create(b, loc, cid, ntpc);
-      return arith::AddIOp::create(b, loc, mul, tid).getResult();
-    }
-    if (gridAxes[0] == 1 && gridAxes[1] == 0) {
-      if (!numCores)
-        return failure();
-      Value mul = arith::MulIOp::create(b, loc, tid, numCores);
-      return arith::AddIOp::create(b, loc, mul, cid).getResult();
-    }
-  }
-
-  return failure();
+  int64_t innerExtent = gridShape[gridAxes[1]];
+  Value innerExtentValue = arith::ConstantIndexOp::create(b, loc, innerExtent);
+  Value scaledOuter =
+      arith::MulIOp::create(b, loc, *outerOr, innerExtentValue).getResult();
+  return arith::AddIOp::create(b, loc, scaledOuter, *innerOr).getResult();
 }
 
 static SmallVector<int16_t, 2> getGridAxesFromOp(Operation *op) {
@@ -202,16 +173,6 @@ static SmallVector<int16_t, 2> getGridAxesFromOp(Operation *op) {
   return axes;
 }
 
-static FailureOr<Value> computeAllSliceProcessIndex(Operation *op,
-                                                    func::FuncOp func,
-                                                    OpBuilder &b,
-                                                    Location loc) {
-  SmallVector<int16_t, 2> gridAxes = getGridAxesFromOp(op);
-  if (gridAxes.empty())
-    return computeLinearIdxFromFuncArgs(func, b, loc);
-  return computeProcessIndexForGridAxes(func, b, loc, gridAxes);
-}
-
 static FailureOr<mlir::shard::GridOp> lookupGrid(Operation *op,
                                                  FlatSymbolRefAttr gridAttr) {
   if (!gridAttr)
@@ -223,6 +184,25 @@ static FailureOr<mlir::shard::GridOp> lookupGrid(Operation *op,
     return failure();
 
   return grid;
+}
+
+static FailureOr<Value> computeAllSliceProcessIndex(Operation *op, OpBuilder &b,
+                                                    Location loc) {
+  auto gridAttr = op->getAttrOfType<FlatSymbolRefAttr>("grid");
+  auto gridOr = lookupGrid(op, gridAttr);
+  if (failed(gridOr))
+    return failure();
+
+  SmallVector<int16_t, 2> gridAxes = getGridAxesFromOp(op);
+  if (gridAxes.empty()) {
+    ArrayRef<int64_t> gridShape = (*gridOr).getShape();
+    gridAxes.reserve(gridShape.size());
+    for (int64_t axis = 0, e = static_cast<int64_t>(gridShape.size());
+         axis < e; ++axis)
+      gridAxes.push_back(static_cast<int16_t>(axis));
+  }
+
+  return computeProcessIndexForGridAxes(*gridOr, b, loc, gridAxes);
 }
 
 /// Helper to extract tileShape
@@ -779,11 +759,8 @@ materializeRankedInputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
       return failure();
     int64_t sliceAxis = *sliceAxisOr;
 
-    auto func = allSlice->getParentOfType<func::FuncOp>();
-    if (!func)
-      return failure();
-
-    auto linearIdxOrFail = computeAllSliceProcessIndex(allSlice.getOperation(), func, b, loc);
+    auto linearIdxOrFail =
+        computeAllSliceProcessIndex(allSlice.getOperation(), b, loc);
     if (failed(linearIdxOrFail))
       return failure();
 
@@ -875,11 +852,8 @@ materializeRank2InputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
       return failure();
     int64_t sliceAxis = *sliceAxisOr;
 
-    auto func = allSlice->getParentOfType<func::FuncOp>();
-    if (!func)
-      return failure();
-
-    auto linearIdxOrFail = computeAllSliceProcessIndex(allSlice.getOperation(), func, b, loc);
+    auto linearIdxOrFail =
+        computeAllSliceProcessIndex(allSlice.getOperation(), b, loc);
     if (failed(linearIdxOrFail))
       return failure();
 
@@ -933,11 +907,8 @@ materializeRank2InputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
         return failure();
       int64_t sliceAxis = *sliceAxisOr;
 
-      auto func = allSliceOp->getParentOfType<func::FuncOp>();
-      if (!func)
-        return failure();
-
-      auto linearIdxOrFail = computeAllSliceProcessIndex(allSliceOp.getOperation(), func, b, loc);
+      auto linearIdxOrFail =
+          computeAllSliceProcessIndex(allSliceOp.getOperation(), b, loc);
       if (failed(linearIdxOrFail))
         return failure();
 
@@ -1023,11 +994,8 @@ materializeRank1InputAsSubview(OpBuilder &b, Location loc, Value inputTensor) {
     if (sliceSize <= 0)
       return failure();
 
-    auto func = allSlice->getParentOfType<func::FuncOp>();
-    if (!func)
-      return failure();
-
-    auto linearIdxOrFail = computeAllSliceProcessIndex(allSlice.getOperation(), func, b, loc);
+    auto linearIdxOrFail =
+        computeAllSliceProcessIndex(allSlice.getOperation(), b, loc);
 
     if (failed(linearIdxOrFail))
       return failure();
@@ -2457,10 +2425,6 @@ materializeTileToDestination(OpBuilder &b,
   // so that the generated values dominate the new memref generic.
   b.setInsertionPoint(tileOp);
 
-  auto func = tileOp->getParentOfType<func::FuncOp>();
-  if (!func)
-    return failure();
-
   ArrayRef<int64_t> gridShape = grid.getShape();
   if (gridShape.empty() || gridShape.size() > 2)
     return failure();
@@ -2509,7 +2473,7 @@ materializeTileToDestination(OpBuilder &b,
     if (axes.empty()) {
       offsets.push_back(b.getIndexAttr(0));
     } else {
-      auto procIdxOr = computeProcessIndexForGridAxes(func, b, loc, axes);
+      auto procIdxOr = computeProcessIndexForGridAxes(grid, b, loc, axes);
       if (failed(procIdxOr))
         return failure();
       Value tileExtent = arith::ConstantIndexOp::create(b, loc, tileShape[d]);
@@ -2538,7 +2502,14 @@ materializeTileToDestination(OpBuilder &b,
   }
 
   if (!hasNonZeroDynamicOffset) {
-    auto procIdxOr = computeLinearIdxFromFuncArgs(func, b, loc);
+    SmallVector<int16_t, 2> flattenedAxes;
+    flattenedAxes.reserve(gridShape.size());
+    for (int64_t axis = 0, e = static_cast<int64_t>(gridShape.size());
+         axis < e; ++axis)
+      flattenedAxes.push_back(static_cast<int16_t>(axis));
+
+    auto procIdxOr =
+        computeProcessIndexForGridAxes(grid, b, loc, flattenedAxes);
     if (failed(procIdxOr))
       return failure();
     Value tileExtent =
