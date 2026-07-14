@@ -4,7 +4,6 @@
 // after the NSP grid was changed from a legacy 1-D grid to a 2-D grid.
 //
 // The input IR models the hand-off produced by NSPLocalizePass:
-//
 //   - the NSP grid is 2-D: 16 cores x 4 threads;
 //   - the elementwise path still flattens all grid axes for this test;
 //   - therefore, tensor<2048x512xf32> is split into 64 local tiles;
@@ -13,19 +12,16 @@
 //     the global destination memref<2048x512xf32>.
 //
 // Expected NSPMaterialize behavior:
-//
-//   - emit shard.process_linear_index for the flattened per-participant index;
+//   - compute the flattened participant index directly from the Hexagon ABI:
+//       linearIdx = cid * ntpc + tid
 //   - create a destination memref.subview:
-//
 //       %out[linearIdx * 32, 0] [32, 512] [1, 1]
-//
 //   - recover memref views for the two tensor tile inputs;
 //   - rebuild the elementwise linalg.generic with memref semantics;
 //   - erase the temporary nsp.materialize_tile op;
 //   - avoid the fallback bufferization.materialize_in_destination path.
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
-
 module {
   shard.grid @nsp(shape = 16x4)
 
@@ -77,21 +73,29 @@ module {
 
 // CHECK-LABEL: func.func @materialize_rank2_elementwise
 
-// nsp-materialize emits shard.process_linear_index for the flattened
-// per-participant index.
-// CHECK: %[[LINEAR_IDX:.*]] = shard.process_linear_index on @nsp : index
+// The pass computes the flattened participant index directly from the ABI.
+// With the function signature above, the relevant tail arguments are:
+//   ntpc = %arg3
+//   tid  = %arg6
+//   cid  = %arg7
+// CHECK-DAG: %[[CID:.*]] = arith.index_cast %arg7 : i32 to index
+// CHECK-DAG: %[[TID:.*]] = arith.index_cast %arg6 : i32 to index
+// CHECK-DAG: %[[NTPC:.*]] = arith.index_cast %arg3 : i32 to index
+
+// CHECK: %[[LINEAR_MUL:.*]] = arith.muli %[[CID]], %[[NTPC]] : index
+// CHECK: %[[LINEAR_IDX:.*]] = arith.addi %[[LINEAR_MUL]], %[[TID]] : index
 
 // The destination offset is linearIdx * tile_shape[0], i.e. linearIdx * 32.
 // CHECK: %[[C32:.*]] = arith.constant 32 : index
 // CHECK: %[[ROW_OFFSET:.*]] = arith.muli %[[LINEAR_IDX]], %[[C32]] : index
 
 // The final destination becomes a per-participant rank-2 subview.
-// CHECK: %[[DST_VIEW:.*]] = memref.subview %{{.*}}[%[[ROW_OFFSET]], 0] [32, 512] [1, 1]
+// CHECK: %[[DST_VIEW:.*]] = memref.subview %arg2[%[[ROW_OFFSET]], 0] [32, 512] [1, 1]
 
 // The tensor tile inputs are recovered as memref subviews over the original
-// input buffers. These are local 32x512 views in the flattened 2-D grid path.
-// CHECK: %[[A_VIEW:.*]] = memref.subview %{{.*}}[%c0, %c0] [32, 512] [1, 1]
-// CHECK: %[[B_VIEW:.*]] = memref.subview %{{.*}}[%c0, %c0] [32, 512] [1, 1]
+// input buffers.
+// CHECK: %[[A_VIEW:.*]] = memref.subview %arg0[%c0, %c0] [32, 512] [1, 1]
+// CHECK: %[[B_VIEW:.*]] = memref.subview %arg1[%c0, %c0] [32, 512] [1, 1]
 
 // The localized tensor linalg.generic is rewritten as a memref linalg.generic
 // consuming the input subviews and writing directly into the destination subview.
