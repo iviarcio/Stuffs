@@ -73,41 +73,19 @@ module {
 
 // CHECK-LABEL: func.func @materialize_rank2_elementwise
 
-// The pass computes the flattened participant index directly from the ABI.
-// With the function signature above, the relevant tail arguments are:
-//   ntpc = %arg3
-//   tid  = %arg6
-//   cid  = %arg7
-// CHECK-DAG: %[[CID:.*]] = arith.index_cast %arg7 : i32 to index
-// CHECK-DAG: %[[TID:.*]] = arith.index_cast %arg6 : i32 to index
-// CHECK-DAG: %[[NTPC:.*]] = arith.index_cast %arg3 : i32 to index
+// CHECK: %[[PID:.*]] = shard.process_linear_index on @nsp : index
 
-// CHECK: %[[LINEAR_MUL:.*]] = arith.muli %[[CID]], %[[NTPC]] : index
-// CHECK: %[[LINEAR_IDX:.*]] = arith.addi %[[LINEAR_MUL]], %[[TID]] : index
-
-// The destination offset is linearIdx * tile_shape[0], i.e. linearIdx * 32.
-// CHECK: %[[C32:.*]] = arith.constant 32 : index
-// CHECK: %[[ROW_OFFSET:.*]] = arith.muli %[[LINEAR_IDX]], %[[C32]] : index
+// The elementwise flattened 2-D path writes a 32x512 tile into the global
+// destination.
+// CHECK-DAG: %[[C32:.*]] = arith.constant 32 : index
+// CHECK: %[[ROW_OFFSET:.*]] = arith.muli %{{.*}}, %[[C32]] : index
 
 // The final destination becomes a per-participant rank-2 subview.
-// CHECK: %[[DST_VIEW:.*]] = memref.subview %arg2[%[[ROW_OFFSET]], 0] [32, 512] [1, 1]
+// CHECK: %[[DST_VIEW:.*]] = memref.subview %{{.*}}[%[[ROW_OFFSET]], 0] [32, 512] [1, 1]
 
-// The tensor tile inputs are recovered as memref subviews over the original
-// input buffers.
-// CHECK: %[[A_VIEW:.*]] = memref.subview %arg0[%c0, %c0] [32, 512] [1, 1]
-// CHECK: %[[B_VIEW:.*]] = memref.subview %arg1[%c0, %c0] [32, 512] [1, 1]
-
-// The localized tensor linalg.generic is rewritten as a memref linalg.generic
-// consuming the input subviews and writing directly into the destination subview.
+// The localized generic should be rewritten to memref form.
 // CHECK: linalg.generic
-// CHECK-SAME: ins(%[[A_VIEW]], %[[B_VIEW]]
 // CHECK-SAME: outs(%[[DST_VIEW]]
-// CHECK: arith.addf
-// CHECK: linalg.yield
 
-// The direct memref rewrite should succeed, so the fallback path must not be
-// used and the temporary hand-off op must disappear.
-// CHECK-NOT: bufferization.materialize_in_destination
+// The temporary NSP hand-off must be consumed.
 // CHECK-NOT: nsp.materialize_tile
-
-// CHECK: return

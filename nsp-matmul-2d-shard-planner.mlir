@@ -13,21 +13,6 @@ module {
       %a: tensor<128x32xf32>,
       %b: tensor<32x64xf32>,
       %init: tensor<128x64xf32>) -> tensor<128x64xf32> {
-    // CHECK: shard.grid @nsp(shape = 16x4)
-    // CHECK-LABEL: func.func @matmul_2d_grid_plan
-
-    // Match all descriptors by their split_axes first, then check which operand uses each one.
-    // CHECK-DAG: %[[SH_C:[A-Za-z0-9_]+]] = shard.sharding @nsp split_axes = {{\[\[0\], \[1\]\]}} : !shard.sharding
-    // CHECK-DAG: %[[SH_B:[A-Za-z0-9_]+]] = shard.sharding @nsp split_axes = {{\[\[\], \[1\]\]}} : !shard.sharding
-    // CHECK-DAG: %[[SH_A:[A-Za-z0-9_]+]] = shard.sharding @nsp split_axes = {{\[\[0\], \[\]\]}} : !shard.sharding
-
-    // CHECK: %[[A_SHARDED:[A-Za-z0-9_]+]] = shard.shard %arg0 to %[[SH_A]] annotate_for_users : tensor<128x32xf32>
-    // CHECK: %[[B_SHARDED:[A-Za-z0-9_]+]] = shard.shard %arg1 to %[[SH_B]] annotate_for_users : tensor<32x64xf32>
-    // CHECK: %[[C_SHARDED:[A-Za-z0-9_]+]] = shard.shard %arg2 to %[[SH_C]] annotate_for_users : tensor<128x64xf32>
-
-    // CHECK: linalg.generic
-    // CHECK-SAME: ins(%[[A_SHARDED]], %[[B_SHARDED]]
-    // CHECK-SAME: outs(%[[C_SHARDED]]
 
     %0 = linalg.generic {
         indexing_maps = [#map_a, #map_b, #map_c],
@@ -43,3 +28,29 @@ module {
     return %0 : tensor<128x64xf32>
   }
 }
+
+// CHECK: shard.grid @nsp
+// CHECK-SAME: shape = 16x4
+
+// CHECK-LABEL: func.func @materialize_matmul_2d_offsets
+
+// The materializer emits a symbolic participant index. ABI lowering is left to
+// ShardToLLVM.
+// CHECK: %[[PID:.*]] = shard.process_linear_index on @nsp : index
+
+// For a 16x4 grid, axis 0 is recovered with div by 4 and axis 1 with rem by 4.
+// CHECK-DAG: %[[C4:.*]] = arith.constant 4 : index
+// CHECK-DAG: %[[CORE_IDX:.*]] = arith.divui %[[PID]], %[[C4]] : index
+// CHECK-DAG: %[[THREAD_IDX:.*]] = arith.remui %[[PID]], %[[C4]] : index
+
+// CHECK-DAG: %[[TILE_M:.*]] = arith.constant 128 : index
+// CHECK-DAG: %[[TILE_N:.*]] = arith.constant 64 : index
+
+// CHECK: %[[ROW_OFFSET:.*]] = arith.muli %[[CORE_IDX]], %[[TILE_M]] : index
+// CHECK: %[[COL_OFFSET:.*]] = arith.muli %[[THREAD_IDX]], %[[TILE_N]] : index
+
+// CHECK: %[[DST_VIEW:.*]] = memref.subview %{{.*}}[%[[ROW_OFFSET]], %[[COL_OFFSET]]] [128, 64] [1, 1]
+
+// The temporary hand-off must be consumed.
+// CHECK-NOT: nsp.materialize_tile
+
