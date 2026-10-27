@@ -106,7 +106,7 @@ struct NSPGridInitPass
     OpBuilder b(ctx);
     b.setInsertionPointToStart(module.getBody());
     SmallVector<int64_t, 2> shape = {numCores, numThreads};
-    shard::GridOp::create(b, module.getLoc()), "nsp",
+    shard::GridOp::create(b, module.getLoc(), "nsp",
                           llvm::ArrayRef<int64_t>(shape));
   }
 
@@ -120,8 +120,7 @@ namespace {
 // Pipeline options (exposed as command-line flags).
 //
 // Usage:
-//   --pass-pipeline="nsp-shard(nsp-count=64 propagate=true
-//   allow-collectives)"
+//   --pass-pipeline="nsp-shard(nsp-count=64 propagate=true allow-collectives)"
 //   --pass-pipeline="nsp-shard(nsp-cores=16 nsp-threads=4)"
 //===----------------------------------------------------------------------===//
 struct NSPShardPipelineOptions
@@ -150,8 +149,8 @@ struct NSPShardPipelineOptions
 
   Option<bool> allowCollectives{
       *this, "allow-collectives",
-      llvm::cl::desc("Allow planner/SPMDization to insert collectives (e.g. "
-                     "all-reduce)"),
+      llvm::cl::desc(
+          "Allow planner/SPMDization to insert collectives (e.g. all-reduce)"),
       llvm::cl::init(false)};
 
   Option<bool> canonicalize{
@@ -166,8 +165,7 @@ struct NSPShardPipelineOptions
 // The pipeline transforms linalg-on-tensor IR into partitioned SPMD code:
 //
 //   Input:   linalg.generic (tensor semantics, single-core)
-//   Output:  per-participant local compute + memref.subview destination
-//   writes
+//   Output:  per-participant local compute + memref.subview destination writes
 //
 // The split between localization (step 3) and materialization (step 4) is
 // intentional: downstream tiling/vectorization runs between them while the IR
