@@ -1274,7 +1274,7 @@ private:
       return false;
     if (linalgOp.getNumDpsInits() != 0)
       return false;
-    if (op->getNumResults) != 0)
+    if (op->getNumResults() != 0)
       return false;
     // Ensure at least one input is a ranked tensor.
     bool hasRankedTensorInput = false;
@@ -1421,9 +1421,9 @@ private:
             continue;
           Value src = copy.getSource();
           if (auto srcSv = src.getDefiningOp<memref::SubViewOp>())
-            src = SrcSv.getSource();
+            src = srcSv.getSource();
           if (auto rc = src.getDefiningOp<memref::ReinterpretCastOp>()) {
-            if (!dyn_cast<BaseMemRefType>(rc.getSource().getType).hasRank() &&
+            if (!dyn_cast<BaseMemRefType>(rc.getSource().getType().hasRank() &&
                 reinterpretCastHasDynamicOffset(rc))
               return true;
           }
@@ -1471,7 +1471,7 @@ private:
                              const GridShapeInfo &gridInfo) {
     SmallVector<mlir::utils::IteratorType> iters;
     iters.reserve(op.getNumLoops());
-    for (mir::utils::IteratorType it : op.getIteratorTypesArray())
+    for (mlir::utils::IteratorType it : op.getIteratorTypesArray())
       iters.push_back(it);
 
     auto maps = op.getIndexingMapsArray();
@@ -1522,7 +1522,7 @@ private:
   /// do not implement the sharding interface. Using attributes avoids that
   /// issue while still giving NSPLocalizePass everything it needs.
   ///
-  /// Emitted attributes on the linalg generic:
+  /// Emitted attributes on the linalg.generic:
   ///   nsp.scatter_shard      : unit   (marker for NSPLocalizePass)
   ///   nsp.scatter_num_shards : i64    (flattened grid size)
   ///   nsp.scatter_grid       : string (grid symbol name, e.g. "@nsp")
@@ -1532,7 +1532,7 @@ private:
                                               llvm::StringMap<Value> &) {
     MLIRContext *ctx = op.getContext();
 
-    // Compute the total shard count from the plan's grid axes
+    // Compute the total shard count from the plan's grid axes.
     // For a 1-D or flattened plan the shardIter maps to all grid axes; we
     // read the numShards from the plan's flattenedGridAxes product.
     // However plan does not store extents; we derive numShards from the
@@ -1545,7 +1545,7 @@ private:
     op->setAttr("nsp.scatter_shard", UnitAttr::get(ctx));
     op->setAttr("nsp.scatter_num_shards",
                 IntegerAttr::get(IntegerType::get(ctx, 64), numShards));
-    op->setAttr("nsp.scatter_grid", StringAttr::get(ctx, grid.getSymName));
+    op->setAttr("nsp.scatter_grid", StringAttr::get(ctx, grid.getSymName()));
   }
 };
 
