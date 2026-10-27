@@ -1368,7 +1368,7 @@ private:
   /// shard.
   ///
   /// Use this for the regular (output-bearing) generic path only.
-  static bool hasPreloadedTiLeInput(linalg::GenericOp op) {
+  static bool hasPreloadedTileInput(linalg::GenericOp op) {
     for (Value operand : op->getOperands()) {
       auto toTensor = operand.getDefiningOp<bufferization::ToTensorOp>();
       if (!toTensor) {
