@@ -305,11 +305,10 @@ struct LowerAllSlice final : public RewritePattern {
     Location loc = op->getLoc();
 
     SmallVector<int16_t, 2> gridAxes = getGridAxesFromOp(op);
-    FailureOr<Value> procIdxOrFail = gridAxes.empty()
-                                          ? computeLinearIdxFromFuncArgs(
-                                                func, rewriter, loc)
-                                          : computeProcessIndexForGridAxes(
-                                                func, rewriter, loc, gridAxes);
+    FailureOr<Value> procIdxOrFail =
+        gridAxes.empty()
+            ? computeLinearIdxFromFuncArgs(func, rewriter, loc)
+            : computeProcessIndexForGridAxes(func, rewriter, loc, gridAxes);
     if (failed(procIdxOrFail))
       return failure();
 

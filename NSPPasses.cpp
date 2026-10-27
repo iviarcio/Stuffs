@@ -27,6 +27,8 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/Pass.h"
@@ -71,127 +73,174 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry);
 using namespace mlir;
 using namespace hexagon;
 
+//===----------------------------------------------------------------------===//
+// NSPGridInitPass - module-level pre-pass that creates shard.grid @nsp.
+//
+// NSPShardPLannerPass is a function-level pass; MLIR runs all functions in
+// parallel when threading is enabled. If two functions race in
+// getOrCreateGrid they both find no existing @nsp symbol and both try to
+// insert one, triggering a "redefinition of symbol 'nsp'" error.
+//
+// This module-level pass runs single-threaded (module passes are never
+// parallelized by MLIR) and creates the symbol before the planner fires.
+// NSPShardPlannerPass::getOrCreateGrid already returns early when the symbol
+// is present, so the two passes compose safely.
+//===----------------------------------------------------------------------===//
+
+struct NSPGridInitPass
+    : public PassWrapper<NSPGridInitPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NSPGridInitPass)
+
+  NSPGridInitPass(int64_t numCores, int64_t numThreads)
+      : numCores(numCores), numThreads(numThreads) {}
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry insert<mlir::shard::ShardDialect>();
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    if (module.lookupSymbol<shard::GridOp>("nsp"))
+      return;
+    MIRContext *ctx = module.getContext();
+    OpBuilder b(ctx);
+    b.setInsertionPointToStart(module.getBody));
+    SmallVector<int64_t, 2> shape = {numCores, numThreads};
+    shard::GridOp::create(b, module.getLoc), "nsp",
+                          llvm::ArrayRef<int64_t>(shape));
+  }
+
+  int64_t numCores;
+  int64_t numThreads;
+}
+
 namespace {
 
-//===----------------------------------------------------------------------===//
-// Pipeline options (exposed as command-line flags).
-//
-// Usage:
-//   --pass-pipeline="nsp-shard(nsp-count=32 propagate=true allow-collectives)"
-//   --pass-pipeline="nsp-shard(nsp-cores=8 nsp-threads=4)"
-//===----------------------------------------------------------------------===//
-struct NSPShardPipelineOptions
-    : public PassPipelineOptions<NSPShardPipelineOptions> {
-  Option<int64_t> nspCount{
-      *this, "nsp-count",
-      llvm::cl::desc(
-          "Legacy flattened number of NSP participants in the mesh"),
-      llvm::cl::init(32)};
-
-  Option<int64_t> nspCores{
-      *this, "nsp-cores",
-      llvm::cl::desc(
-          "Number of NSP cores in grid axis 0. If unset, nsp-count is used."),
-      llvm::cl::init(0)};
-
-  Option<int64_t> nspThreads{
-      *this, "nsp-threads",
-      llvm::cl::desc(
-          "Number of NSP threads per core in grid axis 1. If unset, uses 1."),
-      llvm::cl::init(0)};
-
-  Option<bool> runPropagation{
-      *this, "propagate",
-      llvm::cl::desc("Run sharding propagation after planning"),
-      llvm::cl::init(true)};
-
-  Option<bool> allowCollectives{
-      *this, "allow-collectives",
-      llvm::cl::desc(
-          "Allow planner/SPMDization to insert collectives (e.g. all-reduce)"),
-      llvm::cl::init(false)};
-
-  Option<bool> canonicalize{
-      *this, "canonicalize",
-      llvm::cl::desc("Run canonicalize + CSE at key boundaries"),
-      llvm::cl::init(true)};
-};
-
-//===--------------------------------------------------------------------===//
-// Pipeline construction.
-//
-// The pipeline transforms linalg-on-tensor IR into partitioned SPMD code:
-//
-//   Input:   linalg.generic (tensor semantics, single-core)
-//   Output:  per-participant local compute + memref.subview destination writes
-//
-// The split between localization (step 3) and materialization (step 4) is
-// intentional: downstream tiling/vectorization runs between them while the IR
-// still has pure tensor semantics.
-//
-//  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌───────────────┐
-//  │ 1. Planner   │-->│ 2. Propagate │-->│ 3. Localize  │-->│ 4.Materialize │
-//  └──────────────┘   └──────────────┘   └──────────────┘   └───────────────┘
-//         │                 │                  │                  │
-//  shard.grid/shard   infer missing      local tensor +     memref.subview
-//  annotations        shardings          nsp.materialize_   writes
-//                                        tile
-//===--------------------------------------------------------------------===//
-static void buildNSPShardPipeline(OpPassManager &pm,
-                                  const NSPShardPipelineOptions &opts) {
-
-  // Step 1: Planner - attach shard annotations to linalg.generic ops.
-  // Runs on func.func (analyzes per-function).
+  //===----------------------------------------------------------------------===//
+  // Pipeline options (exposed as command-line flags).
   //
-  // Preserve the legacy nsp-count behavior by default, but allow callers to
-  // expose the hardware topology explicitly as a 2-D grid: [cores, threads].
-  const int64_t numCores = opts.nspCores > 0 ? opts.nspCores : opts.nspCount;
-  const int64_t numThreads = opts.nspThreads > 0 ? opts.nspThreads : 1;
+  // Usage:
+  //   --pass-pipeline="nsp-shard(nsp-count=64 propagate=true
+  //   allow-collectives)"
+  //   --pass-pipeline="nsp-shard(nsp-cores=16 nsp-threads=4)"
+  //===----------------------------------------------------------------------===//
+  struct NSPShardPipelineOptions
+      : public PassPipelineOptions<NSPShardPipelineOptions> {
+    Option<int64_t> nspCount{
+        *this, "nsp-count",
+        llvm::cl::desc(
+            "Legacy flattened number of NSP participants in the mesh"),
+        llvm::cl::init(64)};
 
-  pm.addNestedPass<func::FuncOp>(createNSPShardPlannerPass(
-      numCores, numThreads, opts.allowCollectives));
-  if (opts.canonicalize) {
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
-  }
+    Option<int64_t> nspCores{
+        *this, "nsp-cores",
+        llvm::cl::desc(
+            "Number of NSP cores in grid axis 0. If unset, nsp-count is used."),
+        llvm::cl::init(0)};
 
-  // Step 2: Propagation - infer shardings for unannotated operands by
-  // traversing the dataflow graph (backward then forward). Relies on
-  // ShardingInterface external models registered by
-  // registerNSPShardInterfaceModels().
-  if (opts.runPropagation) {
-    pm.addNestedPass<func::FuncOp>(createNSPShardingPropagationPass());
-  }
-  if (opts.canonicalize) {
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
-  }
+    Option<int64_t> nspThreads{
+        *this, "nsp-threads",
+        llvm::cl::desc(
+            "Number of NSP threads per core in grid axis 1. If unset, uses 1."),
+        llvm::cl::init(0)};
 
-  // Step 3: Localization - rewrite sharded compute into per-participant
-  // local tensor ops. Emits nsp.materialize_tile as a hand-off to step 4.
-  // In non-collective mode, also distributes scf.for loops cyclically.
+    Option<bool> runPropagation{
+        *this, "propagate",
+        llvm::cl::desc("Run sharding propagation after planning"),
+        llvm::cl::init(true)};
+
+    Option<bool> allowCollectives{
+        *this, "allow-collectives",
+        llvm::cl::desc("Allow planner/SPMDization to insert collectives (e.g. "
+                       "all-reduce)"),
+        llvm::cl::init(false)};
+
+    Option<bool> canonicalize{
+        *this, "canonicalize",
+        llvm::cl::desc("Run canonicalize + CSE at key boundaries"),
+        llvm::cl::init(true)};
+  };
+
+  //===--------------------------------------------------------------------===//
+  // Pipeline construction.
   //
-  // After this point the IR still has tensor semantics, so tiling and
-  // vectorization passes can be inserted here before materialization.
-  pm.addPass(createNSPLocalizePass(opts.allowCollectives));
+  // The pipeline transforms linalg-on-tensor IR into partitioned SPMD code:
+  //
+  //   Input:   linalg.generic (tensor semantics, single-core)
+  //   Output:  per-participant local compute + memref.subview destination
+  //   writes
+  //
+  // The split between localization (step 3) and materialization (step 4) is
+  // intentional: downstream tiling/vectorization runs between them while the IR
+  // still has pure tensor semantics.
+  //
+  //  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌───────────────┐
+  //  │ 1. Planner   │-->│ 2. Propagate │-->│ 3. Localize  │-->│ 4.Materialize │
+  //  └──────────────┘   └──────────────┘   └──────────────┘   └───────────────┘
+  //         │                 │                  │                  │
+  //  shard.grid/shard   infer missing      local tensor +     memref.subview
+  //  annotations        shardings          nsp.materialize_   writes
+  //                                        tile
+  //===--------------------------------------------------------------------===//
+  static void buildNSPShardPipeline(OpPassManager & pm,
+                                    const NSPShardPipelineOptions &opts) {
 
-  // Optional cleanup boundary before downstream tiling/vectorization
-  if (opts.canonicalize) {
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+    // Step 1: Planner - attach shard annotations to linalg.generic ops.
+    // Runs on func.func (analyzes per-function).
+    //
+    // Preserve the legacy nsp-count behavior by default, but allow callers to
+    // expose the hardware topology explicitly as a 2-D grid: [cores, threads].
+    const int64_t numCores = opts.nspCores > 0 ? opts.nspCores : opts.nspCount;
+    const int64_t numThreads = opts.nspThreads > 0 ? opts.nspThreads : 1;
+
+    // Pre-create shard.grid @nsp at module scope so that the function-level
+    // planner pass never races to insert it from multiple threads in parallel.
+    pm.addPass(createNSPGridInitPass(numCores, numThreads));
+
+    pm.addNestedPass<func::FuncOp>(
+        createNSPShardPlannerPass(numCores, numThreads, opts.allowCollectives));
+    if (opts.canonicalize) {
+      pm.addPass(createCanonicalizerPass());
+      pm.addPass(createCSEPass());
+    }
+
+    // Step 2: Propagation - infer shardings for unannotated operands by
+    // traversing the dataflow graph (backward then forward). Relies on
+    // ShardingInterface external models registered by
+    // registerNSPShardInterfaceModels().
+    if (opts.runPropagation) {
+      pm.addNestedPass<func::FuncOp>(createNSPShardingPropagationPass());
+    }
+    if (opts.canonicalize) {
+      pm.addPass(createCanonicalizerPass());
+      pm.addPass(createCSEPass());
+    }
+
+    // Step 3: Localization - rewrite sharded compute into per-participant
+    // local tensor ops. Emits nsp.materialize_tile as a hand-off to step 4.
+    // In non-collective mode, also distributes scf.for loops cyclically.
+    //
+    // After this point the IR still has tensor semantics, so tiling and
+    // vectorization passes can be inserted here before materialization.
+    pm.addPass(createNSPLocalizePass(opts.allowCollectives));
+
+    // Optional cleanup boundary before downstream tiling/vectorization
+    if (opts.canonicalize) {
+      pm.addPass(createCanonicalizerPass());
+      pm.addPass(createCSEPass());
+    }
+
+    // Step 4: Materialization - lower nsp.materialize_tile into explicit
+    // per-participant memref.subview stores. After this pass, the NSP
+    // dialect ops are fully consumed.
+    pm.addPass(createNSPMaterializePass());
+
+    // 5. Cleanup
+    if (opts.canonicalize) {
+      pm.addPass(createCanonicalizerPass());
+      pm.addPass(createCSEPass());
+    }
   }
-
-  // Step 4: Materialization - lower nsp.materialize_tile into explicit
-  // per-participant memref.subview stores. After this pass, the NSP
-  // dialect ops are fully consumed.
-  pm.addPass(createNSPMaterializePass());
-
-  // 5. Cleanup
-  if (opts.canonicalize) {
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
-  }
-}
 
 } // namespace
 
@@ -218,6 +267,14 @@ void registerNSPPasses() {
       []() -> std::unique_ptr<Pass> { return createNSPLocalizePass(); });
   registerPass(
       []() -> std::unique_ptr<Pass> { return createNSPMaterializePass(); });
+}
+
+/// Public factory for the module-level grid init pass (used by
+/// LinalgToLLVMPass and any other caller that drives the planner directly
+/// without going through the nsp-shard pipeline).
+std::unique_ptr<Pass> createNSPGridInitPass(int64_t numCores,
+                                            int64_t numThreads) {
+  return std::make_unique<NSPGridInitPass>(numCores, numThreads);
 }
 
 /// Register NSP pipelines.
