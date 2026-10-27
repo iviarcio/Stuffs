@@ -55,7 +55,7 @@
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
-#include "mlir/Dialect/Memref/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Shard/IR/ShardDialect.h"
 #include "mlir/Dialect/Shard/IR/ShardOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -224,13 +224,13 @@ struct NSPShardPlannerPass
 
     func.walk([&](linalg::GenericOp op) {
       linalg::LinalgOp linalgOp(op);
-      // Scatter-only generics (ins-only, no results, body has memref store)
+      // Scatter-only generics (ins-only, no results, body has memref.store)
       // must be checked before hasPureTensorSemantics because they satisfy
       // the "no memref operands + at least one tensor" condition but have
-      // zero DPS inits and would fail build Plan For Generic.
+      // zero DPS inits and would fail buildPlanForGeneric.
       if (isScatterOnlyGeneric(op))
         scatterGenerics.push_back(op);
-      else if (Linalg0p.hasPureTensorSemantics())
+      else if (LinalgOp.hasPureTensorSemantics())
         generics.push_back(op);
     });
 
@@ -277,8 +277,8 @@ struct NSPShardPlannerPass
     }
 
     // Annotate scatter-only (ins-only, no results) generics.
-    for (Linalg::GenericOp op : scatter Generics) {
-      if (!op || lop->getParentOp))
+    for (linalg::GenericOp op : scatter Generics) {
+      if (!op || !op->getParentOp))
         continue;
 
       // Skip scatter generics whose input tensors were computed by a
@@ -1264,17 +1264,17 @@ private:
   }
 
   /// Return true iff 'op' is a scatter-only generic:
-  /// - At least one ranked tensor input.
-  /// - Zero DPS in its and zero tensor results.
-  /// - The body contains at least one memref. store op.
-  /// These are produced by Triton kernels with non-linear scatter stores
+  ///   - At least one ranked tensor input.
+  ///   - Zero DPS in its and zero tensor results.
+  ///   - The body contains at least one memref. store op.
+  /// These are produced by Triton kernels with non-linear scatter stores.
   static bool isScatterOnlyGeneric(linalg::GenericOp op) {
-    linalg::LinalgOp linalg0p(op);
-    if (linalg0p.getNumDpsInputs() < 1)
+    linalg::LinalgOp linalgOp(op);
+    if (linalgOp.getNumDpsInputs() < 1)
       return false;
-    if (linalg0p.getNumDpsInits) ! = 0)
+    if (linalgOp.getNumDpsInits) != 0)
       return false;
-    if (op->getNumResults) ! = 0)
+    if (op->getNumResults) != 0)
       return false;
     // Ensure at least one input is a ranked tensor.
     bool hasRankedTensorInput = false;
@@ -1286,11 +1286,10 @@ private:
     }
     if (!hasRankedTensorInput)
       return false;
-    // Body must contain at least one memref store.
+    // Body must contain at least one memref.store.
     bool hasStore = false;
-    op.getRegion).front().walk(
-        [&] (mlir::memref::StoreOp) {
-      hasStore = true; });
+    op.getRegion().front().walk(
+        [&](mlir::memref::StoreOp) { hasStore = true; });
     return hasStore;
   }
 
@@ -1301,21 +1300,21 @@ private:
   /// one program_id tile.
   static bool reinterpretCastHasDynamicOffset(memref::ReinterpretCastOp rc) {
     auto offsets = rc.getMixedOffsets();
-    if (offsets.empty)
+    if (offsets.empty())
       return false;
     if (auto constVal = getConstantIntValue(offsets[0]))
       return *constVal != 0;
     return true;
   }
 
-  /// Return true if 'op' has a to_tensor(alloc) input whose alloc is filled by
+  /// Return true if `op` has a to_tensor(alloc) input whose alloc is filled by
   /// a memref.copy from a reinterpret_cast(memref<*xT>) with a DYNAMIC offset
   /// (i.e. program_id-indexed tile).
   ///
   /// Static-zero-offset casts cover the entire tensor and are safe to shard.
   ///
-  /// Use this for the scatter path (no scf.for exclusion needed : even a gather
-  /// Loop over a dynamic-offset cast is program_id-tied).
+  /// Use this for the scatter path (no scf.for exclusion needed: even a gather
+  /// loop over a dynamic-offset cast is program_id-tied).
   static bool hasAnyAllocCopyInput(linalg::GenericOp op) {
     for (Value operand : op -›getOperands()) {
       auto toTensor = operand.getDefiningOp<bufferization::ToTensor0p>();
@@ -1333,10 +1332,10 @@ private:
           if (!copy || copy.getTarget() != subview.getResult())
             continue;
           Value src = copy.getSource();
-          if (auto srcSv = src.getDefining0p<memref::SubViewOp>())
+          if (auto srcSv = src.getDefiningOp<memref::SubViewOp>())
             src = srcSv.getSource();
-          if (auto rc = src.getDefining0p<memref::ReinterpretCast0p>()) {
-            if (!dyn_cast<BaseMemRefType>(rc.getSource).getType()).hasRank() &&
+          if (auto rc = src.getDefiningOp<memref::ReinterpretCastOp>()) {
+            if (!dyn_cast<BaseMemRefType>(rc.getSource().getType()).hasRank() &&
                 reinterpretCastHasDynamicOffset(rc))
               return true;
           }
@@ -1346,44 +1345,45 @@ private:
     return false;
   }
 
-  /// Return true if any tensor input of 'op' is a Triton-style pre-loaded
+  /// Return true if any tensor input of `op` is a Triton-style pre-loaded
   /// contiguous tile from a program_id-indexed dynamic-offset reinterpret_cast,
   /// copied outside a scf.for (bulk preload, not gather-style).
+  ///
   /// Two patterns are recognized:
   ///
   /// Pattern A (indirect, via alloc+copy):
-  /// to_tensor(alloc) where alloc is filled by
-  /// memref.copy(subview(alloc), reinterpret_cast<*xT>[program_id*BLOCK])
-  /// outside a scf.for.
+  ///   to_tensor(alloc) where alloc is filled by
+  ///   memref.copy(subview(alloc), reinterpret_cast<*xT>[program_id*BLOCK])
+  ///   outside a scf.for.
   ///
   /// Pattern B (direct):
-  /// to_tensor(reinterpret_cast<*xT>[program_id*BLOCK])
-  /// The inductor silu/unsafe_view_mul kernel uses this form: the
-  /// reinterpret_cast is passed directly to to_tensor without an
-  /// alloc+copy intermediary. Without detecting this pattern the planner
-  /// annotates the generic for sharding, and the NSPMaterializePass later
-  /// computes an out-of-bounds store offset (Error 500).
+  ///   to_tensor(reinterpret_cast<*xT>[program_id*BLOCK])
+  ///   The inductor silu/unsafe_view_mul kernel uses this form: the
+  ///   reinterpret_cast is passed directly to to_tensor without an
+  ///   alloc+copy intermediary. Without detecting this pattern the planner
+  ///   annotates the generic for sharding, and the NSPMaterializePass later
+  ///   computes an out-of-bounds store offset (Error 500).
   ///
   /// Static-zero-offset casts and gather loops (scf.for) are both safe to
   /// shard.
   ///
   /// Use this for the regular (output-bearing) generic path only.
-  static bool hasPreloadedTiLeInput(Linalg : GenericOp op) {
-    for (Value operand : op -›getOperands()) {
+  static bool hasPreloadedTiLeInput(linalg::GenericOp op) {
+    for (Value operand : op->getOperands()) {
       auto toTensor = operand.getDefiningOp<bufferization::ToTensorOp>();
       if (!toTensor) {
         // Pattern C: operand is the result of a scf.for whose body loads
         // program_id-indexed tiles via to_tensor(reinterpret_cast[dynamic]).
         // The for-loop output is a locally-computed tile (e.g. the flash
-        // attention accumulator 'acc'). Sharding it would incorrectly divide
+        // attention accumulator `acc`). Sharding it would incorrectly divide
         // the local result instead of the global tensor.
         if (auto forResult = dyn_cast<OpResult>(operand))
-          if (auto for0p = dyn_cast<scf::ForOp>(forResult.getOwner)) {
+          if (auto for0p = dyn_cast<scf::ForOp>(forResult.getOwner())) {
             bool found = false;
             forOp.walk([&](bufferization::ToTensorOp tt) {
-              Value src = tt -›getOperand(0);_
-              if (auto rc = src.getDefining0p<memref::ReinterpretCastOp>())
-                if (!dyn_cast<BaseMemRefType>(rc.getSource(.getType)
+              Value src = tt->getOperand(0);
+              if (auto rc = src.getDefiningOp<memref::ReinterpretCastOp>())
+                if (!dyn_cast<BaseMemRefType>(rc.getSource().getType())
                          .hasRank() &&
                     reinterpretCastHasDynamicOffset(rc))
                   found = true;
@@ -1394,18 +1394,18 @@ private:
         continue;
       }
 
-      Value toTensorSrc = toTensor -›getOperand(0);
+      Value toTensorSrc = toTensor->getOperand(0);
 
       // Pattern B: direct to_tensor(reinterpret_cast) with dynamic offset.
-      if (auto rc = toTensorSrc.getDefiningOp<memref::ReinterpretCastOp>)) {
-          if (!dyn_cast<BaseMemRefType>(rc.getSource().getType()).hasRank() &&
-              reinterpretCastHasDynamicOffset(rc))
-            return true;
-        }
+      if (auto rc = toTensorSrc.getDefiningOp<memref::ReinterpretCastOp>()) {
+        if (!dyn_cast<BaseMemRefType>(rc.getSource().getType()).hasRank() &&
+            reinterpretCastHasDynamicOffset(rc))
+          return true;
+      }
 
       // Pattern A: to_tensor(alloc) where alloc is filled via copy from a
       // dynamic-offset reinterpret_cast outside a scf.for.
-      auto alloc = toTensorSrc.getDefining0p<memref::AllocOp>();
+      auto alloc = toTensorSrc.getDefiningOp<memref::AllocOp>();
       if (!alloc)
         continue;
       for (Operation *user : alloc.getResult().getUsers()) {
@@ -1414,138 +1414,140 @@ private:
           continue;
         for (Operation *svUser : subview.getResult().getUsers()) {
           auto copy = dyn_cast<memref::CopyOp>(svUser);
-          | if (!copy || copy.getTarget() != subview.getResult()) continue;
-          // Copies inside a scf. for are gather-style - not a bulk preload
-          if (copy->getParentOfType<scf::For0p>())
+          if (!copy || copy.getTarget() != subview.getResult())
+            continue;
+          // Copies inside a scf.for are gather-style - not a bulk preload.
+          if (copy->getParentOfType<scf::ForOp>())
             continue;
           Value src = copy.getSource();
-          {
-            if (auto srcSv = src.getDefiningOp<memref::SubViewOp>())
-              src = SrcSv.getSource();
-            if (auto rc = src.getDefining0p<memref::ReinterpretCast0p>()) {
-            if (!dyn_cast<BaseMemRefType>(rc.getSource(.getType).hasRank() &&
-                reinterpretCastHasDynamicOffset(rc))
-              return true;
-            }
+          if (auto srcSv = src.getDefiningOp<memref::SubViewOp>())
+            src = SrcSv.getSource();
+          if (auto rc = src.getDefiningOp<memref::ReinterpretCastOp>()) {
+          if (!dyn_cast<BaseMemRefType>(rc.getSource(.getType).hasRank() &&
+              reinterpretCastHasDynamicOffset(rc))
+            return true;
           }
         }
       }
-      return false;
     }
+    return false;
+  }
 
-    /// Return true if any ranked-tensor input of the scatter generic is
-    /// produced by a linalg-generic whose body contains a linalg.index op.
-    ///
-    /// Such inputs are computed with an offset of 'program_id * BLOCK' baked in
-    /// With NUM_ITERATIONS_SEMANTICS the program_id is non-zero on NSPs other
-    /// than 0, so every NSP would read a different (shifted) window of the
-    /// global buffer. Sharding the scatter while leaving the parent computation
-    /// unsharded causes out-of-bounds accesses on those NSPs.
-    static bool scatterInputComputedFromLinalgIndex(Linalg::GenericOp op) {
-      for (Value input : op.getInputs()) {
-        auto *defOp = input.getDefining0p();
-        if (!defOp)
-          continue;
-        // Walk through insert_slice / extract_result wrappers to the real
-        // source.
-        if (auto res = dyn_cast<0pResult>(input)) {
-        auto parentGeneric = dyn_cast<linalg::Generic0p>(res.getOwner));
-        if (parentGeneric) {
-          bool hasLinalgIndex = false;
-          parentGeneric.getRegion().front().walk(
-              [&](Linalg::IndexOp) { hasLinalgIndex = true; });
-          if (hasLinalgIndex)
-            return true;
-        }
-        }
+  /// Return true if any ranked-tensor input of the scatter generic is
+  /// produced by a linalg-generic whose body contains a linalg.index op.
+  ///
+  /// Such inputs are computed with an offset of 'program_id * BLOCK' baked in
+  /// With NUM_ITERATIONS_SEMANTICS the program_id is non-zero on NSPs other
+  /// than 0, so every NSP would read a different (shifted) window of the
+  /// global buffer. Sharding the scatter while leaving the parent computation
+  /// unsharded causes out-of-bounds accesses on those NSPs.
+  static bool scatterInputComputedFromLinalgIndex(linalg::GenericOp op) {
+    for (Value input : op.getInputs()) {
+      auto *defOp = input.getDefining0p();
+      if (!defOp)
+        continue;
+      // Walk through insert_slice / extract_result wrappers to the real
+      // source.
+      if (auto res = dyn_cast<0pResult>(input)) {
+      auto parentGeneric = dyn_cast<linalg::Generic0p>(res.getOwner));
+      if (parentGeneric) {
+        bool hasLinalgIndex = false;
+        parentGeneric.getRegion().front().walk(
+            [&](linalg::IndexOp) { hasLinalgIndex = true; });
+        if (hasLinalgIndex)
+          return true;
       }
-      return false;
+      }
+    }
+    return false;
+  }
+
+  /// Build a sharding plan for a scatter-only generic.
+  ///
+  /// Since the op has no output tensor we derive the shard iterator from the
+  /// first input's indexing map instead of an output map.
+  static FailureOr<ShardPlan>
+  buildPlanForScatterGeneric(linalg::GenericOp op,
+                             const GridShapeInfo &gridInfo) {
+    SmallVector<mlir::utils::IteratorType> iters;
+    iters.reserve(op.getNumLoops());
+    for (mir : utils::IteratorType it : op.getIteratorTypesArray())
+      iters.push_back(it);
+
+    auto maps = op.getIndexingMapsArray();
+    if (maps.empty())
+      return failure();
+
+    // Use the first input map as the "output proxy" for iterator selection.
+    AffineMap inMap = maps[0];
+    auto inTy = dyn_cast<RankedTensorType>(op.getInputs()[0].getType());
+
+    ShardPlan plan;
+    plan.shardIter =
+        pickShardIteratorIndex(inMap, iters, inTy, gridInfo.numShards);
+    if (plan.shardIter < 0) {
+      // Warn when the tensor is too small to divide across all NSPs. The most
+      // common cause is BLOCK_SIZE < nspCount (e.g. BLOCK_SIZE=16, 32 NSPs).
+      if (inTy && inTy.hasStaticShape() && gridInfo.numShards > 0) {
+        int64_t maxDim = *llvm::max_element(inTy.getShape());
+        if (maxDim < gridInfo.numShards)
+          op.emitWarning()
+          « "NSPShardPlanner: scatter generic input has max dim " «< maxDim
+          « " < nspCount " « gridInfo.numShards
+          « "; no sharding applied - increase BLOCK_SIZE to › = "
+          « gridInfo.numShards;
+      }
+      return failure();
     }
 
-    /// Build a sharding plan for a scatter-only generic.
-    ///
-    /// Since the op has no output tensor we derive the shard iterator from the
-    /// first input's indexing map instead of an output map.
-    static FailureOr<ShardPlan> buildPlanForScatterGeneric(
-        linalg::GenericOp op, const GridShapeInfo &gridInfo) {
-      SmallVector<mlir::utils::IteratorType> iters;
-      iters.reserve(op.getNumLoops());
-      for (mir : utils::IteratorType it : op.getIteratorTypesArray())
-        iters.push_back(it);
+    plan.addLoopGridAxes(plan.shardIter, gridInfo.flattenedGridAxes);
+    plan.requiresAllReduce = false;
 
-      auto maps = op.getIndexingMapsArray();
-      if (maps.empty())
+    // Check that every input map is compatible.
+    for (AffineMap map : maps) {
+      if (!is0perandMapCompatibleWithShardPlan(map, plan))
         return failure();
-
-      // Use the first input map as the "output proxy" for iterator selection.
-      AffineMap inMap = maps[0];
-      auto inTy = dyn_cast<RankedTensorType>(op.getInputs()[0].getType());
-
-      ShardPlan plan;
-      plan.shardIter =
-          pickShardIteratorIndex(inMap, iters, inTy, gridInfo.numShards);
-      if (plan.shardIter < 0) {
-        // Warn when the tensor is too small to divide across all NSPs. The most
-        // common cause is BLOCK_SIZE < nspCount (e.g. BLOCK_SIZE=16, 32 NSPs).
-        if (inTy && inTy.hasStaticShape() && gridInfo.numShards > 0) {
-          int64_t maxDim = *llvm::max_element(inTy.getShape());
-          if (maxDim < gridInfo.numShards)
-            op.emitWarning()
-            « "NSPShardPlanner: scatter generic input has max dim " «< maxDim
-            « " < nspCount " « gridInfo.numShards
-            « "; no sharding applied - increase BLOCK_SIZE to › = "
-            « gridInfo.numShards;
-        }
-        return failure();
-      }
-
-      plan.addLoopGridAxes(plan.shardIter, gridInfo.flattenedGridAxes);
-      plan.requiresAllReduce = false;
-
-      // Check that every input map is compatible.
-      for (AffineMap map : maps) {
-        if (!is0perandMapCompatibleWithShardPlan(map, plan))
-          return failure();
-      }
-
-      return plan;
     }
 
-    /// Annotate a scatter-only (ins-only, no results) linalg.generic with shard
-    /// planning information encoded as op attributes instead of shard.shard SSA
-    /// values.
-    ///
-    /// Rationale: scatter generics live in a mixed tensor+memref context.
-    /// Wrapping their inputs in shard.shard would trigger sharding-propagation,
-    /// which walks the entire function and fails on ops like memref.cast that
-    /// do not implement the sharding interface. Using attributes avoids that
-    /// issue while still giving NSPLocalizePass everything it needs.
-    ///
-    /// Emitted attributes on the linalg generic:
-    ///   nsp.scatter_shard      : unit   (marker for NSPLocalizePass)
-    ///   nsp.scatter_num_shards : i64    (flattened grid size)
-    ///   nsp.scatter_grid       : string (grid symbol name, e.g. "@nsp")
-    static void annotateScatterGenericWithShard(
-        linalg::GenericOp op, shard::GridOp grid, const ShardPlan &plan,
-        llvm::StringMap<Value> &) {
-    MLIRContext * c t x = op.getContext);
+    return plan;
+  }
 
-    // Compute the total shard count from the plan's grid axes
-    // For a 1-D or flattened plan the shardIter maps to all grid axes; we
-    // read the numShards from the plan's flattenedGridAxes product.
-    // However plan does not store extents; we derive numShards from the
-    // grid shape.
-    int64_t numShards = 1;
-    ArrayRef<int64_t> shape = grid.getShape();
-    for (int64_t ext : shape)
-      numShards *= ext;
+  /// Annotate a scatter-only (ins-only, no results) linalg.generic with shard
+  /// planning information encoded as op attributes instead of shard.shard SSA
+  /// values.
+  ///
+  /// Rationale: scatter generics live in a mixed tensor+memref context.
+  /// Wrapping their inputs in shard.shard would trigger sharding-propagation,
+  /// which walks the entire function and fails on ops like memref.cast that
+  /// do not implement the sharding interface. Using attributes avoids that
+  /// issue while still giving NSPLocalizePass everything it needs.
+  ///
+  /// Emitted attributes on the linalg generic:
+  ///   nsp.scatter_shard      : unit   (marker for NSPLocalizePass)
+  ///   nsp.scatter_num_shards : i64    (flattened grid size)
+  ///   nsp.scatter_grid       : string (grid symbol name, e.g. "@nsp")
+  static void annotateScatterGenericWithShard(linalg::GenericOp op,
+                                              shard::GridOp grid,
+                                              const ShardPlan &plan,
+                                              llvm::StringMap<Value> &) {
+  MLIRContext * c t x = op.getContext);
 
-    op->setAttr "nsp.scatter_shard", UnitAttr::get(ctx));
-    op->setAttr("nsp.scatter_num_shards",
-                IntegerAttr::get(IntegerType::get(ctx, 64), numShards));
-    op->setAttr("nsp.scatter_grid", StringAttr::get(ctx, grid.getSymName));
-    }
-  };
+  // Compute the total shard count from the plan's grid axes
+  // For a 1-D or flattened plan the shardIter maps to all grid axes; we
+  // read the numShards from the plan's flattenedGridAxes product.
+  // However plan does not store extents; we derive numShards from the
+  // grid shape.
+  int64_t numShards = 1;
+  ArrayRef<int64_t> shape = grid.getShape();
+  for (int64_t ext : shape)
+    numShards *= ext;
+
+  op->setAttr("nsp.scatter_shard", UnitAttr::get(ctx));
+  op->setAttr("nsp.scatter_num_shards",
+              IntegerAttr::get(IntegerType::get(ctx, 64), numShards));
+  op->setAttr("nsp.scatter_grid", StringAttr::get(ctx, grid.getSymName));
+  }
+};
 
 } // namespace
 
@@ -1554,30 +1556,30 @@ private:
 //===----------------------------------------------------------------------===//
 
 namespace mlir {
-  namespace hexagon {
+namespace hexagon {
 
-  std::unique_ptr<Pass> createNSPShardPlannerPass() {
-    return std::make_unique<NSPShardPlannerPass>();
-  }
+std::unique_ptr<Pass> createNSPShardPlannerPass() {
+  return std::make_unique<NSPShardPlannerPass>();
+}
 
-  std::unique_ptr<Pass> createNSPShardPlannerPass(int64_t numCores,
-                                                  int64_t numThreads,
-                                                  bool allowCollectives) {
-    ShardPolicy policy;
-    policy.numCores = numCores;
-    policy.numThreads = numThreads;
-    policy.allowCollectives = allowCollectives;
-    return std::make_unique<NSPShardPlannerPass>(policy);
-  }
+std::unique_ptr<Pass> createNSPShardPlannerPass(int64_t numCores,
+                                                int64_t numThreads,
+                                                bool allowCollectives) {
+  ShardPolicy policy;
+  policy.numCores = numCores;
+  policy.numThreads = numThreads;
+  policy.allowCollectives = allowCollectives;
+  return std::make_unique<NSPShardPlannerPass>(policy);
+}
 
-  std::unique_ptr<Pass> createNSPShardPlannerPass(int64_t nspCount,
-                                                  bool allowCollectives) {
-    ShardPolicy policy;
-    policy.numCores = nspCount;
-    policy.numThreads = 1;
-    policy.allowCollectives = allowCollectives;
-    return std::make_unique<NSPShardPlannerPass>(policy);
-  }
+std::unique_ptr<Pass> createNSPShardPlannerPass(int64_t nspCount,
+                                                bool allowCollectives) {
+  ShardPolicy policy;
+  policy.numCores = nspCount;
+  policy.numThreads = 1;
+  policy.allowCollectives = allowCollectives;
+  return std::make_unique<NSPShardPlannerPass>(policy);
+}
 
-  } // namespace hexagon
+} // namespace hexagon
 } // namespace mlir
