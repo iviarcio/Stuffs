@@ -132,6 +132,27 @@ localizeGenericToTensor(OpBuilder &b, linalg::GenericOp g,
       return failure();
   }
 
+  // Warn when the tile along the split axis is narrower than one HVX128
+  // register (128 bytes).  Transcendental ops (math.cos, math.sin, etc.)
+  // require at least a full HVX vector and will fail at runtime otherwise.
+  // Example: BLOCK_SIZE=256 / 32 NSPs → tile=[8], vector<8xf32>=32 bytes < 128.
+  // Fix: increase BLOCK_SIZE so that BLOCK_SIZE / nspCount >= 128 /
+  // sizeof(elem).
+  if (auto floatTy = dyn_cast<FloatType>(localTy.getElementType())) {
+    int64_t tileElems = tileShape[splitAxis];
+    int64_t elemBytes = floatTy.getWidth() / 8;
+    int64_t tileBytes = tileElems * elemBytes;
+    if (tileBytes < 128) {
+      g.emitWarning()
+          << "NSPLocalize: NSP tile along axis " << splitAxis << " is "
+          << tileElems << " x f" << floatTy.getWidth() << " = " << tileBytes
+          << " bytes, smaller than one HVX128 register (128 bytes); "
+          << "transcendental ops (math.cos, math.sin, etc.) will fail at "
+          << "runtime - increase BLOCK_SIZE so that "
+          << "BLOCK_SIZE / nspCount >= " << (128 / elemBytes);
+    }
+  }
+
   localizedGeneric->setAttr("nsp.localized", b.getUnitAttr());
   localizedGeneric->setAttr("nsp.materialize_tile_shape",
                             b.getDenseI64ArrayAttr(tileShape));
@@ -261,6 +282,143 @@ static bool isSupportedBroadcast2DGeneric(linalg::GenericOp g,
   return true;
 }
 
+/// Return true if the reinterpret_cast has a dynamic (non-zero-constant)
+/// offset - meaning it is indexed by a runtime value such as program_id*BLOCK.
+/// A static zero offset covers the whole tensor from the start and is safe to
+/// shard; a dynamic offset means the copy only covers one program_id tile.
+static bool reinterpretCastHasDynamicOffset(memref::ReinterpretCastOp rc) {
+  auto offsets = rc.getMixedOffsets();
+  if (offsets.empty())
+    return false;
+  // If the first offset is a constant zero it is the whole-tensor case.
+  if (auto constVal = getConstantIntValue(offsets[0]))
+    return *constVal != 0;
+  // Non-constant (SSA value) offset - dynamic, program_id-dependent.
+  return true;
+}
+
+/// Return true if any operand of `op` has a to_tensor(alloc) input whose
+/// alloc is filled by a memref.copy from a reinterpret_cast(memref<*xT>)
+/// with a DYNAMIC offset (i.e. program_id-indexed tile).
+///
+/// Copies from reinterpret_casts with a static zero offset cover the entire
+/// tensor and are safe to shard - do not block them.
+///
+/// Use this for the scatter path (no scf.for exclusion needed: even a gather
+/// loop over a dynamic-offset cast is program_id-tied).
+static bool isAllocCopyInput(linalg::GenericOp op) {
+  for (Value operand : op->getOperands()) {
+    auto toTensor = operand.getDefiningOp<bufferization::ToTensorOp>();
+    if (!toTensor)
+      continue;
+    auto alloc = toTensor->getOperand(0).getDefiningOp<memref::AllocOp>();
+    if (!alloc)
+      continue;
+    for (Operation *user : alloc.getResult().getUsers()) {
+      auto subview = dyn_cast<memref::SubViewOp>(user);
+      if (!subview)
+        continue;
+      for (Operation *svUser : subview.getResult().getUsers()) {
+        auto copy = dyn_cast<memref::CopyOp>(svUser);
+        if (!copy || copy.getTarget() != subview.getResult())
+          continue;
+        Value src = copy.getSource();
+        if (auto srcSv = src.getDefiningOp<memref::SubViewOp>())
+          src = srcSv.getSource();
+        if (auto rc = src.getDefiningOp<memref::ReinterpretCastOp>())
+          if (!dyn_cast<BaseMemRefType>(rc.getSource().getType()).hasRank() &&
+              reinterpretCastHasDynamicOffset(rc))
+            return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// Return true if any operand of `op` is a Triton-style pre-loaded contiguous
+/// tile:
+///
+/// Two patterns are recognized:
+///
+/// Pattern A (indirect, via alloc+copy):
+///   bufferization.to_tensor(alloc) where alloc is filled via a
+///   memref.copy NOT inside a scf.for, from a reinterpret_cast with a
+///   DYNAMIC offset (program_id-indexed).
+///
+/// Pattern B (direct):
+///   bufferization.to_tensor(reinterpret_cast<*xT>[program_id*BLOCK])
+///   The inductor silu/unsafe_view_mul kernel uses this form: the
+///   reinterpret_cast is passed directly to to_tensor without an
+///   alloc+copy intermediary. Without detecting this pattern the localizer
+///   would split the program_id-sized tile further, producing out-of-bounds
+///   shard writes (Error 500).
+///
+/// Static-zero-offset casts are whole-tensor loads - safe to shard.
+/// The scf.for exclusion allows gather-style element-by-element loads.
+static bool isPreloadedTileInput(linalg::GenericOp op) {
+  for (Value operand : op->getOperands()) {
+    auto toTensor = operand.getDefiningOp<bufferization::ToTensorOp>();
+    if (!toTensor) {
+      // Pattern C: operand is the result of a scf.for whose body loads
+      // program_id-indexed tiles via to_tensor(reinterpret_cast[dynamic]).
+      // The for-loop output is a locally-computed tile (e.g. flash attention
+      // accumulator `acc`). Sharding it would incorrectly divide the local
+      // result instead of the global tensor.
+      if (auto forResult = dyn_cast<OpResult>(operand))
+        if (auto forOp = dyn_cast<scf::ForOp>(forResult.getOwner())) {
+          bool found = false;
+          forOp.walk([&](bufferization::ToTensorOp tt) {
+            Value src = tt->getOperand(0);
+            if (auto rc = src.getDefiningOp<memref::ReinterpretCastOp>())
+              if (!dyn_cast<BaseMemRefType>(rc.getSource().getType())
+                       .hasRank() &&
+                  reinterpretCastHasDynamicOffset(rc))
+                found = true;
+          });
+          if (found)
+            return true;
+        }
+      continue;
+    }
+
+    Value toTensorSrc = toTensor->getOperand(0);
+
+    // Pattern B: direct to_tensor(reinterpret_cast) with dynamic offset.
+    if (auto rc = toTensorSrc.getDefiningOp<memref::ReinterpretCastOp>()) {
+      if (!dyn_cast<BaseMemRefType>(rc.getSource().getType()).hasRank() &&
+          reinterpretCastHasDynamicOffset(rc))
+        return true;
+    }
+
+    // Pattern A: to_tensor(alloc) where alloc is filled via copy from a
+    // dynamic-offset reinterpret_cast outside a scf.for.
+    auto alloc = toTensorSrc.getDefiningOp<memref::AllocOp>();
+    if (!alloc)
+      continue;
+    for (Operation *user : alloc.getResult().getUsers()) {
+      auto subview = dyn_cast<memref::SubViewOp>(user);
+      if (!subview)
+        continue;
+      for (Operation *svUser : subview.getResult().getUsers()) {
+        auto copy = dyn_cast<memref::CopyOp>(svUser);
+        if (!copy || copy.getTarget() != subview.getResult())
+          continue;
+        // Copies inside a scf.for are gather-style - not a bulk preload.
+        if (copy->getParentOfType<scf::ForOp>())
+          continue;
+        Value src = copy.getSource();
+        if (auto srcSv = src.getDefiningOp<memref::SubViewOp>())
+          src = srcSv.getSource();
+        if (auto rc = src.getDefiningOp<memref::ReinterpretCastOp>())
+          if (!dyn_cast<BaseMemRefType>(rc.getSource().getType()).hasRank() &&
+              reinterpretCastHasDynamicOffset(rc))
+            return true;
+      }
+    }
+  }
+  return false;
+}
+
 //===----------------------------------------------------------------------===//
 // Drop stale shard.shard wrappers after localization has consumed sharding
 // annotations.
@@ -337,8 +495,8 @@ static FailureOr<NspGridInfo> lookupNspGridInfo(ModuleOp module) {
 
   for (auto [axis, extent] : llvm::enumerate(shape)) {
     if (extent <= 0) {
-      module.emitError() << "invalid shard grid extent at axis " << axis
-                         << ": " << extent;
+      module.emitError() << "invalid shard grid extent at axis " << axis << ": "
+                         << extent;
       return failure();
     }
     info.numShards *= extent;
@@ -376,12 +534,23 @@ static void warnIfNoShardingDescriptors(ModuleOp module) {
   int64_t numShardingOps = 0;
   module.walk([&](mlir::shard::ShardingOp op) { ++numShardingOps; });
 
+  // Scatter-only generics are annotated with nsp.scatter_shard instead of
+  // shard.sharding (to avoid triggering sharding-propagation on memref ops).
+  // They count as "sharded" for the purpose of this warning.
   if (numShardingOps == 0) {
-    module.emitWarning()
-        << "NSPLocalizePass found shard.grid '@nsp' but no 'shard.sharding' "
-           "ops in the module. This may be expected during early bring-up, "
-           "but if it is unexpected, ensure sharding propagation created "
-           "sharding descriptors.";
+    bool hasScatterShard = false;
+    module.walk([&](mlir::linalg::GenericOp op) {
+      if (op->hasAttr("nsp.scatter_shard"))
+        hasScatterShard = true;
+    });
+    if (!hasScatterShard)
+      module.emitWarning()
+          << "NSPLocalizePass found shard.grid '@nsp' but no sharded "
+             "computations were found: no 'shard.sharding' ops "
+             "(tensor-semantic "
+             "path) and no 'nsp.scatter_shard'-annotated generics (scatter "
+             "path). Ensure NSPShardPlannerPass ran and annotated at least one "
+             "linalg.generic.";
   }
 }
 
@@ -1148,7 +1317,6 @@ static Value stripTrivialWrappers(Value v) {
   return cur;
 }
 
-
 using TensorSplitAxes = SmallVector<SmallVector<int16_t, 2>, 4>;
 
 static std::optional<TensorSplitAxes>
@@ -1157,7 +1325,8 @@ getSplitAxesFromShardAnnotatedValue(Value value) {
   if (!shardOp)
     return std::nullopt;
 
-  auto shardingOp = shardOp.getSharding().getDefiningOp<mlir::shard::ShardingOp>();
+  auto shardingOp =
+      shardOp.getSharding().getDefiningOp<mlir::shard::ShardingOp>();
   if (!shardingOp)
     return std::nullopt;
 
@@ -1278,8 +1447,10 @@ static bool isSupportedMatmul2DGeneric(mlir::linalg::GenericOp g) {
       g.getNumLoops() != 3)
     return false;
 
-  auto lhsTy = dyn_cast<RankedTensorType>(g.getDpsInputOperand(0)->get().getType());
-  auto rhsTy = dyn_cast<RankedTensorType>(g.getDpsInputOperand(1)->get().getType());
+  auto lhsTy =
+      dyn_cast<RankedTensorType>(g.getDpsInputOperand(0)->get().getType());
+  auto rhsTy =
+      dyn_cast<RankedTensorType>(g.getDpsInputOperand(1)->get().getType());
   auto outTy = dyn_cast<RankedTensorType>(g.getResult(0).getType());
   if (!lhsTy || !rhsTy || !outTy || lhsTy.getRank() != 2 ||
       rhsTy.getRank() != 2 || outTy.getRank() != 2)
@@ -1493,6 +1664,50 @@ private:
 
         wrappers.push_back(user);
         auto found = search(expandOp->getResult(0), depth + 1);
+        if (found)
+          return found;
+        wrappers.pop_back();
+        continue;
+      }
+
+      // Accept a partial-tile guard: extract_slice with static zero offsets,
+      // static unit strides, and exactly one dynamic size on the split axis.
+      // The dynamic size is the valid_count carried forward to
+      // materialize_tile.
+      if (auto extractSlice = dyn_cast<tensor::ExtractSliceOp>(user)) {
+        if (extractSlice->getOperand(0) != cur)
+          continue;
+
+        auto sourceTy = dyn_cast<RankedTensorType>(cur.getType());
+        if (!sourceTy)
+          continue;
+
+        // All offsets must be static zero; all strides must be static one.
+        bool validOffsets =
+            llvm::all_of(extractSlice.getMixedOffsets(), [](OpFoldResult ofr) {
+              auto attr = dyn_cast<Attribute>(ofr);
+              auto intAttr = attr ? dyn_cast<IntegerAttr>(attr) : IntegerAttr();
+              return intAttr && intAttr.getInt() == 0;
+            });
+        bool validStrides =
+            llvm::all_of(extractSlice.getMixedStrides(), [](OpFoldResult ofr) {
+              auto attr = dyn_cast<Attribute>(ofr);
+              auto intAttr = attr ? dyn_cast<IntegerAttr>(attr) : IntegerAttr();
+              return intAttr && intAttr.getInt() == 1;
+            });
+        if (!validOffsets || !validStrides)
+          continue;
+
+        // Exactly one dynamic size (the valid_count dimension); others must
+        // equal the full source extent.
+        auto mixedSizes = extractSlice.getMixedSizes();
+        int64_t numDynamic = llvm::count_if(
+            mixedSizes, [](OpFoldResult ofr) { return isa<Value>(ofr); });
+        if (numDynamic != 1)
+          continue;
+
+        wrappers.push_back(user);
+        auto found = search(extractSlice->getResult(0), depth + 1);
         if (found)
           return found;
         wrappers.pop_back();
@@ -3071,9 +3286,9 @@ struct NSPLocalizePass
             isSupportedElementwiseGenericShape(g, outResTy, inputTys);
         bool supportsBroadcast2D =
             isSupportedBroadcast2DGeneric(g, outResTy, inputTys);
-        bool supportsMatmul2D =
-            !allowCollectives && gridInfo->gridShape.size() == 2 &&
-            isSupportedMatmul2DGeneric(g);
+        bool supportsMatmul2D = !allowCollectives &&
+                                gridInfo->gridShape.size() == 2 &&
+                                isSupportedMatmul2DGeneric(g);
 
         if (supportsMatmul2D) {
           std::optional<MaterializeSink> sink =
@@ -3173,7 +3388,8 @@ struct NSPLocalizePass
               /*dest=*/dest,
               /*grid=*/FlatSymbolRefAttr::get(grid.getSymNameAttr()),
               /*splitAxis=*/b.getI64IntegerAttr(0),
-              /*tileShape=*/b.getArrayAttr(tileShapeElems));
+              /*tileShape=*/b.getArrayAttr(tileShapeElems),
+              /*valid_count=*/Value{});
 
           mat.erase();
           for (Operation *op : llvm::reverse(wrappers))
@@ -3187,6 +3403,12 @@ struct NSPLocalizePass
         if (!supportsIdentityElementwise && !supportsBroadcast2D)
           continue;
 
+        // Skip generics whose inputs are Triton-style pre-loaded program_id
+        // tiles: to_tensor(alloc+copy+reinterpret_cast(memref<*xT>)).
+        // Such tensors are per-program_id tiles; sharding only covers one tile.
+        if (isPreloadedTileInput(g))
+          continue;
+
         std::optional<int64_t> splitAxisOr;
         if (supportsBroadcast2D) {
           // The rank-2 broadcast path models row/column projections relative to
@@ -3198,14 +3420,15 @@ struct NSPLocalizePass
           splitAxisOr = shapeInfo.chooseSplitAxis(outResTy);
         }
 
-        if (!splitAxisOr) {
-          g.emitError() << "NSPLocalize: cannot choose a split axis for result "
-                        << outResTy << " with grid size " << numShards
-                        << " (requires at least one positive static dimension "
-                           "divisible by the grid size)";
-          signalPassFailure();
-          return;
-        }
+        if (!splitAxisOr)
+          // No dimension of this result is divisible by the grid size (e.g. a
+          // batch-sized rank-1 mask tensor from an index bounds check). There
+          // is no way to shard it across NSP threads, so leave it as a global,
+          // redundantly-computed op rather than failing the whole pass -- every
+          // producer/consumer of such an undersized value hits this same
+          // "continue" path, so the un-localized subgraph stays
+          // self-consistent.
+          continue;
         shapeInfo.splitAxis = *splitAxisOr;
 
         auto localTy = shapeInfo.getLocalType(outResTy);
@@ -3344,6 +3567,7 @@ struct NSPLocalizePass
 
         auto localizedGeneric = *localizedOrFail;
         Value localResult = localizedGeneric.getResult(0);
+        Value partialTileValidCount; // captured by closure below
 
         auto rebuildPostSinkTensorChain =
             [&](Value baseLocal, ArrayRef<Operation *> wrappers) -> Value {
@@ -3358,6 +3582,20 @@ struct NSPLocalizePass
             // contract only needs the local ranked tensor value.
             if (isa<tensor::CastOp>(wrapper))
               continue;
+
+            if (auto extractSlice = dyn_cast<tensor::ExtractSliceOp>(wrapper)) {
+              // Recover the dynamic size value valid_count.
+              for (OpFoldResult ofr : extractSlice.getMixedSizes()) {
+                if (auto v = dyn_cast<Value>(ofr)) {
+                  partialTileValidCount = v;
+                  break;
+                }
+              }
+              // We do not rebuild the slice: local tile is already smaller than
+              // global tensor. The valid_count is forwarded to
+              // materialize_tile.
+              continue;
+            }
 
             if (auto expand = dyn_cast<tensor::ExpandShapeOp>(wrapper)) {
               auto localInputTy =
@@ -3487,7 +3725,9 @@ struct NSPLocalizePass
             /*dest=*/dest,
             /*grid=*/FlatSymbolRefAttr::get(grid.getSymNameAttr()),
             /*splitAxis=*/splitAxisAttr,
-            /*tileShape=*/tileShapeArrayAttr);
+            /*tileShape=*/tileShapeArrayAttr,
+            /*valid_count=*/partialTileValidCount); // null Value if
+                                                    // !extract_slice
 
         // The old sink chain is now replaced by the explicit NSP
         // materialization anchor.
@@ -3511,6 +3751,361 @@ struct NSPLocalizePass
         continue;
 
       } // for worklist
+
+      // -----------------------------------------------------------------------
+      // Scatter-generic localization path.
+      //
+      // NSPShardPlannerPass marks scatter-only generics (ins-only, no results,
+      // body with memref.store) with:
+      //   nsp.scatter_shard        : unit
+      //   nsp.scatter_num_shards   : i64
+      //   nsp.scatter_grid         : string  (e.g. "nsp")
+      //
+      // This pass:
+      //   1. Slices each input into a per-NSP local tile via shard.all_slice.
+      //   2. Computes nspOffset = process_linear_index * localTileSize.
+      //   3. Clones the body remapping external i32 tile-base values to
+      //      (base + nspOffset) so NSP k processes elements
+      //      [k*tileSize, (k+1)*tileSize).
+      //   4. Erases the original scatter generic.
+      // -----------------------------------------------------------------------
+      SmallVector<mlir::linalg::GenericOp> scatterWorklist;
+      func.walk([&](mlir::linalg::GenericOp sg) {
+        if (sg->hasAttr("nsp.scatter_shard"))
+          scatterWorklist.push_back(sg);
+      });
+
+      for (mlir::linalg::GenericOp sg : scatterWorklist) {
+        if (!sg || !sg->getParentOp())
+          continue;
+
+        auto numShardsAttr =
+            sg->getAttrOfType<IntegerAttr>("nsp.scatter_num_shards");
+        if (!numShardsAttr)
+          continue;
+        int64_t scatterNumShards = numShardsAttr.getInt();
+        if (scatterNumShards <= 0)
+          continue;
+
+        // Require a 1-D input.
+        Value firstIn = sg.getDpsInputOperand(0)->get();
+        auto inputTy = dyn_cast<RankedTensorType>(firstIn.getType());
+        if (!inputTy || inputTy.getRank() != 1)
+          continue;
+        int64_t globalSize = inputTy.getDimSize(0);
+        if (ShapedType::isDynamic(globalSize) || globalSize <= 0)
+          continue;
+
+        const int64_t numInputs = sg.getNumDpsInputs();
+        Location loc = sg.getLoc();
+        b.setInsertionPoint(sg);
+
+        // Under-subscribed path: globalSize < scatterNumShards.
+        //
+        // Each active shard (procIdx < globalSize) processes exactly one
+        // element.  We use tensor.extract_slice([procIdx:procIdx+1]) to
+        // obtain the per-shard 1-element tile and wrap the whole scatter
+        // generic in scf.if(procIdx < globalSize) so inactive shards are
+        // no-ops.  The body's existing mask check (e.g. cmpi slt %in, xnumel)
+        // still handles any out-of-range valid_count suppression.
+        if (globalSize < scatterNumShards) {
+          Region &bodyRegion = sg.getRegion();
+          Block &bodyBlock = bodyRegion.front();
+
+          // In the under-subscribed case each shard owns exactly one element;
+          // process_linear_index (range 0..numShards-1) is both the shard index
+          // and the nspOffset (localTileSize == 1).
+          Value procLinearIdx =
+              mlir::shard::ProcessLinearIndexOp::create(b, loc, grid);
+          Value procLinearIdxI32 =
+              arith::IndexCastOp::create(b, loc, b.getI32Type(), procLinearIdx);
+          Value globalSizeVal =
+              arith::ConstantIntOp::create(b, loc, globalSize, /*width=*/32);
+          Value isActive =
+              arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt,
+                                    procLinearIdxI32, globalSizeVal);
+
+          // Detect external i32 bases and replace them with procLinearIdxI32.
+          llvm::SmallDenseSet<Value> externalI32Bases;
+          for (Operation &innerOp : bodyBlock.getOperations()) {
+            auto addi = dyn_cast<arith::AddIOp>(innerOp);
+            if (!addi)
+              continue;
+            Value lhs = addi.getLhs();
+            Value rhs = addi.getRhs();
+            auto isExtI32 = [&](Value v) -> bool {
+              return v.getType().isInteger(32) && v.getDefiningOp() &&
+                     v.getDefiningOp()->getParentRegion() != &bodyRegion;
+            };
+            auto fromLinalgIdx = [&](Value v) -> bool {
+              if (auto c = v.getDefiningOp<arith::IndexCastOp>())
+                return !!c.getIn().getDefiningOp<linalg::IndexOp>();
+              return false;
+            };
+            if (isExtI32(lhs) && fromLinalgIdx(rhs))
+              externalI32Bases.insert(lhs);
+            if (isExtI32(rhs) && fromLinalgIdx(lhs))
+              externalI32Bases.insert(rhs);
+          }
+          IRMapping cloneMap;
+          for (Value base : externalI32Bases) {
+            cloneMap.map(base, procLinearIdxI32);
+          }
+
+          // Wrap in scf.if to guard inactive shards.
+          auto ifOp = mlir::scf::IfOp::create(b, loc, TypeRange{}, isActive,
+                                              /*withElseRegion=*/false);
+          OpBuilder ifB = OpBuilder::atBlockBegin(ifOp.thenBlock());
+
+          // Extract 1-element slices at offset procLinearIdx from every input.
+          SmallVector<Value> localInputs;
+          localInputs.reserve(numInputs);
+          bool failed = false;
+          for (int64_t i = 0; i < numInputs; ++i) {
+            Value in = sg.getDpsInputOperand(i)->get();
+            auto inRtt = dyn_cast<RankedTensorType>(in.getType());
+            if (!inRtt) {
+              localInputs.push_back(in);
+              continue;
+            }
+            if (inRtt.getRank() != 1 || inRtt.getDimSize(0) != globalSize) {
+              failed = true;
+              break;
+            }
+            RankedTensorType localInTy =
+                RankedTensorType::get({1}, inRtt.getElementType());
+            // Offset is dynamic (procLinearIdx); size and stride are static 1.
+            // Use OpFoldResult overload so the static size is encoded
+            // correctly in the result type (tensor<1xT>, not tensor<?xT>).
+            Value localIn = tensor::ExtractSliceOp::create(
+                ifB, loc, localInTy, in,
+                /*offsets=*/ArrayRef<OpFoldResult>{OpFoldResult(procLinearIdx)},
+                /*sizes=*/ArrayRef<OpFoldResult>{ifB.getIndexAttr(1)},
+                /*strides=*/ArrayRef<OpFoldResult>{ifB.getIndexAttr(1)});
+            localInputs.push_back(localIn);
+          }
+          if (failed) {
+            ifOp.erase();
+            continue;
+          }
+
+          // Rebuild the scatter generic with 1-element inputs inside the guard.
+          auto newSg = linalg::GenericOp::create(
+              ifB, loc, /*resultTensorTypes=*/TypeRange{},
+              /*inputs=*/localInputs, /*outputs=*/ValueRange{},
+              sg.getIndexingMapsArray(), sg.getIteratorTypesArray());
+
+          auto idxMapsNm = StringAttr::get(sg->getContext(), "indexing_maps");
+          auto iterTypesNm =
+              StringAttr::get(sg->getContext(), "iterator_types");
+          for (auto na : sg->getAttrs()) {
+            StringRef nm = na.getName().strref();
+            if (na.getName() == idxMapsNm || na.getName() == iterTypesNm ||
+                nm == "nsp.scatter_shard" || nm == "nsp.scatter_num_shards" ||
+                nm == "nsp.scatter_grid")
+              continue;
+            newSg->setAttr(na.getName(), na.getValue());
+          }
+          newSg->setAttr("nsp.localized", b.getUnitAttr());
+
+          // Clone body with remapped external i32 bases.
+          Region &dstRegion = newSg.getRegion();
+          dstRegion.getBlocks().clear();
+          Block *dstBlock = new Block();
+          dstRegion.push_back(dstBlock);
+          for (BlockArgument bArg : bodyBlock.getArguments())
+            cloneMap.map(bArg,
+                         dstBlock->addArgument(bArg.getType(), bArg.getLoc()));
+          OpBuilder bodyB = OpBuilder::atBlockEnd(dstBlock);
+          for (Operation &innerOp : bodyBlock.getOperations())
+            bodyB.clone(innerOp, cloneMap);
+
+          // Note: scf::IfOp::create already inserted a scf.yield via
+          // ensureTerminator; do NOT add another one here.
+
+          sg.erase();
+          continue;
+        }
+
+        // Even-division path: each shard gets an equal-sized tile.
+        if (globalSize % scatterNumShards != 0)
+          continue;
+        int64_t localTileSize = globalSize / scatterNumShards;
+
+        // Slice all ranked-tensor inputs into per-NSP tiles using
+        // shard.all_slice along dim 0 with all grid axes.
+        SmallVector<Value> localInputs;
+        localInputs.reserve(numInputs);
+        bool anyFailed = false;
+        for (int64_t i = 0; i < numInputs; ++i) {
+          Value in = sg.getDpsInputOperand(i)->get();
+          auto inRtt = dyn_cast<RankedTensorType>(in.getType());
+          if (!inRtt) {
+            localInputs.push_back(in);
+            continue;
+          }
+          int64_t inSize = inRtt.getDimSize(0);
+          if (ShapedType::isDynamic(inSize) || inSize <= 0 ||
+              inSize % scatterNumShards != 0) {
+            anyFailed = true;
+            break;
+          }
+          SmallVector<int64_t> localShape(inRtt.getShape().begin(),
+                                          inRtt.getShape().end());
+          localShape[0] = inSize / scatterNumShards;
+          RankedTensorType localInTy =
+              RankedTensorType::get(localShape, inRtt.getElementType());
+
+          SmallVector<mlir::shard::GridAxis, 2> axes;
+          for (mlir::shard::GridAxis ax : gridAxes)
+            axes.push_back(ax);
+
+          Value localIn = mlir::shard::AllSliceOp::create(
+                              b, loc, localInTy, in, grid.getSymName(), axes,
+                              /*sliceAxis=*/0)
+                              .getResult();
+          localInputs.push_back(localIn);
+        }
+        if (anyFailed)
+          continue;
+
+        // Compute the per-NSP offset: procIdx * localTileSize (as i32).
+        Value procIdx = mlir::shard::ProcessLinearIndexOp::create(b, loc, grid);
+        Value localTileSizeVal =
+            arith::ConstantIntOp::create(b, loc, localTileSize, /*width=*/32);
+        Value procIdx32 =
+            arith::IndexCastOp::create(b, loc, b.getI32Type(), procIdx);
+        Value nspOffset =
+            arith::MulIOp::create(b, loc, procIdx32, localTileSizeVal);
+
+        // Find external i32 values used by the body that drive the global
+        // index via arith.addi(external_i32, index_cast(linalg.index)).
+        Region &bodyRegion = sg.getRegion();
+        Block &bodyBlock = bodyRegion.front();
+
+        llvm::SmallDenseSet<Value> externalI32Bases;
+        for (Operation &innerOp : bodyBlock.getOperations()) {
+          auto addi = dyn_cast<arith::AddIOp>(innerOp);
+          if (!addi)
+            continue;
+          Value lhs = addi.getLhs();
+          Value rhs = addi.getRhs();
+
+          auto isExternalI32 = [&](Value v) -> bool {
+            if (!v.getType().isInteger(32))
+              return false;
+            auto *defOp = v.getDefiningOp();
+            if (!defOp)
+              return false; // block arg
+            return defOp->getParentRegion() != &bodyRegion;
+          };
+          auto derivesFromLinalgIndex = [&](Value v) -> bool {
+            if (auto cast = v.getDefiningOp<arith::IndexCastOp>())
+              if (cast.getIn().getDefiningOp<linalg::IndexOp>())
+                return true;
+            return false;
+          };
+
+          if (isExternalI32(lhs) && derivesFromLinalgIndex(rhs))
+            externalI32Bases.insert(lhs);
+          if (isExternalI32(rhs) && derivesFromLinalgIndex(lhs))
+            externalI32Bases.insert(rhs);
+        }
+
+        // Build the cloneMap for the body.
+        //
+        // Case A - body has addi(external_i32_base, cast(linalg.index)):
+        //   Replace each external base with (base + nspOffset) so the effective
+        //   global index becomes (original_tile_base + nspOffset + local_lane).
+        //   The original tile base must be preserved so each NSP starts at the
+        //   correct absolute position within the program_id tile.
+        //
+        // Case B - body uses linalg.index directly (no external base), e.g.:
+        //   %i = linalg.index 0; %j = index_cast %i; divsi/remsi ...
+        //   Here we must still shift by nspOffset.  We handle this by inserting
+        //   a post-clone fixup that replaces every IndexOp result with
+        //   (nspOffset + IndexOp), using an i32 add applied to the index_cast
+        //   that immediately follows the IndexOp.
+        IRMapping cloneMap;
+        bool hasExternalBase = !externalI32Bases.empty();
+        for (Value base : externalI32Bases) {
+          Value adjBase = arith::AddIOp::create(b, loc, base, nspOffset);
+          cloneMap.map(base, adjBase);
+        }
+
+        // Rebuild the scatter generic with local inputs and cloned body.
+        SmallVector<AffineMap> indexingMaps(sg.getIndexingMapsArray());
+        SmallVector<utils::IteratorType> iteratorTypes(
+            sg.getIteratorTypesArray());
+
+        auto newSg =
+            linalg::GenericOp::create(b, loc, /*resultTensorTypes=*/TypeRange{},
+                                      /*inputs=*/localInputs,
+                                      /*outputs=*/ValueRange{},
+                                      /*indexingMaps=*/indexingMaps,
+                                      /*iteratorTypes=*/iteratorTypes);
+
+        // Carry over non-structural attributes; strip the planner markers.
+        auto indexingMapsName =
+            StringAttr::get(sg->getContext(), "indexing_maps");
+        auto iteratorTypesName =
+            StringAttr::get(sg->getContext(), "iterator_types");
+        for (auto na : sg->getAttrs()) {
+          StringRef name = na.getName().strref();
+          if (na.getName() == indexingMapsName ||
+              na.getName() == iteratorTypesName ||
+              name == "nsp.scatter_shard" || name == "nsp.scatter_num_shards" ||
+              name == "nsp.scatter_grid")
+            continue;
+          newSg->setAttr(na.getName(), na.getValue());
+        }
+        newSg->setAttr("nsp.localized", b.getUnitAttr());
+
+        // Clone the region body with the adjusted external bases.
+        Region &dstRegion = newSg.getRegion();
+        dstRegion.getBlocks().clear();
+        Block *dstBlock = new Block();
+        dstRegion.push_back(dstBlock);
+
+        for (BlockArgument bArg : bodyBlock.getArguments()) {
+          BlockArgument newArg =
+              dstBlock->addArgument(bArg.getType(), bArg.getLoc());
+          cloneMap.map(bArg, newArg);
+        }
+
+        OpBuilder bodyBuilder = OpBuilder::atBlockEnd(dstBlock);
+        for (Operation &innerOp : bodyBlock.getOperations())
+          bodyBuilder.clone(innerOp, cloneMap);
+
+        // Case B fixup: if the body uses linalg.index directly (no external
+        // base), shift every IndexOp result by nspOffset.  For each cloned
+        // IndexOp we find the immediately-following index_cast (i32), insert
+        // nspOffset_index = index_cast(nspOffset) before it, then replace the
+        // index_cast input with (clonedIndex + nspOffset_index) so all
+        // downstream uses of the cast see the global index.
+        if (!hasExternalBase) {
+          // nspOffset is i32; build an index-typed version once, before the
+          // body, so it is available to all IndexOp users.
+          OpBuilder fixupB(dstBlock, dstBlock->begin());
+          Value nspOffsetIndex = arith::IndexCastOp::create(
+              fixupB, loc, fixupB.getIndexType(), nspOffset);
+
+          dstBlock->walk([&](linalg::IndexOp clonedIdx) {
+            Value localIdx = clonedIdx.getResult(); // index type
+            // Insert  globalIdx = localIdx + nspOffsetIndex  right after the
+            // IndexOp and redirect all downstream uses to it.
+            OpBuilder insertB(dstBlock, std::next(clonedIdx->getIterator()));
+            Value globalIdx = arith::AddIOp::create(insertB, clonedIdx.getLoc(),
+                                                    localIdx, nspOffsetIndex);
+            // Replace all uses of localIdx except the addi we just created.
+            localIdx.replaceAllUsesExcept(globalIdx, globalIdx.getDefiningOp());
+          });
+        }
+
+        // Erase the original scatter generic (no results, no uses).
+        sg.erase();
+
+      } // for scatterWorklist
     }); // module.walk
 
     // Final cleanup
