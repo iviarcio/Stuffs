@@ -3286,11 +3286,11 @@ struct NSPLocalizePass
             isSupportedElementwiseGenericShape(g, outResTy, inputTys);
         bool supportsBroadcast2D =
             isSupportedBroadcast2DGeneric(g, outResTy, inputTys);
-        bool supportsMatmul2D = !allowCollectives &&
-                                gridInfo->gridShape.size() == 2 &&
-                                isSupportedMatmul2DGeneric(g);
+        bool supportsShardedMatmul = !allowCollectives &&
+                                     gridInfo->gridShape.size() == 2 &&
+                                     isSupportedMatmul2DGeneric(g);
 
-        if (supportsMatmul2D) {
+        if (supportsShardedMatmul) {
           std::optional<MaterializeSink> sink =
               materializeSinkFinder.find(g.getResult(0));
           if (!sink)
@@ -3303,6 +3303,24 @@ struct NSPLocalizePass
           std::optional<TensorSplitAxes> outSplitAxes =
               getSplitAxesFromShardAnnotatedValue(oldInit);
           if (!lhsSplitAxes || !rhsSplitAxes || !outSplitAxes)
+            continue;
+
+          // The materialize_tile contract supports a single output split
+          // dimension. The physical grid axes may both shard that dimension.
+          // Leave genuine two-dimensional tensor sharding for a later pass.
+          if (outSplitAxes->size() != 2)
+            continue;
+          int64_t splitAxis = -1;
+          for (int64_t dim = 0; dim < 2; ++dim) {
+            if ((*outSplitAxes)[dim].empty())
+              continue;
+            if (splitAxis >= 0) {
+              splitAxis = -1;
+              break;
+            }
+            splitAxis = dim;
+          }
+          if (splitAxis < 0)
             continue;
 
           RankedTensorType lhsLocalTy = getLocalTypeFromSplitAxes(
@@ -3324,7 +3342,7 @@ struct NSPLocalizePass
           Value initLocal = materializeValueUsingSplitAxes(
               b, oldInit, localTy, *outSplitAxes, gridInfo->gridShape);
           if (!lhsLocal || !rhsLocal || !initLocal) {
-            g.emitError() << "NSPLocalize: failed to materialize 2-D matmul "
+            g.emitError() << "NSPLocalize: failed to materialize sharded matmul "
                              "local operands";
             signalPassFailure();
             return;
@@ -3332,11 +3350,10 @@ struct NSPLocalizePass
 
           SmallVector<Value, 2> matmulLocalInputs = {lhsLocal, rhsLocal};
           auto localizedOrFail = localizeGenericToTensor(
-              b, g, localTy, matmulLocalInputs, initLocal,
-              /*splitAxis=*/0);
+              b, g, localTy, matmulLocalInputs, initLocal, splitAxis);
           if (failed(localizedOrFail)) {
             g.emitError()
-                << "NSPLocalize: failed to build localized 2-D matmul";
+                << "NSPLocalize: failed to build localized matmul";
             signalPassFailure();
             return;
           }
@@ -3350,7 +3367,7 @@ struct NSPLocalizePass
             if (isa<mlir::shard::ShardOp, tensor::CastOp>(wrapper))
               continue;
             wrapper->emitRemark()
-                << "NSPLocalize: unsupported tensor wrapper in 2-D matmul "
+                << "NSPLocalize: unsupported tensor wrapper in sharded matmul "
                    "materialize sink chain: "
                 << wrapper->getName();
             signalPassFailure();
@@ -3362,7 +3379,7 @@ struct NSPLocalizePass
           auto materializeSourceTy =
               dyn_cast<RankedTensorType>(materializeSource.getType());
           if (!destTy || !materializeSourceTy) {
-            g.emitError() << "NSPLocalize: invalid 2-D matmul materialization "
+            g.emitError() << "NSPLocalize: invalid sharded matmul materialization "
                              "source or destination";
             signalPassFailure();
             return;
@@ -3373,7 +3390,7 @@ struct NSPLocalizePass
           for (int64_t dim : materializeSourceTy.getShape()) {
             if (ShapedType::isDynamic(dim) || dim <= 0) {
               localizedGeneric.emitError()
-                  << "NSPLocalize: materialized 2-D matmul tile has dynamic "
+                  << "NSPLocalize: materialized matmul tile has dynamic "
                      "shape";
               signalPassFailure();
               return;
@@ -3387,7 +3404,7 @@ struct NSPLocalizePass
               /*source=*/materializeSource,
               /*dest=*/dest,
               /*grid=*/FlatSymbolRefAttr::get(grid.getSymNameAttr()),
-              /*splitAxis=*/b.getI64IntegerAttr(0),
+              /*splitAxis=*/b.getI64IntegerAttr(splitAxis),
               /*tileShape=*/b.getArrayAttr(tileShapeElems),
               /*valid_count=*/Value{});
 
@@ -3404,7 +3421,7 @@ struct NSPLocalizePass
           continue;
 
         // Skip generics whose inputs are Triton-style pre-loaded program_id
-        // tiles: to_tensor(alloc+copy+reinterpret_cast(memref<*xT>)).
+        // tiles: to_tensor(alloc<-copy<-reinterpret_cast(memref<*xT>)).
         // Such tensors are per-program_id tiles; sharding only covers one tile.
         if (isPreloadedTileInput(g))
           continue;
