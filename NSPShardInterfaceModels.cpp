@@ -38,6 +38,7 @@
 #include "mlir/IR/SymbolTable.h"
 
 // Dialects / ops we model.
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -46,6 +47,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
 
 // Shard interface.
 #include "mlir/Dialect/Shard/Interfaces/ShardingInterface.h"
@@ -1287,8 +1290,91 @@ struct CollapseShapeShardingModel
 };
 
 //===----------------------------------------------------------------------===//
-// linalg.transpose / linalg.reduce
+// linalg.transpose / linalg.reduce / linalg.fill
 //===----------------------------------------------------------------------===//
+
+struct FillShardingModel
+    : public shard::ShardingInterface::ExternalModel<FillShardingModel,
+                                                     linalg::FillOp> {
+  // linalg.fill(value, init) -> result
+  //
+  // Indexing maps:
+  //   value (scalar): empty map  - no loop dimension
+  //   init  (tensor): identity   - same shape as result
+  //   result(tensor): identity
+  //
+  // Loop iterators: all-parallel over the output rank.
+  SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
+    auto fill = cast<linalg::FillOp>(op);
+    auto outTy = dyn_cast<RankedTensorType>(fill.result().getType());
+    if (!outTy)
+      return {};
+
+    MLIRContext *ctx = op->getContext();
+    int64_t rank = outTy.getRank();
+    AffineMap id = AffineMap::getMultiDimIdentityMap(rank, ctx);
+    AffineMap scalar = AffineMap::get(rank, 0, {}, ctx);
+
+    // value -> scalar (empty), init -> identity, result -> identity
+    return {scalar, id, id};
+  }
+
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
+    auto fill = cast<linalg::FillOp>(op);
+    auto outTy = dyn_cast<RankedTensorType>(fill.result().getType());
+    if (!outTy)
+      return {};
+    return makeParallelIters(outTy.getRank());
+  }
+
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
+
+  FailureOr<shard::ShardingOption>
+  getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
+                    ArrayRef<shard::Sharding> resultShardings) const {
+    // operandShardings[0] = value (scalar, always replicated - ignore)
+    // operandShardings[1] = init tensor
+    if (operandShardings.size() >= 2 && operandShardings[1])
+      return makeValueShardingOption(operandShardings[1]);
+
+    if (!resultShardings.empty() && resultShardings[0])
+      return makeValueShardingOption(resultShardings[0]);
+
+    return shard::ShardingOption::makeEmpty();
+  }
+
+  FailureOr<std::vector<shard::Sharding>>
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
+    auto fill = cast<linalg::FillOp>(op);
+    auto outTy = cast<RankedTensorType>(fill.result().getType());
+
+    shard::Sharding tensorSharding =
+        fromShardingOption(op, opt, outTy.getRank());
+
+    std::vector<shard::Sharding> res;
+    res.resize(op->getNumOperands() + op->getNumResults(), shard::Sharding());
+    // res[0] = value (scalar) -> replicated (empty Sharding)
+    res[1] = tensorSharding; // init
+    res[2] = tensorSharding; // result
+    return res;
+  }
+
+  LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
+                                       const shard::ShardingOption &) const {
+    return success();
+  }
+
+  LogicalResult partition(Operation *op, ArrayRef<Value> partitionedOperands,
+                          ArrayRef<shard::Sharding>, ArrayRef<shard::Sharding>,
+                          IRMapping &partitionMap, SymbolTableCollection &,
+                          OpBuilder &builder) const {
+    return partitionByCloning(op, partitionedOperands, partitionMap, builder);
+  }
+};
 
 struct TransposeShardingModel
     : public shard::ShardingInterface::ExternalModel<TransposeShardingModel,
@@ -1511,6 +1597,12 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
     // a precise model complex; treat as opaque boundary for propagation).
     memref::SubViewOp::attachInterface<NoShardingModel<memref::SubViewOp>>(
         *ctx);
+    memref::CastOp::attachInterface<NoShardingModel<memref::CastOp>>(*ctx);
+
+    // Scalar/elementwise store: sharding-transparent. The store writes a
+    // single computed value (e.g. a scalar boolean from new_ones) to a
+    // single-element buffer; no sharding dimension exists.
+    memref::StoreOp::attachInterface<NoShardingModel<memref::StoreOp>>(*ctx);
 
     // Pointer/metadata extraction: sharding-transparent.
     memref::ExtractAlignedPointerAsIndexOp::attachInterface<
@@ -1525,6 +1617,12 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
             *ctx);
         bufferization::ToTensorOp::attachInterface<ToTensorShardingModel>(*ctx);
         bufferization::ToBufferOp::attachInterface<ToBufferShardingModel>(*ctx);
+    // Terminal tensor-to-buffer sink: treated as a hard propagation
+    // boundary in NSPShardingPropagationPass (skipped via early return).
+    // Register NoShardingModel so that the MLIR verifier does not reject
+    // the op for missing interface when it encounters it during
+    // verification passes that run before our custom propagation guard
+    // fires.
         bufferization::MaterializeInDestinationOp::attachInterface<
             NoShardingModel<bufferization::MaterializeInDestinationOp>>(*ctx);
       });
@@ -1543,11 +1641,26 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
         *ctx);
   });
 
-  // Linalg structural ops (Transpose & Reduce)
+  // Linalg structural ops (Transpose, Reduce & Fill)
   registry.addExtension(+[](MLIRContext *ctx, linalg::LinalgDialect *dialect) {
     (void)dialect;
     linalg::TransposeOp::attachInterface<TransposeShardingModel>(*ctx);
     linalg::ReduceOp::attachInterface<ReduceShardingModel>(*ctx);
+    linalg::FillOp::attachInterface<FillShardingModel>(*ctx);
+  });
+
+  // Affine: load/store/apply are scalar address/index computations used in
+  // vectorized kernels after bufferization. They carry no tensor sharding
+  // semantics; treat as sharding-transparent so propagation continues past
+  // them.
+  registry.addExtension(+[](MLIRContext *ctx, affine::AffineDialect *dialect) {
+    (void)dialect;
+    affine::AffineLoadOp::attachInterface<
+        NoShardingModel<affine::AffineLoadOp>>(*ctx);
+    affine::AffineStoreOp::attachInterface<
+        NoShardingModel<affine::AffineStoreOp>>(*ctx);
+    affine::AffineApplyOp::attachInterface<
+        NoShardingModel<affine::AffineApplyOp>>(*ctx);
   });
 
   // Control-flow (modeled as sharding-transparent for now).
@@ -1570,7 +1683,8 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
     arith::IndexCastOp::attachInterface<NoShardingModel<arith::IndexCastOp>>(
         *ctx);
 
-    // Scalar integer comparison /  min / max / bit ops
+    // Scalar integer comparison / min / max / bit ops used for index/mask
+    // calculations in fused kernels - sharding-transparent.
     arith::CmpIOp::attachInterface<NoShardingModel<arith::CmpIOp>>(*ctx);
     arith::CmpFOp::attachInterface<NoShardingModel<arith::CmpFOp>>(*ctx);
     arith::MinSIOp::attachInterface<NoShardingModel<arith::MinSIOp>>(*ctx);
@@ -1635,6 +1749,14 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
     // Pointer/Integer conversion ops: metadata/address plumbing only
     LLVM::IntToPtrOp::attachInterface<NoShardingModel<LLVM::IntToPtrOp>>(*ctx);
     LLVM::PtrToIntOp::attachInterface<NoShardingModel<LLVM::PtrToIntOp>>(*ctx);
+  });
+
+  // Builtin dialect: type-plumbing cast produced by conversion frameworks.
+  // It carries no compute semantics; treat as a sharding-transparent boundary.
+  registry.addExtension(+[](MLIRContext *ctx, BuiltinDialect *dialect) {
+    (void)dialect;
+    UnrealizedConversionCastOp::attachInterface<
+        NoShardingModel<UnrealizedConversionCastOp>>(*ctx);
   });
 }
 
