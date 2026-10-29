@@ -591,43 +591,49 @@ private:
     return std::nullopt;
   }
 
-  /// Build an experimental 2-D matmul plan that maps:
-  ///   i -> grid axis 0 (cores)
-  ///   j -> grid axis 1 (threads)
-  /// while keeping the reduction dimension local/replicated.
-  static FailureOr<ShardPlan> buildMatmul2DPlan(linalg::GenericOp op,
-                                                const GridShapeInfo &gridInfo,
-                                                RankedTensorType outputTy,
-                                                int64_t iIter, int64_t jIter) {
-    if (!gridInfo.is2DGrid())
-      return failure();
-
-    if (!outputTy || !outputTy.hasStaticShape())
+  /// Build a single-axis matmul plan using the full NSP grid.
+  ///
+  /// Prefer the larger output dimension (M on ties), but reject dimensions
+  /// that cannot be split evenly or would produce tiles smaller than 16.
+  /// Leave the reduction dimension K unsharded.
+  static FailureOr<ShardPlan> buildMatmul1DPlan(
+      linalg::GenericOp op, const GridShapeInfo &gridInfo,
+      RankedTensorType outputTy, int64_t iIter, int64_t jIter) {
+    constexpr int64_t minTileExtent = 16;
+    if (!outputTy || !outputTy.hasStaticShape() || gridInfo.numShards <= 0)
       return failure();
 
     linalg::LinalgOp linalgOp(op);
     AffineMap outMap = op.getIndexingMapsArray()[linalgOp.getNumDpsInputs()];
-
     std::optional<int64_t> iDim = getTensorDimForLoopIter(outMap, iIter);
     std::optional<int64_t> jDim = getTensorDimForLoopIter(outMap, jIter);
     if (!iDim || !jDim || *iDim == *jDim)
       return failure();
 
-    int64_t iExtent = outputTy.getDimSize(*iDim);
-    int64_t jExtent = outputTy.getDimSize(*jDim);
-    int64_t coreExtent = gridInfo.getAxisExtent(/*axis=*/0);
-    int64_t threadExtent = gridInfo.getAxisExtent(/*axis=*/1);
+    int64_t m = outputTy.getDimSize(*iDim);
+    int64_t n = outputTy.getDimSize(*jDim);
+    auto canShard = [&](int64_t extent) {
+      return extent > 0 && extent % gridInfo.numShards == 0 &&
+             extent / gridInfo.numShards >= minTileExtent;
+    };
 
-    if (iExtent <= 0 || jExtent <= 0 || coreExtent <= 0 || threadExtent <= 0)
-      return failure();
-    if (iExtent % coreExtent != 0 || jExtent % threadExtent != 0)
+    int64_t preferredIter = m >= n ? iIter : jIter;
+    int64_t alternateIter = m >= n ? jIter : iIter;
+    int64_t preferredExtent = m >= n ? m : n;
+    int64_t alternateExtent = m >= n ? n : m;
+
+    int64_t chosenIter = -1;
+    if (canShard(preferredExtent))
+      chosenIter = preferredIter;
+    else if (canShard(alternateExtent))
+      chosenIter = alternateIter;
+    else
       return failure();
 
     ShardPlan plan;
-    plan.shardIter = iIter;
+    plan.shardIter = chosenIter;
     plan.requiresAllReduce = false;
-    plan.addLoopGridAxes(iIter, ArrayRef<int16_t>{0});
-    plan.addLoopGridAxes(jIter, ArrayRef<int16_t>{1});
+    plan.addLoopGridAxes(chosenIter, gridInfo.flattenedGridAxes);
     return plan;
   }
 
@@ -658,18 +664,18 @@ private:
     AffineMap outMap = op.getIndexingMapsArray().back();
     auto outTy = dyn_cast<RankedTensorType>(op.getResult(0).getType());
 
-    // Experimental matmul-specific path: use the two independent 2-D grid axes
-    // instead of flattening them onto one tensor dimension.
+    // Matmul-like generics must use exactly one output dimension for now.
+    // Do not fall back to generic planning when neither M nor N is viable.
     int64_t iIter = -1, jIter = -1, kIter = -1;
     if (matchMatmulLike(op, iIter, jIter, kIter)) {
       FailureOr<ShardPlan> matmulPlan =
-          buildMatmul2DPlan(op, gridInfo, outTy, iIter, jIter);
-      if (succeeded(matmulPlan)) {
-        for (AffineMap map : op.getIndexingMapsArray())
-          if (!isOperandMapCompatibleWithShardPlan(map, *matmulPlan))
-            return failure();
-        return matmulPlan;
-      }
+          buildMatmul1DPlan(op, gridInfo, outTy, iIter, jIter);
+      if (failed(matmulPlan))
+        return failure();
+      for (AffineMap map : op.getIndexingMapsArray())
+        if (!isOperandMapCompatibleWithShardPlan(map, *matmulPlan))
+          return failure();
+      return matmulPlan;
     }
 
     ShardPlan plan;
