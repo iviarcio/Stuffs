@@ -8,10 +8,10 @@
 // NSP Sharding Propagation pass.
 //
 // This module is mostly from upstream Mesh/Transforms/ShardingPropagation.cpp
-// The main difference is NSP-specific adjustement to how propagation boundaries
+// The main difference is NSP-specific adjustment to how propagation boundaries
 // are handled.
 //
-// In particular, this pass preserves the upstream propagatioon behavior for
+// In particular, this pass preserves the upstream propagation behavior for
 // tensor-based operations, but treats bufferization.materialize_in_destination
 // as a hard boundary. This prevents sharding from being propagated across a
 // tensor-to-buffer transition where the destination is a memref.
@@ -292,6 +292,9 @@ static FailureOr<ShardingOption> selectShardingOption(
       shardingOptionsAndReshardingRequirements.front());
 }
 
+// NOTE: This method is same as upstream, except for
+// bufferization.materialize_in_destination op (see below)
+//
 // For each operation that implements the ShardingInterface, infer the sharding
 // option of the operation from its operands and/or results using the
 // `getShardingOption` method. If the inferred sharding option is not empty, add
@@ -394,12 +397,12 @@ struct NSPShardingPropagationPass
   StringRef getArgument() const final { return "nsp-sharding-propagation"; }
 
   StringRef getDescription() const final {
-    return "NSP-specific sharding propagation with tensor-to-buffer sink boundaries";
+    return "NSP-specific sharding propagation with tensor-to-buffer sink "
+           "boundaries";
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<bufferization::BufferizationDialect,
-                    func::FuncDialect,
+    registry.insert<bufferization::BufferizationDialect, func::FuncDialect,
                     shard::ShardDialect>();
   }
 
@@ -420,7 +423,8 @@ struct NSPShardingPropagationPass
     LLVM_DEBUG(
         DBGS() << "print all the ops' iterator types and indexing maps in the "
                   "block.\n";
-        for (Operation &op : block.getOperations()) {
+        for (Operation &op
+             : block.getOperations()) {
           if (auto shardingOp = llvm::dyn_cast<ShardingInterface>(&op))
             shardingOp.printLoopTypesAndIndexingMaps(llvm::dbgs());
         });
