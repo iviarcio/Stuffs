@@ -1617,12 +1617,12 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
             *ctx);
         bufferization::ToTensorOp::attachInterface<ToTensorShardingModel>(*ctx);
         bufferization::ToBufferOp::attachInterface<ToBufferShardingModel>(*ctx);
-    // Terminal tensor-to-buffer sink: treated as a hard propagation
-    // boundary in NSPShardingPropagationPass (skipped via early return).
-    // Register NoShardingModel so that the MLIR verifier does not reject
-    // the op for missing interface when it encounters it during
-    // verification passes that run before our custom propagation guard
-    // fires.
+        // Terminal tensor-to-buffer sink: treated as a hard propagation
+        // boundary in NSPShardingPropagationPass (skipped via early return).
+        // Register NoShardingModel so that the MLIR verifier does not reject
+        // the op for missing interface when it encounters it during
+        // verification passes that run before our custom propagation guard
+        // fires.
         bufferization::MaterializeInDestinationOp::attachInterface<
             NoShardingModel<bufferization::MaterializeInDestinationOp>>(*ctx);
       });

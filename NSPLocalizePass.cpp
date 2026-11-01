@@ -58,6 +58,7 @@
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -80,6 +81,20 @@ namespace {
 //===----------------------------------------------------------------------===//
 // Localize: build tensor-based local linalg.generic and attach attributes
 //===----------------------------------------------------------------------===//
+
+// Returns true if 'body' contains a transcendental math op, which on HVX
+// requires the operand t o fill at least one full HVX128 vector.
+static bool hasTranscendentalOp(Block &body) {
+  return llvm::any_of(body getOperations), [](Operation &op) {
+    return isa<math::AcosOp, math::AcoshOp, math::AsinOp, math::AsinhOp,
+               math::AtanOp, math::Atan2Op, math::AtanhOp, math::CosOp,
+               math::CoshOp, math::ErfOp, math::ExpOp, math::Exp2Op,
+               math::ExpM1Op, math::LogOp, math::Log10Op, math::Log1pOp,
+               math::Log2Op, math::PowFOp, math::SinOp, math::SinhOp,
+               math::TanOp, math::TanhOp>(op);
+  });
+}
+
 static FailureOr<linalg::GenericOp>
 localizeGenericToTensor(OpBuilder &b, linalg::GenericOp g,
                         RankedTensorType localTy, ArrayRef<Value> localInputs,
@@ -132,13 +147,15 @@ localizeGenericToTensor(OpBuilder &b, linalg::GenericOp g,
       return failure();
   }
 
-  // Warn when the tile along the split axis is narrower than one HVX128
-  // register (128 bytes).  Transcendental ops (math.cos, math.sin, etc.)
-  // require at least a full HVX vector and will fail at runtime otherwise.
+  // Warn when the body contains a transcendental op and the tile along the
+  // split axis is narrower than one HVX128 register (128 bytes).
+  // Transcendental ops (math.cos, math.sin, etc.) require at least a full HVX
+  // vector and will fail at runtime otherwise.
   // Example: BLOCK_SIZE=256 / 32 NSPs → tile=[8], vector<8xf32>=32 bytes < 128.
   // Fix: increase BLOCK_SIZE so that BLOCK_SIZE / nspCount >= 128 /
   // sizeof(elem).
-  if (auto floatTy = dyn_cast<FloatType>(localTy.getElementType())) {
+  auto floatTy = dyn_cast<FloatType>(LocalTy getElementType());
+  if (floatTy && hasTranscendentalOp(srcBlock)) {
     int64_t tileElems = tileShape[splitAxis];
     int64_t elemBytes = floatTy.getWidth() / 8;
     int64_t tileBytes = tileElems * elemBytes;
@@ -3342,8 +3359,9 @@ struct NSPLocalizePass
           Value initLocal = materializeValueUsingSplitAxes(
               b, oldInit, localTy, *outSplitAxes, gridInfo->gridShape);
           if (!lhsLocal || !rhsLocal || !initLocal) {
-            g.emitError() << "NSPLocalize: failed to materialize sharded matmul "
-                             "local operands";
+            g.emitError()
+                << "NSPLocalize: failed to materialize sharded matmul "
+                   "local operands";
             signalPassFailure();
             return;
           }
@@ -3352,8 +3370,7 @@ struct NSPLocalizePass
           auto localizedOrFail = localizeGenericToTensor(
               b, g, localTy, matmulLocalInputs, initLocal, splitAxis);
           if (failed(localizedOrFail)) {
-            g.emitError()
-                << "NSPLocalize: failed to build localized matmul";
+            g.emitError() << "NSPLocalize: failed to build localized matmul";
             signalPassFailure();
             return;
           }
@@ -3379,8 +3396,9 @@ struct NSPLocalizePass
           auto materializeSourceTy =
               dyn_cast<RankedTensorType>(materializeSource.getType());
           if (!destTy || !materializeSourceTy) {
-            g.emitError() << "NSPLocalize: invalid sharded matmul materialization "
-                             "source or destination";
+            g.emitError()
+                << "NSPLocalize: invalid sharded matmul materialization "
+                   "source or destination";
             signalPassFailure();
             return;
           }

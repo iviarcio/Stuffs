@@ -1429,7 +1429,7 @@ private:
           if (auto srcSv = src.getDefiningOp<memref::SubViewOp>())
             src = srcSv.getSource();
           if (auto rc = src.getDefiningOp<memref::ReinterpretCastOp>()) {
-            if (!dyn_cast<BaseMemRefType>(rc.getSource().getType().hasRank() &&
+            if (!dyn_cast<BaseMemRefType>(rc.getSource().getType()).hasRank() &&
                 reinterpretCastHasDynamicOffset(rc))
               return true;
           }

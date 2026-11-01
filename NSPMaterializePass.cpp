@@ -2467,7 +2467,7 @@ materializeTileToDestination(OpBuilder &b,
   // Partial-tile guard: when valid_count is present, each participant writes
   // only the portion of its tile that falls within [0, valid_count).
   if (Value validCount = tileOp.getValidCount()) {
-    // The dest memref may have a dynamic split-axis dimension (the caller
+    // The dest memref may have a dynamic split_axis dimension (the caller
     // already subviewed it to the global valid region), so
     // getGridAxesForMaterializedDim cannot derive axes from destDim/tileShape.
     // In the partial-tile pattern the full grid always shards split_axis, so
